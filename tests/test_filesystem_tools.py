@@ -96,6 +96,8 @@ def test_write_file_atomically_replaces_matching_file(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert result["meta"]["sha256"] == sha256_file_streaming(target)
+    assert "-value = 1" in result["meta"]["diff"]
+    assert "+value = 2" in result["meta"]["diff"]
     assert list(workspace.glob(".agent-*")) == []
 
 

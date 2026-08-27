@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from utils.diff import generate_unified_diff, truncate_diff
+
 
 DEFAULT_HASH_CHUNK_SIZE = 64 * 1024
 DEFAULT_MAX_WRITE_BYTES = 2 * 1024 * 1024
@@ -221,10 +223,19 @@ def write_file(
         return _error("not_a_file", "target path is not a regular file", meta={"path": path})
 
     previous_mode: int | None = None
+    original_content = ""
     if target.exists():
         try:
             actual_sha256 = sha256_file_streaming(target)
             previous_mode = stat.S_IMODE(target.stat().st_mode)
+            with target.open("r", encoding="utf-8", errors="strict", newline="") as stream:
+                original_content = stream.read()
+        except UnicodeDecodeError:
+            return _error(
+                "not_utf8",
+                "existing file is not valid UTF-8 text",
+                meta={"path": path},
+            )
         except OSError as exc:
             return _error("read_before_write_failed", str(exc), meta={"path": path})
         if actual_sha256 != expected_sha256:
@@ -240,6 +251,7 @@ def write_file(
             meta={"path": path},
         )
 
+    diff_text = truncate_diff(generate_unified_diff(original_content, content, path))
     temp_name: str | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +265,7 @@ def write_file(
         os.replace(temp_name, target)
         temp_name = None
     except OSError as exc:
-        return _error("write_failed", str(exc), meta={"path": path})
+        return _error("write_failed", str(exc), meta={"path": path, "diff": diff_text})
     finally:
         if temp_name is not None:
             try:
@@ -270,6 +282,6 @@ def write_file(
             "sha256": sha256_file_streaming(target),
             "size_bytes": len(encoded),
             "created": previous_mode is None,
+            "diff": diff_text,
         },
     }
-
