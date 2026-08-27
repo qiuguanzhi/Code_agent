@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .pytest-local-tmp/
+.pytest-run-*/
 .mypy_cache/
 .ruff_cache/
 

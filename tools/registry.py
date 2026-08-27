@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -32,18 +32,21 @@ class ToolRegistry:
         *,
         write_policy: Mapping[str, bool] | None = None,
         max_same_call: int = 3,
+        confirm_write: Callable[[str], bool] | None = None,
     ) -> None:
         self.workspace = workspace.resolve(strict=True)
         self.write_policy = dict(WRITE_POLICY if write_policy is None else write_policy)
         self.max_same_call = max_same_call
+        self.confirm_write = confirm_write
         self.schemas = get_tool_schemas()
 
     def _confirm_write(self, path: str) -> bool:
         """Placeholder confirmation hook for file modifications."""
 
-        _ = path
         # TODO: 接入用户交互界面
-        return True
+        if self.confirm_write is None:
+            return True
+        return self.confirm_write(path)
 
     def execute_one_call(self, call: ToolCall, state: AgentState) -> str:
         """Validate, deduplicate, confirm, and execute one local tool call."""
@@ -98,8 +101,11 @@ class ToolRegistry:
             if result.get("ok") is True:
                 file_path = str(arguments["path"])
                 new_hash = result["meta"].get("sha256")
+                diff_text = result["meta"].get("diff")
                 if isinstance(new_hash, str):
-                    state.changed_files[file_path] = new_hash
+                    state.changed_file_hashes[file_path] = new_hash
+                if isinstance(diff_text, str):
+                    state.changed_files[file_path] = diff_text
 
         return self._cache_result(call.id, result, state)
 
@@ -114,4 +120,3 @@ class ToolRegistry:
         encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
         state.tool_result_cache[call_id] = encoded
         return encoded
-

@@ -28,7 +28,7 @@ Status: Accepted by user
 
 ### Pending items
 
-- Phase 3: Context manager, agent loop, CLI, and demo
+- None for Phase 1
 
 ## Phase 2 — Provider and State
 
@@ -81,10 +81,73 @@ Status: Accepted by user
 
 - User reproduction: tests that did not need `tmp_path` passed, while 18 tests failed during fixture setup with `WinError 5` on `%TEMP%\pytest-of-lenovo`; no project assertion failed.
 - Root cause: an inaccessible pytest global temporary directory and an inaccessible legacy `.pytest_cache`, rather than filesystem/provider implementation behavior.
-- Fix: pytest now uses the repository-local `.pytest-local-tmp` base directory and disables the optional cache provider through `pyproject.toml`.
+- Fix: pytest disables the optional cache provider, and `tests/conftest.py` assigns every process a unique repository-local `.pytest-run-<pid>-<uuid>` base directory.
 - Verification: the user's two original pytest commands now report 24 passed and 40 passed/1 skipped respectively.
-- Result: test execution no longer depends on the damaged global temp/cache directories; the verification directory was removed afterward so the user's account creates it locally.
+- Result: test execution no longer depends on damaged global temp/cache directories and does not reuse a directory created under another Windows security context.
 
 ### Pending items
 
-- Phase 3: context manager, agent loop, CLI, and demo
+- None for Phase 2
+
+## Phase 3 — Agent Loop and CLI
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `agent/context.py`: protocol-unit grouping, deterministic JSON work memory, conservative character-based token estimation, and budget fitting
+- `agent/loop.py`: snapshot initialization, model/tool loop, bounded API retries, wall-clock/max-step/repeated-call stops, and lifecycle callbacks
+- `main.py`: CLI argument parsing, provider/environment validation, interactive write confirmation, dependency-free colored events, and completion summary
+- `tools/registry.py`: injected confirmation callback and separate Diff/hash change tracking
+- `examples/buggy_calculator/`: intentionally failing zero-division demo with isolated pytest configuration
+- `tests/conftest.py`: unique per-process repository-local pytest temp directories to avoid Windows ACL collisions
+
+### CLI usage
+
+```powershell
+python main.py --workspace ./examples/buggy_calculator "修复除零错误"
+python main.py --workspace ./demo "运行测试" --max-steps 12
+python main.py --workspace ./demo "修改代码" --interactive
+python main.py --cli --workspace ./demo "规划并修复" --mode goal --verbose
+```
+
+Supported arguments:
+
+- `--workspace`: required existing workspace directory
+- `--max-steps`: maximum model/tool iterations, default 20
+- `--max-wall-seconds`: wall-clock run limit, default 600
+- `--input-budget`: conservative input token budget, default 48,000
+- `--interactive`: wait for `y/n` before each `write_file`
+- `--verbose`: print structured lifecycle event data
+- `--mode {auto,goal}`: activate normal or goal-oriented prompt behavior
+- `--provider {deepseek,bailian}`: select the environment-backed provider
+- `--cli`: explicit CLI selector reserved for future GUI coexistence
+
+### Test status
+
+- Status: Pass
+- Phase 3 focused command: `pytest tests/test_context.py tests/test_agent_loop.py tests/test_cli.py -v`
+- Phase 3 focused result: 12 passed
+- Full regression command: `pytest tests/ -v`
+- Full regression result: 52 passed, 1 skipped
+- Demo precondition: `examples/buggy_calculator` reports 1 failed/1 passed before the agent repair, as intended.
+- Network usage: none; the full read → write → pytest → finish loop uses `FakeProvider` while executing real local tools.
+- Skip reason: Windows did not grant permission to create a test symlink.
+
+### Design update
+
+- `E:\codex\Project\coding_agent_technical_design.md` now contains section `0.4 桌面 GUI 架构（PySide6）` between sections 0.3 and 1.
+- Phase 3 remains CLI-only; PySide6 is not yet a dependency and no GUI implementation was added.
+
+### Known limitations
+
+- `rollback_to_snapshot` remains a Phase 2 placeholder and snapshots record metadata, not restorable file contents.
+- Token estimation deliberately overestimates from character count; no model-specific tokenizer is bundled.
+- Shell execution remains an allow-listed local mechanism, not a container-grade sandbox.
+- Streaming model output and GUI delivery are not implemented in Phase 3.
+- A real API end-to-end run requires the user's environment-specific key/model and was not performed in automated tests.
+
+### Pending items
+
+- Wait for user acceptance of Phase 3
+- Optional future GUI phase based on the new PySide6 design section

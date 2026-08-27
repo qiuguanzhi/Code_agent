@@ -96,7 +96,8 @@ def test_default_write_confirmation_hook_and_diff_metadata(tmp_path: Path) -> No
     assert result["meta"]["confirmed_by_user"] is True
     assert "-value = 1" in result["meta"]["diff"]
     assert "+value = 2" in result["meta"]["diff"]
-    assert state.changed_files["main.py"] == result["meta"]["sha256"]
+    assert state.changed_files["main.py"] == result["meta"]["diff"]
+    assert state.changed_file_hashes["main.py"] == result["meta"]["sha256"]
     assert registry.execute_one_call(call, state) == encoded
 
 

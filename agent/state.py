@@ -40,6 +40,7 @@ class AgentState:
     repeated_signatures: dict[str, int] = field(default_factory=dict)
     tool_result_cache: dict[str, str] = field(default_factory=dict)
     changed_files: dict[str, str] = field(default_factory=dict)
+    changed_file_hashes: dict[str, str] = field(default_factory=dict)
     last_test_result: str | None = None
     initial_snapshot: dict[str, str] = field(default_factory=dict)
     mode: str = "auto"
@@ -50,4 +51,3 @@ class AgentState:
         if self.mode not in VALID_AGENT_MODES:
             allowed = ", ".join(sorted(VALID_AGENT_MODES))
             raise ValueError(f"mode must be one of: {allowed}")
-
