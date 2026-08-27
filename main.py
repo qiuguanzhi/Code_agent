@@ -1,4 +1,4 @@
-"""Command-line entry point for the lightweight coding agent."""
+"""CLI and optional PySide6 entry points for the lightweight coding agent."""
 
 from __future__ import annotations
 
@@ -30,11 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the framework-free local coding agent.",
     )
-    parser.add_argument("task", help="Programming task for the agent")
+    parser.add_argument("task", nargs="?", help="Programming task for the agent")
     parser.add_argument(
         "--workspace",
         type=Path,
-        required=True,
         help="Existing workspace directory accessible to local tools",
     )
     parser.add_argument("--max-steps", type=int, default=20)
@@ -48,12 +47,35 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("deepseek", "bailian"),
         default=os.getenv("AGENT_PROVIDER", "deepseek"),
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the PySide6 desktop skeleton without contacting a provider",
+    )
+    mode_group.add_argument(
         "--cli",
         action="store_true",
-        help="Explicitly select CLI mode; retained for future GUI coexistence",
+        help="Explicitly select CLI mode",
     )
     return parser
+
+
+def run_gui() -> int:
+    """Launch the optional desktop application through lazy GUI imports."""
+
+    from PySide6.QtWidgets import QApplication
+
+    from gui.main_window import MainWindow
+    from gui.theme import DARK_THEME
+
+    existing_app = QApplication.instance()
+    app = existing_app if existing_app is not None else QApplication([sys.argv[0]])
+    app.setApplicationName("Mini Coding Agent")
+    app.setStyleSheet(DARK_THEME)
+    window = MainWindow()
+    window.show()
+    return int(app.exec())
 
 
 def _confirm_write(path: str) -> bool:
@@ -130,6 +152,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Validate configuration, run the agent, and return a process exit code."""
 
     args = build_parser().parse_args(argv)
+    if args.gui:
+        return run_gui()
+
+    if args.workspace is None or args.task is None:
+        print("CLI 模式需要 --workspace 和任务文本。", file=sys.stderr)
+        return 2
+
     try:
         workspace = args.workspace.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:

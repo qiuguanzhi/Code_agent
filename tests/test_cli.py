@@ -44,3 +44,13 @@ def test_cli_reports_missing_api_key_without_network(
     assert exit_code == 2
     assert "DEEPSEEK_API_KEY" in capsys.readouterr().err
 
+
+def test_cli_reports_missing_workspace_and_task(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Keep GUI-compatible optional parser fields mandatory at CLI runtime."""
+
+    exit_code = main(["--cli"])
+
+    assert exit_code == 2
+    assert "--workspace" in capsys.readouterr().err

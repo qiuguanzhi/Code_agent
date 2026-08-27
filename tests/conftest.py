@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Give each test process a unique repository-local base temp directory."""
 
     root = Path(str(config.rootpath)).resolve()
     run_id = f".pytest-run-{os.getpid()}-{uuid.uuid4().hex}"
     config.option.basetemp = str(root / run_id)
-

@@ -91,7 +91,7 @@ Status: Accepted by user
 
 ## Phase 3 — Agent Loop and CLI
 
-Status: Implemented; awaiting user acceptance
+Status: Accepted by user
 
 ### Completed modules
 
@@ -149,5 +149,51 @@ Supported arguments:
 
 ### Pending items
 
-- Wait for user acceptance of Phase 3
-- Optional future GUI phase based on the new PySide6 design section
+- None for Phase 3
+
+## Phase 4 — PySide6 GUI Skeleton
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `gui/theme.py`: complete Catppuccin Mocha QSS theme using the design palette
+- `gui/worker.py`: `QThread` placeholder with log, code, Diff, status, and completion signals
+- `gui/main_window.py`: menus, toolbar, three-color status indicator, adjustable 60/40 split view, decision buttons, task input, and status bar
+- `gui/__init__.py`: public exports for `MainWindow` and `AgentWorker`
+- `main.py`: mutually exclusive `--gui` and `--cli` startup paths with lazy PySide6 imports
+- `pyproject.toml`: PySide6 runtime dependency and GUI package discovery
+- `tests/test_gui.py`: offscreen theme, layout, worker-signal, six-log, and GUI-dispatch tests
+
+### GUI usage
+
+```powershell
+python main.py --gui
+```
+
+- GUI mode does not require a workspace, API key, or network connection in Phase 4.
+- Enter a task and click `发送` or `▶ 运行任务` to run the five-second simulation.
+- The simulation emits six color-coded logs at half-second intervals, previews candidate code and a Unified Diff, and enables the apply/reject placeholders.
+- CLI usage remains unchanged, including the optional explicit `--cli` selector.
+
+### Test status
+
+- Status: Pass
+- Focused command: `pytest tests/test_gui.py tests/test_cli.py -v`
+- Focused result: 8 passed
+- Full regression command: `pytest tests/ -v`
+- Full regression result: 58 passed, 1 skipped
+- GUI platform in tests: Qt `offscreen`; no display server, API key, or network is required.
+- Skip reason: Windows did not grant permission to create a test symlink.
+
+### Known limitations
+
+- The GUI worker is intentionally simulated and does not call `run_agent` in Phase 4.
+- Apply/reject buttons only update the preview state; they do not write files.
+- Rollback invokes the existing Phase 2 placeholder and cannot yet restore content.
+- GUI interactive confirmation records the selected policy but is not connected to tool execution.
+
+### Pending items
+
+- Wait for user acceptance of Phase 4
+- Connect `AgentWorker` to the real Agent loop in a future phase

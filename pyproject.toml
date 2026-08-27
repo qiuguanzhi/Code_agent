@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.40,<3",
+    "pyside6>=6.6.0",
 ]
 
 [project.optional-dependencies]
@@ -20,4 +21,4 @@ addopts = "-ra -p no:cacheprovider"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "providers*", "tools*", "utils*"]
+include = ["agent*", "gui*", "providers*", "tools*", "utils*"]
