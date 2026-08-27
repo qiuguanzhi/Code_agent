@@ -1,0 +1,24 @@
+[project]
+name = "mini-coding-agent"
+version = "0.1.0"
+description = "A lightweight coding agent built with native tool calling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40,<3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "providers*", "tools*", "utils*"]
+
