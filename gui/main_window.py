@@ -1,11 +1,11 @@
-"""Main window for the Phase 4 PySide6 desktop skeleton."""
+"""Main window bound to the real framework-free Agent loop."""
 
 from __future__ import annotations
 
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFontDatabase, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QTextEdit,
@@ -31,17 +32,9 @@ STATUS_COLORS: dict[str, str] = {
     "error": "#f38ba8",
 }
 
-LOG_COLORS: dict[str, str] = {
-    "info": "#89b4fa",
-    "thinking": "#cba6f7",
-    "warning": "#f9e2af",
-    "success": "#a6e3a1",
-    "error": "#f38ba8",
-}
-
 
 class MainWindow(QMainWindow):
-    """Display the GUI structure while delegating work to a mock QThread."""
+    """Display one real Agent run while keeping all work off the GUI thread."""
 
     def __init__(self, workspace_root: Path | None = None) -> None:
         """Initialize the menus, toolbar, split view, input, and status bar."""
@@ -51,9 +44,13 @@ class MainWindow(QMainWindow):
         self.snapshot_data: dict[str, str] = {}
         self.mode = "auto"
         self.interactive_confirmation = False
+        self.max_steps = 20
         self.worker: AgentWorker | None = None
+        self._close_pending = False
+        self._latest_file_path = ""
         self._latest_code = ""
         self._latest_diff = ""
+        self._latest_diff_counts = (0, 0)
 
         self.setWindowTitle("Mini Coding Agent")
         self.resize(1180, 760)
@@ -64,7 +61,7 @@ class MainWindow(QMainWindow):
         self._create_tool_bar()
         self._create_central_widget()
         self.statusBar().setObjectName("statusBar")
-        self._set_status("ready", "就绪")
+        self.update_status("ready", "就绪")
         self._refresh_workspace_label()
 
     def _create_actions(self) -> None:
@@ -220,64 +217,92 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def _create_worker(self, task: str) -> AgentWorker:
-        """Create the placeholder worker; Phase 5 can replace this boundary."""
+        """Create the real worker at a test-replaceable boundary."""
 
-        return AgentWorker(task)
+        _ = task
+        return AgentWorker(mode=self.mode)
 
     @Slot()
     def _submit_task(self) -> None:
-        """Start one mock task if no worker is currently active."""
+        """Start one real Agent task if a workspace is available."""
 
         task = self.task_input.text().strip()
         if not task:
-            self._set_status("error", "请先输入任务")
+            self.update_status("error", "请先输入任务")
+            return
+        if self.workspace_root is None:
+            self.update_status("error", "请先打开工作区")
             return
         if self.worker is not None and self.worker.isRunning():
             self.statusBar().showMessage("已有任务正在运行")
             return
 
         self.log_view.clear()
+        self._latest_file_path = ""
         self._latest_code = ""
         self._latest_diff = ""
+        self._latest_diff_counts = (0, 0)
         self._refresh_code_panel()
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.send_button.setEnabled(False)
         self.run_action.setEnabled(False)
-        self._set_status("running", "模拟 Agent 正在运行")
+        self.update_status("running", "Agent 正在运行")
 
         self.worker = self._create_worker(task)
-        self.worker.log_signal.connect(self._append_log)
-        self.worker.code_signal.connect(self._show_code)
-        self.worker.diff_signal.connect(self._show_diff)
-        self.worker.status_signal.connect(self._set_status)
+        self.worker.log_signal.connect(self.update_log)
+        self.worker.code_signal.connect(self.update_code)
+        self.worker.diff_signal.connect(self.update_diff)
+        self.worker.status_signal.connect(self.update_status)
+        self.worker.confirmation_signal.connect(self._request_write_confirmation)
         self.worker.finished_signal.connect(self._handle_worker_finished)
-        self.worker.start()
+        try:
+            self.worker.start_agent(
+                task,
+                self.workspace_root,
+                self.max_steps,
+                self.interactive_confirmation,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.send_button.setEnabled(True)
+            self.run_action.setEnabled(True)
+            self.update_status("error", str(exc))
 
-    @Slot(str, str)
-    def _append_log(self, message: str, level: str = "info") -> None:
-        """Append one escaped, color-coded line to the log panel."""
+    @Slot(int, str, str, str, str)
+    def update_log(self, step: int, icon: str, label: str, color: str, message: str) -> None:
+        """Append one escaped lifecycle event as an HTML log line."""
 
-        color = LOG_COLORS.get(level, LOG_COLORS["info"])
-        label = escape(level.upper())
-        safe_message = escape(message)
+        safe_icon = escape(icon)
+        safe_label = escape(label)
+        safe_message = escape(message).replace("\n", "<br>")
+        step_text = f"{step:02d}" if step > 0 else "--"
         self.log_view.append(
-            f'<span style="color:{color}; font-weight:600">[{label}]</span> '
+            f'<span style="color:#6c7086">[{step_text}]</span> '
+            f'<span style="color:{color}; font-weight:600">{safe_icon} {safe_label}</span> '
             f'<span style="color:#cdd6f4">{safe_message}</span>'
         )
 
-    @Slot(str)
-    def _show_code(self, content: str) -> None:
-        """Store code preview content received from the worker."""
+    @Slot(str, str)
+    def update_code(self, file_path: str, content: str) -> None:
+        """Display the latest page returned by the real read_file tool."""
 
+        self._latest_file_path = file_path
         self._latest_code = content
         self._refresh_code_panel()
 
-    @Slot(str)
-    def _show_diff(self, content: str) -> None:
-        """Store a diff preview and enable the decision placeholders."""
+    @Slot(str, str, int, int)
+    def update_diff(
+        self,
+        file_path: str,
+        diff_text: str,
+        additions: int,
+        deletions: int,
+    ) -> None:
+        """Display a successful write_file Diff and its change counts."""
 
-        self._latest_diff = content
+        self._latest_file_path = file_path
+        self._latest_diff = diff_text
+        self._latest_diff_counts = (additions, deletions)
         self._refresh_code_panel()
         self.apply_button.setEnabled(True)
         self.reject_button.setEnabled(True)
@@ -287,13 +312,18 @@ class MainWindow(QMainWindow):
 
         sections: list[str] = []
         if self._latest_code:
-            sections.append("# 候选代码\n" + self._latest_code.rstrip())
+            header = f"# 文件：{self._latest_file_path or '未知'}"
+            sections.append(header + "\n" + self._latest_code.rstrip())
         if self._latest_diff:
-            sections.append("# Unified Diff\n" + self._latest_diff.rstrip())
+            additions, deletions = self._latest_diff_counts
+            sections.append(
+                f"# Unified Diff：{self._latest_file_path or '未知'} "
+                f"(+{additions} / -{deletions})\n{self._latest_diff.rstrip()}"
+            )
         self.code_view.setPlainText("\n\n".join(sections))
 
     @Slot(str, str)
-    def _set_status(self, state: str, message: str) -> None:
+    def update_status(self, state: str, message: str) -> None:
         """Update the toolbar indicator and status-bar message."""
 
         normalized_state = state if state in STATUS_COLORS else "error"
@@ -305,11 +335,30 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str)
     def _handle_worker_finished(self, success: bool, message: str) -> None:
-        """Restore controls and display the final mock-run state."""
+        """Restore controls, display a summary, and honor deferred window close."""
 
         self.send_button.setEnabled(True)
         self.run_action.setEnabled(True)
-        self._set_status("ready" if success else "error", message)
+        color = "#a6e3a1" if success else "#f38ba8"
+        self.update_log(0, "🏁", "总结", color, message)
+        final_message = message.splitlines()[0] if message else "Agent 已结束"
+        self.update_status("ready" if success else "error", final_message)
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
+
+    @Slot(str)
+    def _request_write_confirmation(self, path: str) -> None:
+        """Ask on the GUI thread and return the decision to the waiting worker."""
+
+        confirmed = QMessageBox.question(
+            self,
+            "确认文件修改",
+            f"允许 Agent 修改以下文件？\n\n{path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+        if self.worker is not None:
+            self.worker.resolve_write_confirmation(confirmed)
 
     @Slot()
     def _open_workspace(self) -> None:
@@ -325,11 +374,11 @@ class MainWindow(QMainWindow):
         try:
             self.workspace_root = Path(selected).resolve(strict=True)
         except (OSError, RuntimeError, ValueError) as exc:
-            self._set_status("error", f"工作区无效：{exc}")
+            self.update_status("error", f"工作区无效：{exc}")
             return
         self.snapshot_data = {}
         self._refresh_workspace_label()
-        self._set_status("ready", "工作区已打开")
+        self.update_status("ready", "工作区已打开")
 
     def _refresh_workspace_label(self) -> None:
         """Show the active workspace path in the toolbar."""
@@ -343,27 +392,27 @@ class MainWindow(QMainWindow):
         """Capture metadata through the existing Phase 2 snapshot hook."""
 
         if self.workspace_root is None:
-            self._set_status("error", "请先打开工作区")
+            self.update_status("error", "请先打开工作区")
             return
         try:
             self.snapshot_data = save_workspace_snapshot(self.workspace_root)
         except (OSError, RuntimeError, ValueError) as exc:
-            self._set_status("error", f"快照保存失败：{exc}")
+            self.update_status("error", f"快照保存失败：{exc}")
             return
-        self._set_status("ready", f"已记录 {len(self.snapshot_data)} 个文件的快照")
+        self.update_status("ready", f"已记录 {len(self.snapshot_data)} 个文件的快照")
 
     @Slot()
     def _rollback_snapshot(self) -> None:
         """Call the Phase 2 rollback stub without claiming restoration succeeded."""
 
         if not self.snapshot_data:
-            self._set_status("error", "尚未保存快照")
+            self.update_status("error", "尚未保存快照")
             return
         restored = rollback_to_snapshot(self.snapshot_data)
         if restored:
-            self._set_status("ready", "已回退到快照")
+            self.update_status("ready", "已回退到快照")
         else:
-            self._set_status("error", "回退功能尚未完整实现")
+            self.update_status("error", "回退功能尚未完整实现")
 
     def _set_mode(self, mode: str, checked: bool) -> None:
         """Update the displayed Agent mode when its checked action fires."""
@@ -376,7 +425,7 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _set_interactive_confirmation(self, checked: bool) -> None:
-        """Record the future GUI write-confirmation preference."""
+        """Record whether write_file calls require a GUI confirmation dialog."""
 
         self.interactive_confirmation = checked
         state = "开启" if checked else "关闭"
@@ -384,26 +433,29 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _apply_placeholder_change(self) -> None:
-        """Acknowledge a mock diff; no file mutation occurs in Phase 4."""
+        """Acknowledge a Diff already written by the Agent in Phase 5."""
 
-        self._append_log("已确认模拟修改（Phase 4 不写入磁盘）。", "success")
+        self.update_log(0, "✓", "Diff", "#a6e3a1", "已确认查看当前修改。")
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
 
     @Slot()
     def _reject_placeholder_change(self) -> None:
-        """Reject the mock diff and clear the pending preview."""
+        """Dismiss the Diff preview without pretending to undo the write."""
 
-        self._append_log("已拒绝模拟修改。", "warning")
+        self.update_log(0, "!", "Diff", "#f9e2af", "已关闭 Diff；本操作不会回退文件。")
         self._latest_diff = ""
         self._refresh_code_panel()
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Request an active placeholder worker to stop before window teardown."""
+        """Defer destruction until an active Agent thread exits safely."""
 
         if self.worker is not None and self.worker.isRunning():
             self.worker.requestInterruption()
-            self.worker.wait(1_500)
+            self._close_pending = True
+            self.update_status("running", "正在等待 Agent 安全停止……")
+            event.ignore()
+            return
         super().closeEvent(event)

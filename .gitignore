@@ -18,6 +18,7 @@ venv/
 .env.*
 !.env.example
 config.toml
+set-env.ps1
 
 # Runtime traces and temporary files
 traces/

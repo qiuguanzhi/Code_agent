@@ -158,6 +158,9 @@ def test_run_agent_completes_read_write_run_finish_loop(tmp_path: Path) -> None:
         "tool_result",
         "run_completed",
     }
+    first_tool_call = next(event for event in events if event["event"] == "tool_call")
+    assert first_tool_call["data"]["tool_call_id"] == "read-1"
+    assert '"path": "calc.py"' in first_tool_call["data"]["arguments_json"]
 
 
 def test_run_agent_retries_transient_model_errors(tmp_path: Path) -> None:

@@ -153,7 +153,7 @@ Supported arguments:
 
 ## Phase 4 — PySide6 GUI Skeleton
 
-Status: Implemented; awaiting user acceptance
+Status: Accepted by user
 
 ### Completed modules
 
@@ -195,5 +195,51 @@ python main.py --gui
 
 ### Pending items
 
-- Wait for user acceptance of Phase 4
-- Connect `AgentWorker` to the real Agent loop in a future phase
+- None for Phase 4
+
+## Phase 5 — GUI and Agent Binding
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `gui/worker.py`: real `run_agent` execution in `QThread`, environment-backed Provider creation, structured lifecycle-to-signal mapping, read/code preview, write/Diff preview, change counts, and completion summary
+- `gui/main_window.py`: send-to-Agent binding, real-time HTML lifecycle logs, code/Diff display, live status updates, and GUI-thread write confirmation dialog
+- `agent/loop.py`: GUI-independent callback payloads now include tool-call ids and raw argument JSON; early snapshot/context failures also emit terminal events
+- `main.py`: GUI startup accepts an optional `--workspace` and still defers Provider/API-key validation until a task is submitted
+- `tests/test_gui.py`: FakeProvider integration tests execute the real Agent loop and local read/write tools without network access
+
+### GUI usage
+
+```powershell
+python main.py --gui --workspace ./examples/buggy_calculator
+```
+
+- Configure `AGENT_PROVIDER`, `AGENT_MODEL`, and the selected provider's API key in the process environment before sending a real task.
+- If `--workspace` is omitted, use `文件 → 打开工作区` before sending a task.
+- `设置 → 交互确认` displays a GUI confirmation dialog before each real `write_file` call.
+- The log panel updates at model request/response, tool call/result, step completion, retry, and terminal events.
+- Successful `read_file` results display their file path and content in the right panel.
+- Successful `write_file` results display the generated Unified Diff and addition/deletion counts.
+
+### Test status
+
+- Status: Pass
+- Focused command: `pytest tests/test_gui.py tests/test_agent_loop.py tests/test_cli.py -v`
+- Focused result: 14 passed
+- Full regression command: `pytest tests/ -v`
+- Full regression result: 59 passed, 1 skipped
+- Network usage: none; GUI tests inject FakeProvider while exercising the production worker, Agent loop, registry, and local tools.
+- Skip reason: Windows did not grant permission to create a test symlink.
+
+### Known limitations
+
+- Provider responses are non-streaming; the GUI updates between lifecycle events rather than token by token.
+- The Diff signal is generated from the successful write result, so it is a post-write view; the pre-write interactive dialog currently confirms the path only.
+- The right-side “应用修改/拒绝” controls acknowledge or dismiss the displayed Diff and do not implement undo.
+- `rollback_to_snapshot` remains a placeholder and cannot restore file contents.
+- A live API run requires user-supplied environment configuration and is not performed by automated tests.
+
+### Pending items
+
+- Wait for user acceptance of Phase 5

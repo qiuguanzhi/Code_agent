@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument(
         "--gui",
         action="store_true",
-        help="Launch the PySide6 desktop skeleton without contacting a provider",
+        help="Launch the PySide6 desktop interface",
     )
     mode_group.add_argument(
         "--cli",
@@ -61,8 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_gui() -> int:
-    """Launch the optional desktop application through lazy GUI imports."""
+def run_gui(workspace_root: Path | None = None) -> int:
+    """Launch the desktop application through lazy GUI imports."""
 
     from PySide6.QtWidgets import QApplication
 
@@ -73,7 +73,7 @@ def run_gui() -> int:
     app = existing_app if existing_app is not None else QApplication([sys.argv[0]])
     app.setApplicationName("Mini Coding Agent")
     app.setStyleSheet(DARK_THEME)
-    window = MainWindow()
+    window = MainWindow(workspace_root=workspace_root)
     window.show()
     return int(app.exec())
 
@@ -153,7 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
     if args.gui:
-        return run_gui()
+        return run_gui(args.workspace)
 
     if args.workspace is None or args.task is None:
         print("CLI 模式需要 --workspace 和任务文本。", file=sys.stderr)

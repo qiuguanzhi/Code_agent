@@ -1,77 +1,232 @@
-"""Background worker placeholder for the Phase 4 desktop skeleton."""
+"""QThread adapter between the framework-free Agent loop and PySide6."""
 
 from __future__ import annotations
 
+import os
+import threading
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+
 from PySide6.QtCore import QThread, Signal
+
+from agent.loop import AgentConfig, AgentRunResult, run_agent
+from providers.base import ModelProvider
+from providers.openai_compatible import create_provider_from_env
+
+
+ConfirmationCallback = Callable[[str], bool]
+
+
+EVENT_PRESENTATION: dict[str, tuple[str, str, str]] = {
+    "run_started": ("🚀", "开始", "#89b4fa"),
+    "model_request": ("🧠", "思考", "#cba6f7"),
+    "model_response": ("💬", "响应", "#cba6f7"),
+    "api_retry": ("↻", "重试", "#f9e2af"),
+    "tool_call": ("🔧", "工具", "#f9e2af"),
+    "tool_result": ("✓", "结果", "#a6e3a1"),
+    "step_completed": ("✓", "步骤", "#89b4fa"),
+    "run_completed": ("✅", "完成", "#a6e3a1"),
+    "run_stopped": ("■", "停止", "#f9e2af"),
+    "run_failed": ("✕", "错误", "#f38ba8"),
+}
 
 
 class AgentWorker(QThread):
-    """Emit deterministic mock Agent activity without calling a provider."""
+    """Run one real Agent session and translate lifecycle events into signals."""
 
-    log_signal = Signal(str, str)
-    code_signal = Signal(str)
-    diff_signal = Signal(str)
+    log_signal = Signal(int, str, str, str, str)
+    code_signal = Signal(str, str)
+    diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
+    confirmation_signal = Signal(str)
     finished_signal = Signal(bool, str)
-
-    _SIMULATED_LOGS: tuple[tuple[str, str], ...] = (
-        ("已接收任务，准备分析工作区。", "info"),
-        ("正在规划执行步骤……", "thinking"),
-        ("模拟读取目标文件。", "info"),
-        ("已生成候选代码修改。", "warning"),
-        ("模拟运行测试：全部通过。", "success"),
-        ("任务完成。", "success"),
-    )
 
     def __init__(
         self,
-        task: str,
         *,
-        interval_ms: int = 500,
-        total_ticks: int = 10,
+        provider: ModelProvider | None = None,
+        provider_name: str | None = None,
+        mode: str = "auto",
+        confirmation_callback: ConfirmationCallback | None = None,
     ) -> None:
-        """Create a five-second-by-default worker with six log emissions."""
+        """Create a worker with optional network-free test dependencies."""
 
         super().__init__()
-        if interval_ms < 0:
-            raise ValueError("interval_ms must be non-negative")
-        if total_ticks < len(self._SIMULATED_LOGS):
-            raise ValueError("total_ticks must allow all simulated logs")
-        self.task = task
-        self.interval_ms = interval_ms
-        self.total_ticks = total_ticks
+        self.provider = provider
+        self.provider_name = provider_name or os.getenv("AGENT_PROVIDER", "deepseek")
+        self.mode = mode
+        self.confirmation_callback = confirmation_callback
+        self._task = ""
+        self._workspace: Path | None = None
+        self._max_steps = 20
+        self._interactive = False
+        self._confirmation_event = threading.Event()
+        self._confirmation_result = False
+
+    def start_agent(
+        self,
+        task: str,
+        workspace: Path | str,
+        max_steps: int,
+        interactive: bool,
+    ) -> None:
+        """Validate and start one configured Agent run in this QThread."""
+
+        if self.isRunning():
+            raise RuntimeError("Agent worker is already running")
+        if not task.strip():
+            raise ValueError("task must be a non-empty string")
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        try:
+            resolved_workspace = Path(workspace).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("workspace cannot be resolved") from exc
+        if not resolved_workspace.is_dir():
+            raise ValueError("workspace must be a directory")
+
+        self._task = task
+        self._workspace = resolved_workspace
+        self._max_steps = max_steps
+        self._interactive = interactive
+        self._confirmation_event.clear()
+        self._confirmation_result = False
+        self.start()
+
+    def resolve_write_confirmation(self, confirmed: bool) -> None:
+        """Release a worker waiting for a GUI write-confirmation decision."""
+
+        self._confirmation_result = confirmed
+        self._confirmation_event.set()
 
     def run(self) -> None:
-        """Emit six half-second logs while keeping a five-second lifecycle."""
+        """Build the Provider/configuration and execute the Agent loop."""
 
-        self.status_signal.emit("running", f"正在运行：{self.task}")
-        for tick in range(self.total_ticks):
+        if self._workspace is None:
+            self._finish_with_error("Agent Worker 尚未配置工作区。")
+            return
+
+        self.status_signal.emit("running", "Agent 正在运行")
+        try:
+            provider = self.provider or create_provider_from_env(self.provider_name)
+            cfg = AgentConfig(
+                workspace=self._workspace,
+                provider=provider,
+                max_steps=self._max_steps,
+                mode=self.mode,
+                interactive=self._interactive,
+                confirm_write=self._confirm_write if self._interactive else None,
+            )
+            result = run_agent(self._task, cfg, self._handle_update)
+        except Exception as exc:
+            self._finish_with_error(f"{type(exc).__name__}: {exc}")
+            return
+
+        success = result.status == "completed"
+        summary = self._format_summary(result)
+        self.status_signal.emit("ready" if success else "error", result.answer)
+        self.finished_signal.emit(success, summary)
+
+    def _confirm_write(self, path: str) -> bool:
+        """Obtain a write decision from an injected callback or the GUI thread."""
+
+        if self.confirmation_callback is not None:
+            return bool(self.confirmation_callback(path))
+
+        self._confirmation_result = False
+        self._confirmation_event.clear()
+        self.confirmation_signal.emit(path)
+        while not self._confirmation_event.wait(timeout=0.1):
             if self.isInterruptionRequested():
-                self.status_signal.emit("error", "模拟任务已取消")
-                self.finished_signal.emit(False, "模拟任务已取消")
-                return
+                return False
+        return self._confirmation_result
 
-            self.msleep(self.interval_ms)
-            if tick < len(self._SIMULATED_LOGS):
-                message, level = self._SIMULATED_LOGS[tick]
-                self.log_signal.emit(message, level)
-                if tick == 3:
-                    self.code_signal.emit(
-                        "def divide(a: float, b: float) -> float:\n"
-                        "    if b == 0:\n"
-                        "        raise ValueError(\"divisor cannot be zero\")\n"
-                        "    return a / b\n"
-                    )
-                if tick == 4:
-                    self.diff_signal.emit(
-                        "--- a/calc.py\n"
-                        "+++ b/calc.py\n"
-                        "@@ -1,2 +1,4 @@\n"
-                        " def divide(a, b):\n"
-                        "+    if b == 0:\n"
-                        "+        raise ValueError(\"divisor cannot be zero\")\n"
-                        "     return a / b\n"
-                    )
+    def _handle_update(self, update: dict[str, Any]) -> None:
+        """Translate a core lifecycle dictionary into strongly shaped Qt signals."""
 
-        self.status_signal.emit("ready", "模拟任务完成")
-        self.finished_signal.emit(True, "模拟任务完成")
+        event = str(update.get("event", "event"))
+        step = self._safe_step(update.get("step"))
+        message = str(update.get("message", ""))
+        data = update.get("data")
+        event_data = data if isinstance(data, Mapping) else {}
+
+        icon, label, color = EVENT_PRESENTATION.get(
+            event,
+            ("•", event, "#89b4fa"),
+        )
+        if event == "tool_result" and event_data.get("ok") is False:
+            icon, color = "✕", "#f38ba8"
+        self.log_signal.emit(step, icon, label, color, message)
+
+        if event == "model_request":
+            self.status_signal.emit("running", f"第 {step} 步：模型思考中")
+        elif event == "tool_call":
+            tool_name = str(event_data.get("tool", "工具"))
+            self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
+        elif event == "tool_result":
+            self._emit_tool_preview(event_data)
+
+    def _emit_tool_preview(self, event_data: Mapping[str, Any]) -> None:
+        """Emit code or Diff previews from one successful tool-result payload."""
+
+        result = event_data.get("result")
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            return
+        tool_name = event_data.get("tool")
+        meta_value = result.get("meta")
+        meta = meta_value if isinstance(meta_value, Mapping) else {}
+        file_path = str(meta.get("path", ""))
+
+        if tool_name == "read_file":
+            content = result.get("data")
+            if file_path and isinstance(content, str):
+                self.code_signal.emit(file_path, content)
+            return
+
+        if tool_name == "write_file":
+            diff_text = meta.get("diff")
+            if file_path and isinstance(diff_text, str):
+                additions, deletions = self._count_diff_changes(diff_text)
+                self.diff_signal.emit(file_path, diff_text, additions, deletions)
+
+    @staticmethod
+    def _safe_step(value: Any) -> int:
+        """Normalize an untrusted callback step without raising in a Qt slot."""
+
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @staticmethod
+    def _count_diff_changes(diff_text: str) -> tuple[int, int]:
+        """Count added and removed content lines, excluding Diff headers."""
+
+        additions = 0
+        deletions = 0
+        for line in diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                additions += 1
+            elif line.startswith("-"):
+                deletions += 1
+        return additions, deletions
+
+    @staticmethod
+    def _format_summary(result: AgentRunResult) -> str:
+        """Create a compact completion summary for the GUI."""
+
+        changed = ", ".join(sorted(result.state.changed_files)) or "无"
+        return (
+            f"{result.answer}\n\n"
+            f"状态：{result.status}\n"
+            f"原因：{result.reason}\n"
+            f"步骤：{result.state.step}\n"
+            f"修改文件：{changed}"
+        )
+
+    def _finish_with_error(self, message: str) -> None:
+        """Emit a stable terminal error without leaking an exception from QThread."""
+
+        self.log_signal.emit(0, "✕", "错误", "#f38ba8", message)
+        self.status_signal.emit("error", message)
+        self.finished_signal.emit(False, message)

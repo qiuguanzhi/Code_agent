@@ -188,7 +188,9 @@ def run_agent(
     try:
         state.initial_snapshot = save_workspace_snapshot(cfg.workspace)
     except (OSError, ValueError) as exc:
-        return _stopped("failed", "snapshot_error", str(exc), state)
+        answer = str(exc)
+        _emit(on_update, "run_failed", 0, answer, reason="snapshot_error")
+        return _stopped("failed", "snapshot_error", answer, state)
 
     state.messages = [
         {"role": "system", "content": _load_system_prompt(cfg)},
@@ -217,7 +219,9 @@ def run_agent(
                 cfg.input_token_budget,
             )
         except ContextBudgetError as exc:
-            return _stopped("failed", "context_budget_error", str(exc), state)
+            answer = str(exc)
+            _emit(on_update, "run_failed", step, answer, reason="context_budget_error")
+            return _stopped("failed", "context_budget_error", answer, state)
 
         _emit(on_update, "model_request", step, "正在请求模型", messages=len(request_messages))
         try:
@@ -253,7 +257,15 @@ def run_agent(
             return _stopped("stopped", "empty_response", answer, state)
 
         for call in turn.tool_calls:
-            _emit(on_update, "tool_call", step, f"调用工具：{call.name}", tool=call.name)
+            _emit(
+                on_update,
+                "tool_call",
+                step,
+                f"调用工具：{call.name}",
+                tool=call.name,
+                tool_call_id=call.id,
+                arguments_json=call.arguments_json,
+            )
             encoded_result = registry.execute_one_call(call, state)
             state.messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": encoded_result}
@@ -267,6 +279,7 @@ def run_agent(
                 step,
                 f"工具完成：{call.name}",
                 tool=call.name,
+                tool_call_id=call.id,
                 ok=result.get("ok"),
                 result=result,
             )
@@ -288,4 +301,3 @@ def run_agent(
     answer = f"Agent 已达到最大步骤数（{cfg.max_steps}），任务可能尚未完成。"
     _emit(on_update, "run_stopped", cfg.max_steps, answer, reason="max_steps")
     return _stopped("stopped", "max_steps", answer, state)
-
