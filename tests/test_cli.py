@@ -57,11 +57,11 @@ def test_cli_reports_missing_workspace_and_task(
     assert "--workspace" in capsys.readouterr().err
 
 
-def test_no_arguments_launches_gui_from_current_directory(
+def test_no_arguments_launches_gui_with_empty_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Allow ``python main.py`` to start the desktop application directly."""
+    """Start the desktop application directly without preloading old files."""
 
     received: Path | None = None
 
@@ -75,4 +75,4 @@ def test_no_arguments_launches_gui_from_current_directory(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_module, "run_gui", fake_run_gui)
     assert main_module.main([]) == 0
-    assert received == tmp_path
+    assert received is None

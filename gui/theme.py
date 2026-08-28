@@ -1,78 +1,89 @@
-"""Persistable light and dark QSS themes for every native GUI component."""
+"""ChatGPT-inspired persistable light and dark QSS themes."""
 
 from __future__ import annotations
 
 
-DARK_COLORS: dict[str, str] = {
-    "background": "#1e1e2e",
-    "code_background": "#11111b",
-    "panel": "#181825",
-    "text": "#cdd6f4",
-    "muted": "#6c7086",
-    "success": "#a6e3a1",
-    "error": "#f38ba8",
-    "accent": "#89b4fa",
-    "purple": "#cba6f7",
-    "warning": "#f9e2af",
-    "border": "#313244",
-    "hover": "#45475a",
-    "pressed": "#585b70",
-    "button_text": "#11111b",
+LIGHT_COLORS: dict[str, str] = {
+    "background": "#f7f7f8",
+    "code_background": "#ffffff",
+    "panel": "#ffffff",
+    "text": "#202123",
+    "muted": "#6e6e80",
+    "success": "#10a37f",
+    "error": "#d00e17",
+    "accent": "#10a37f",
+    "purple": "#7c3aed",
+    "warning": "#b26a00",
+    "border": "#d9d9e3",
+    "hover": "#ececf1",
+    "pressed": "#d2d2d9",
+    "button_text": "#ffffff",
+    "user_bubble": "#10a37f",
+    "user_bubble_text": "#ffffff",
+    "assistant_bubble": "#ececf1",
+    "thinking_background": "#f0f0f0",
 }
 
-LIGHT_COLORS: dict[str, str] = {
-    "background": "#eff1f5",
-    "code_background": "#e6e9ef",
-    "panel": "#dce0e8",
-    "text": "#4c4f69",
-    "muted": "#8c8fa1",
-    "success": "#40a02b",
-    "error": "#d20f39",
-    "accent": "#1e66f5",
-    "purple": "#8839ef",
-    "warning": "#df8e1d",
-    "border": "#bcc0cc",
-    "hover": "#ccd0da",
-    "pressed": "#acb0be",
-    "button_text": "#eff1f5",
+DARK_COLORS: dict[str, str] = {
+    "background": "#343541",
+    "code_background": "#202123",
+    "panel": "#2d2d3a",
+    "text": "#ececf1",
+    "muted": "#acacbe",
+    "success": "#19c37d",
+    "error": "#ff6b6b",
+    "accent": "#19c37d",
+    "purple": "#c4b5fd",
+    "warning": "#f5c26b",
+    "border": "#565869",
+    "hover": "#40414f",
+    "pressed": "#4d4d5c",
+    "button_text": "#ffffff",
+    "user_bubble": "#10a37f",
+    "user_bubble_text": "#ffffff",
+    "assistant_bubble": "#2d2d3a",
+    "thinking_background": "#40414f",
 }
 
 
 def _build_theme(colors: dict[str, str]) -> str:
-    """Generate one complete native-widget stylesheet from semantic colors."""
+    """Generate a complete native-widget theme from semantic colors."""
 
     return f"""
 QWidget {{
     background-color: {colors['background']};
     color: {colors['text']};
-    font-size: 13px;
+    font-family: "Segoe UI", "Inter", "San Francisco", sans-serif;
+    font-size: 14px;
 }}
 QMainWindow, QDialog {{ background-color: {colors['background']}; }}
 QMenuBar, QToolBar, QStatusBar {{
     background-color: {colors['panel']};
     border-color: {colors['border']};
+    font-size: 12px;
 }}
-QMenuBar {{ border-bottom: 1px solid {colors['border']}; padding: 3px; }}
-QMenuBar::item {{ padding: 5px 10px; border-radius: 4px; }}
+QMenuBar {{ border-bottom: 1px solid {colors['border']}; padding: 4px 8px; }}
+QMenuBar::item {{ padding: 6px 11px; border-radius: 6px; }}
 QMenuBar::item:selected, QMenuBar::item:pressed {{ background-color: {colors['hover']}; }}
 QMenu {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
-    padding: 5px;
+    border-radius: 8px;
+    padding: 6px;
 }}
-QMenu::item {{ padding: 7px 28px 7px 12px; border-radius: 4px; }}
+QMenu::item {{ padding: 8px 30px 8px 13px; border-radius: 6px; }}
 QMenu::item:selected {{ background-color: {colors['hover']}; }}
-QMenu::separator {{ height: 1px; background: {colors['border']}; margin: 5px 8px; }}
-QToolBar {{ border-bottom: 1px solid {colors['border']}; spacing: 8px; padding: 5px 8px; }}
+QMenu::separator {{ height: 1px; background: {colors['border']}; margin: 6px 8px; }}
+QToolBar {{ border-bottom: 1px solid {colors['border']}; spacing: 9px; padding: 7px 10px; }}
 QToolBar::separator {{ background: {colors['border']}; width: 1px; margin: 4px 7px; }}
-QLabel#modeLabel {{ color: {colors['purple']}; font-weight: 600; }}
 QLabel#snapshotLabel, QLabel#waitingIndicator {{ color: {colors['warning']}; }}
+QLabel#workspaceEmptyLabel {{ color: {colors['muted']}; font-size: 12px; }}
 QPushButton, QToolButton {{
-    background-color: {colors['border']};
+    background-color: {colors['panel']};
     color: {colors['text']};
-    border: 1px solid {colors['hover']};
-    border-radius: 5px;
-    padding: 6px 12px;
+    border: 1px solid {colors['border']};
+    border-radius: 8px;
+    padding: 7px 13px;
 }}
 QPushButton:hover, QToolButton:hover {{
     background-color: {colors['hover']};
@@ -84,39 +95,80 @@ QPushButton:disabled, QToolButton:disabled {{
     background-color: {colors['panel']};
     border-color: {colors['border']};
 }}
-QPushButton#sendButton, QToolButton#runButton {{
+QPushButton#sendButton {{
     background-color: {colors['accent']};
     color: {colors['button_text']};
+    border: 0;
     font-weight: 600;
 }}
 QPushButton#applyButton {{
     background-color: {colors['success']};
     color: {colors['button_text']};
-    font-weight: 600;
+    border: 0;
+    font-weight: 700;
+    padding: 8px 18px;
 }}
 QPushButton#rejectButton {{
     background-color: {colors['error']};
     color: {colors['button_text']};
+    border: 0;
+    font-weight: 700;
+    padding: 8px 18px;
+}}
+QPushButton#thinkingToggle {{
+    background: transparent;
+    border: 0;
+    color: {colors['muted']};
+    text-align: left;
+    font-size: 12px;
     font-weight: 600;
+    padding: 3px 5px;
+}}
+QPushButton#toolStatusButton {{
+    background-color: {colors['panel']};
+    border: 1px solid {colors['border']};
+    border-radius: 7px;
+    padding: 4px 10px;
+    font-size: 12px;
 }}
 QLineEdit, QTextEdit, QPlainTextEdit, QTextBrowser, QListWidget, QTreeView, QComboBox {{
     background-color: {colors['code_background']};
     color: {colors['text']};
     border: 1px solid {colors['border']};
-    border-radius: 5px;
+    border-radius: 10px;
     selection-background-color: {colors['hover']};
     selection-color: {colors['text']};
 }}
-QLineEdit, QComboBox {{ background-color: {colors['panel']}; padding: 7px 9px; }}
+QLineEdit, QComboBox {{ background-color: {colors['panel']}; padding: 9px 11px; }}
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus, QTreeView:focus {{
     border-color: {colors['accent']};
 }}
-QTextEdit#logView {{ background-color: {colors['panel']}; }}
+QTextBrowser#conversationView {{
+    background-color: {colors['background']};
+    border: 0;
+    padding: 8px;
+}}
+QWidget#logPanel {{
+    background-color: {colors['panel']};
+    border: 1px solid {colors['border']};
+    border-radius: 10px;
+}}
+QWidget#thinkingContainer {{
+    background-color: {colors['thinking_background']};
+    border: 1px solid {colors['border']};
+    border-radius: 10px;
+}}
+QTextBrowser#thinkingView {{
+    background-color: {colors['thinking_background']};
+    color: {colors['muted']};
+    border: 0;
+    padding: 5px 12px;
+    font-size: 12px;
+}}
+QTextEdit#logView {{ background-color: {colors['panel']}; border: 0; font-size: 12px; }}
 QTextEdit#codeView {{ background-color: {colors['code_background']}; }}
-QListWidget::item {{ padding: 5px; border-radius: 3px; }}
-QListWidget::item:selected {{ background-color: {colors['hover']}; }}
 QTreeView {{ background-color: {colors['code_background']}; alternate-background-color: {colors['panel']}; }}
-QTreeView::item {{ padding: 4px; border-radius: 3px; }}
+QTreeView::item {{ padding: 5px; border-radius: 4px; }}
 QTreeView::item:selected {{ background-color: {colors['hover']}; color: {colors['text']}; }}
 QProgressBar {{
     background-color: {colors['panel']};
@@ -125,40 +177,53 @@ QProgressBar {{
     min-height: 9px;
     max-height: 9px;
 }}
-QProgressBar::chunk {{ background-color: {colors['purple']}; border-radius: 4px; }}
-QLabel#loadingLabel {{ color: {colors['purple']}; font-weight: 700; }}
-QTabWidget::pane {{ border: 1px solid {colors['border']}; background: {colors['code_background']}; }}
+QProgressBar::chunk {{ background-color: {colors['accent']}; border-radius: 4px; }}
+QLabel#loadingLabel {{ color: {colors['accent']}; font-weight: 700; }}
+QTabWidget::pane {{
+    border: 1px solid {colors['border']};
+    border-radius: 8px;
+    background: {colors['code_background']};
+}}
 QTabBar::tab {{
     background: {colors['panel']};
     color: {colors['muted']};
     border: 1px solid {colors['border']};
-    padding: 6px 12px;
+    border-bottom: 0;
+    padding: 7px 14px;
 }}
 QTabBar::tab:selected {{ color: {colors['text']}; background: {colors['hover']}; }}
+QLabel#emptyTabPlaceholder {{
+    background-color: #000000;
+    color: #8e8e93;
+    border: 0;
+    border-radius: 0;
+    font-size: 12px;
+}}
 QSplitter::handle {{ background-color: {colors['border']}; width: 4px; height: 4px; }}
 QSplitter::handle:hover {{ background-color: {colors['accent']}; }}
 QStatusBar {{ color: {colors['muted']}; border-top: 1px solid {colors['border']}; }}
 QStatusBar::item {{ border: 0; }}
-QScrollBar:vertical {{ background: {colors['panel']}; width: 12px; margin: 0; }}
+QScrollBar:vertical {{ background: transparent; width: 6px; margin: 2px 0; }}
 QScrollBar::handle:vertical {{
-    background: {colors['hover']};
-    min-height: 24px;
-    border-radius: 5px;
+    background: {colors['muted']};
+    min-height: 28px;
+    border-radius: 3px;
 }}
-QScrollBar::handle:vertical:hover {{ background: {colors['pressed']}; }}
+QScrollBar::handle:vertical:hover {{ background: {colors['accent']}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ height: 0; background: transparent; }}
 QToolTip {{
-    background: {colors['border']};
+    background: {colors['panel']};
     color: {colors['text']};
-    border: 1px solid {colors['hover']};
-    padding: 4px;
+    border: 1px solid {colors['border']};
+    border-radius: 5px;
+    padding: 5px;
 }}
 """
 
 
-DARK_THEME: str = _build_theme(DARK_COLORS)
 LIGHT_THEME: str = _build_theme(LIGHT_COLORS)
+DARK_THEME: str = _build_theme(DARK_COLORS)
 
 
 def get_theme(theme_name: str) -> tuple[str, dict[str, str]]:

@@ -18,7 +18,8 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageB
 import main as main_module
 from agent.state import AssistantTurn, ToolCall
 from gui.main_window import MainWindow
-from gui.theme import DARK_THEME, LIGHT_THEME
+from gui.session import ConversationStore
+from gui.theme import DARK_COLORS, DARK_THEME, LIGHT_COLORS, LIGHT_THEME
 from gui.worker import AgentWorker
 from providers.base import ModelProvider
 from tools.filesystem import sha256_file_streaming
@@ -220,25 +221,24 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def test_themes_cover_dark_and_light_palettes() -> None:
-    """Provide complete global QSS for both selectable themes."""
+    """Provide complete ChatGPT-inspired global QSS in both themes."""
 
     for color in (
-        "#1e1e2e",
-        "#11111b",
-        "#181825",
-        "#cdd6f4",
-        "#6c7086",
-        "#a6e3a1",
-        "#f38ba8",
-        "#89b4fa",
-        "#cba6f7",
-        "#f9e2af",
-        "#313244",
-        "#45475a",
+        "#343541",
+        "#202123",
+        "#2d2d3a",
+        "#ececf1",
+        "#40414f",
     ):
         assert color in DARK_THEME
-    for color in ("#eff1f5", "#e6e9ef", "#4c4f69", "#1e66f5"):
+    for color in ("#f7f7f8", "#ffffff", "#202123", "#10a37f", "#ececf1"):
         assert color in LIGHT_THEME
+    for stylesheet in (DARK_THEME, LIGHT_THEME):
+        assert 'font-family: "Segoe UI"' in stylesheet
+        assert "border-radius: 12px" in stylesheet or "border-radius: 10px" in stylesheet
+        assert "width: 6px" in stylesheet
+    assert DARK_COLORS["user_bubble"] == "#10a37f"
+    assert LIGHT_COLORS["user_bubble"] == "#10a37f"
 
 
 def test_main_window_has_three_resizable_columns_and_empty_input(
@@ -267,6 +267,11 @@ def test_main_window_has_three_resizable_columns_and_empty_input(
         assert window.apply_button.isEnabled() is False
         assert window.reject_button.isEnabled() is False
         assert window.decision_widget.isHidden() is True
+        assert window.code_tabs.empty_placeholder.isHidden() is False
+        assert window.code_tabs.empty_placeholder.isEnabled() is False
+        assert window.code_tabs.empty_placeholder.testAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
         assert str(workspace) in window.workspace_label.text()
         assert "就绪" in window.status_indicator.text()
     finally:
@@ -403,6 +408,7 @@ def test_two_tools_produce_exactly_two_log_rows(
 
     worker = AgentWorker(provider=_two_tool_provider())
     log_spy = QSignalSpy(worker.log_signal)
+    status_spy = QSignalSpy(worker.tool_status_signal)
     worker.start_agent("读取后运行", workspace, max_steps=5, interactive=False)
     assert worker.wait(4_000) is True
     qt_app.processEvents()
@@ -411,6 +417,12 @@ def test_two_tools_produce_exactly_two_log_rows(
     assert [log_spy.at(index)[2] for index in range(2)] == [
         "read_file",
         "run_command",
+    ]
+    assert status_spy.count() == 4
+    assert list(status_spy.at(status_spy.count() - 1)) == [
+        "success",
+        "run_command",
+        "",
     ]
 
 
@@ -425,9 +437,12 @@ def test_deep_mode_emits_safe_process_summaries_and_quick_mode_does_not(
     deep_worker.start_agent("读取文件", workspace, max_steps=4, interactive=False)
     assert deep_worker.wait(2_000) is True
     qt_app.processEvents()
-    summaries = [str(deep_spy.at(index)[0]) for index in range(deep_spy.count())]
+    levels = [int(deep_spy.at(index)[0]) for index in range(deep_spy.count())]
+    summaries = [str(deep_spy.at(index)[1]) for index in range(deep_spy.count())]
     assert len(summaries) >= 4
     assert any("read_file" in summary for summary in summaries)
+    assert 1 in levels
+    assert 2 in levels
     assert all("reasoning_content" not in summary for summary in summaries)
 
     quick_worker = AgentWorker(provider=_read_provider(), mode="auto")
@@ -504,13 +519,58 @@ def test_send_clears_input_and_binds_real_agent(
         assert window.worker.wait(2_000) is True
         qt_app.processEvents()
 
-        assert window.log_view.toPlainText().splitlines() == ["[1] 🔧 read_file"]
+        assert window.log_view.toPlainText() == ""
+        assert window.tool_status_button.text() == "✅ read_file"
+        assert len(window.session_store.active.logs) == 1
+        assert window.session_store.active.logs[0]["label"] == "read_file"
         assert "思考" not in window.log_view.toPlainText()
         assert "模型" not in window.log_view.toPlainText()
         assert "def divide" in window.code_view.toPlainText()
         assert "读取 calc.py" in window.conversation_view.toPlainText()
         assert window.send_button.isEnabled() is True
         assert "就绪" in window.status_indicator.text()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_tool_status_is_one_line_and_error_opens_full_detail(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overwrite the one-line tool state and reveal failure detail on click."""
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda parent, title, message: captured.append((title, message)),
+    )
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        assert window.tool_status_button.height() == 30
+        window.update_tool_status("running", "read_file", "")
+        assert window.tool_status_button.text() == "🔧 read_file"
+        assert window.tool_status_button.isEnabled() is False
+        window.update_tool_status("success", "read_file", "")
+        assert window.tool_status_button.text() == "✅ read_file"
+        window.update_tool_status(
+            "error",
+            "run_command",
+            '{"error": {"code": "permission_denied", "message": "权限不足"}}',
+        )
+        assert window.tool_status_button.text().startswith("❌ run_command")
+        assert "\n" not in window.tool_status_button.text()
+        assert window.tool_status_button.isEnabled() is True
+        window.tool_status_button.click()
+        assert captured == [
+            (
+                "run_command 执行失败",
+                '{"error": {"code": "permission_denied", "message": "权限不足"}}',
+            )
+        ]
     finally:
         window.close()
         qt_app.processEvents()
@@ -551,6 +611,10 @@ def test_deep_mode_shows_process_and_native_loading_feedback(
 
         assert window.loading_container.isVisible() is False
         assert window.thinking_container.isVisible() is True
+        assert window.thinking_view.isVisible() is False
+        assert window.thinking_container.parent().objectName() == "logPanel"
+        window.thinking_toggle.click()
+        assert window.thinking_view.isVisible() is True
         process_text = window.thinking_view.toPlainText()
         assert "分析任务目标" in process_text
         assert "read_file" in process_text
@@ -615,10 +679,10 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
         resolved_text = "已允许修改" if confirmed else "已拒绝修改"
         assert resolved_text in window.conversation_view.toPlainText()
         assert window.waiting_indicator.isVisible() is False
-        lines = window.log_view.toPlainText().splitlines()
-        assert len(lines) == 1
-        assert ("🔧 write_file" in lines[0]) is confirmed
-        assert ("❌ write_file" in lines[0]) is (not confirmed)
+        assert window.log_view.toPlainText() == ""
+        expected_icon = "✅" if confirmed else "❌"
+        assert window.tool_status_button.text().startswith(expected_icon)
+        assert window.decision_widget.isVisible() is False
     finally:
         if window.worker is not None and window.worker.isRunning():
             window.reject_button.click()
@@ -627,12 +691,107 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
         qt_app.processEvents()
 
 
-def test_conversations_switch_without_losing_logs_and_persist(
+def test_pending_diff_tab_close_requires_discard_and_never_writes(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a staged Diff in memory until tab-close discard is confirmed."""
+
+    target = workspace / "calc.py"
+    original = target.read_text(encoding="utf-8")
+    proposed = original.replace("return a / b", "return a * b")
+    provider = _write_provider(target, proposed)
+
+    class PendingWindow(MainWindow):
+        """Inject one pending interactive write."""
+
+        def _create_worker(self, task: str) -> AgentWorker:
+            """Return the deterministic write worker."""
+
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = PendingWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.interactive_action.setChecked(True)
+        window.task_input.setText("暂存修改")
+        window.send_button.click()
+        assert _wait_until(qt_app, lambda: window._awaiting_confirmation)
+        assert target.read_text(encoding="utf-8") == original
+        assert window._tab_has_pending_diff("calc.py") is True
+
+        monkeypatch.setattr(window, "_confirm_discard_pending", lambda scope: False)
+        window._close_code_tab(window.code_tabs.currentIndex())
+        assert window.code_tabs.count() == 1
+        assert window._tab_has_pending_diff("calc.py") is True
+        assert "Unified Diff" in window.code_view.toPlainText()
+
+        monkeypatch.setattr(window, "_confirm_discard_pending", lambda scope: True)
+        window._close_code_tab(window.code_tabs.currentIndex())
+        assert window.code_tabs.count() == 0
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+        assert target.read_text(encoding="utf-8") == original
+    finally:
+        if window.worker is not None and window.worker.isRunning():
+            window.confirm_signal.emit(False)
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
+def test_pending_diff_window_close_can_cancel_or_discard(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel app exit or discard the staged modification before closing."""
+
+    target = workspace / "calc.py"
+    original = target.read_text(encoding="utf-8")
+    provider = _write_provider(target, original.replace("a / b", "a + b"))
+
+    class PendingWindow(MainWindow):
+        """Inject one pending interactive write."""
+
+        def _create_worker(self, task: str) -> AgentWorker:
+            """Return the deterministic write worker."""
+
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = PendingWindow(workspace, settings=gui_settings)
+    window.show()
+    window.interactive_action.setChecked(True)
+    window.task_input.setText("退出前确认")
+    window.send_button.click()
+    assert _wait_until(qt_app, lambda: window._awaiting_confirmation)
+
+    monkeypatch.setattr(window, "_confirm_discard_pending", lambda scope: False)
+    window.close()
+    qt_app.processEvents()
+    assert window.isVisible() is True
+    assert window._tab_has_pending_diff("calc.py") is True
+
+    monkeypatch.setattr(window, "_confirm_discard_pending", lambda scope: True)
+    window.close()
+    assert window.worker is not None
+    assert window.worker.wait(2_000) is True
+    assert _wait_until(qt_app, lambda: not window.isVisible())
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_conversations_switch_in_memory_and_restart_starts_fresh(
     qt_app: QApplication,
     workspace: Path,
     gui_settings: QSettings,
 ) -> None:
-    """Preserve independent messages/logs across switches and restart."""
+    """Keep in-run sessions independent but reset all conversation UI on restart."""
 
     window = MainWindow(workspace, settings=gui_settings)
     first_id = window.session_store.active_id
@@ -649,25 +808,94 @@ def test_conversations_switch_without_losing_logs_and_persist(
     window.update_log(2, "🔧", "run_command", "tool_success", "")
     window._refresh_session_combo()
     window._render_active_session()
-    assert window.log_view.toPlainText() == "[2] 🔧 run_command"
+    assert window.session_store.active.logs[0]["label"] == "run_command"
+    assert window.log_view.toPlainText() == ""
 
     first_index = window.session_combo.findData(first_id)
     window.session_combo.setCurrentIndex(first_index)
-    assert window.log_view.toPlainText() == "[1] 🔧 read_file"
+    assert window.session_store.active.logs[0]["label"] == "read_file"
     assert first_task in window.conversation_view.toPlainText()
     window.close()
     qt_app.processEvents()
 
     restored = MainWindow(workspace, settings=gui_settings)
     try:
-        assert len(restored.session_store.conversations) == 2
-        first = restored.session_store.get(first_id)
-        second = restored.session_store.get(second_id)
-        assert first is not None
-        assert second is not None
-        assert first.logs[0]["label"] == "read_file"
+        assert len(restored.session_store.conversations) == 1
+        assert restored.session_store.active.messages == []
+        assert restored.session_store.active.logs == []
+        assert restored.conversation_view.toPlainText() == ""
+        assert restored.log_view.toPlainText() == ""
+        assert restored.session_store.get(first_id) is None
+        assert restored.session_store.get(second_id) is None
     finally:
         restored.close()
+        qt_app.processEvents()
+
+
+def test_message_delete_updates_memory_rendering_and_persisted_store(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Delete one bubble permanently from UI, memory, and QSettings."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    conversation_id = window.session_store.active_id
+    window.session_store.add_message("user", "需要删除的消息")
+    window.session_store.add_message("assistant", "保留的回复")
+    window._refresh_session_combo()
+    window._render_active_session()
+    rendered_html = window.conversation_view.toHtml().lower()
+    assert "需要删除的消息" in window.conversation_view.toPlainText()
+    assert "10a37f" in rendered_html
+    assert "delete://" in rendered_html
+
+    window._handle_conversation_link(QUrl(f"delete://{conversation_id}/0"))
+    assert "需要删除的消息" not in window.conversation_view.toPlainText()
+    assert "保留的回复" in window.conversation_view.toPlainText()
+    assert len(window.session_store.active.messages) == 1
+    window.session_store.save()
+
+    reloaded_store = ConversationStore(gui_settings)
+    persisted = reloaded_store.get(conversation_id)
+    assert persisted is not None
+    assert [message["content"] for message in persisted.messages] == ["保留的回复"]
+    window.close()
+    qt_app.processEvents()
+
+
+def test_application_without_explicit_workspace_starts_empty(
+    qt_app: QApplication,
+    gui_settings: QSettings,
+) -> None:
+    """Ignore stale conversations and show an empty workspace on startup."""
+
+    gui_settings.setValue(
+        ConversationStore.SETTINGS_KEY,
+        json.dumps(
+            [
+                {
+                    "id": "old-session",
+                    "title": "旧任务",
+                    "messages": [{"role": "user", "content": "旧内容"}],
+                    "logs": [{"step": 1, "label": "read_file"}],
+                    "process": [],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    gui_settings.setValue(ConversationStore.ACTIVE_KEY, "old-session")
+    window = MainWindow(settings=gui_settings)
+    try:
+        assert window.workspace_root is None
+        assert window.workspace_files == set()
+        assert window.workspace_tree.isHidden() is True
+        assert window.workspace_empty_label.isHidden() is False
+        assert window.session_store.active.messages == []
+        assert window.conversation_view.toPlainText() == ""
+    finally:
+        window.close()
         qt_app.processEvents()
 
 
@@ -690,10 +918,12 @@ def test_workspace_panel_collapses_restores_and_code_tabs_are_independent(
         assert window.workspace_panel.isVisible() is True
         assert 120 <= window.workspace_panel.width() <= 400
 
+        assert window.code_tabs.empty_placeholder.isVisible() is True
         window.update_code("111.cpp", "int one = 1;\n")
         assert window.code_tabs.count() == 1
         assert window.code_tabs.tabText(0) == "111.cpp"
         assert window.code_tabs.tabBar().isHidden() is False
+        assert window.code_tabs.empty_placeholder.isVisible() is False
         window.update_code("leet.cpp", "int two = 2;\n")
         assert window.code_tabs.count() == 2
         first_index = next(
@@ -706,6 +936,9 @@ def test_workspace_panel_collapses_restores_and_code_tabs_are_independent(
         window._close_code_tab(first_index)
         assert window.code_tabs.count() == 1
         assert "int two = 2" in window.code_view.toPlainText()
+        window._close_code_tab(0)
+        assert window.code_tabs.count() == 0
+        assert window.code_tabs.empty_placeholder.isVisible() is True
     finally:
         window.close()
         qt_app.processEvents()

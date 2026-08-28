@@ -29,7 +29,8 @@ class AgentWorker(QThread):
     code_signal = Signal(str, str)
     diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
-    progress_signal = Signal(str)
+    progress_signal = Signal(int, str)
+    tool_status_signal = Signal(str, str, str)
     confirmation_signal = Signal(str)
     snapshot_signal = Signal(object, str)
     finished_signal = Signal(bool, str)
@@ -160,11 +161,24 @@ class AgentWorker(QThread):
         elif event == "tool_call":
             tool_name = str(event_data.get("tool", "工具"))
             self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
+            self.tool_status_signal.emit("running", tool_name, "")
             if tool_name == "write_file" and self._interactive:
                 self._prepare_interactive_write(event_data)
         elif event == "tool_result":
             self._emit_tool_preview(event_data)
             self._emit_compact_tool_log(step, event_data)
+            tool_name = str(event_data.get("tool", "unknown_tool"))
+            result = event_data.get("result")
+            if isinstance(result, Mapping) and result.get("ok") is True:
+                self.tool_status_signal.emit("success", tool_name, "")
+            else:
+                detail = json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+                self.tool_status_signal.emit("error", tool_name, detail)
 
     def _emit_safe_progress(
         self,
@@ -175,6 +189,7 @@ class AgentWorker(QThread):
         """Expose high-level lifecycle summaries without private model reasoning."""
 
         summary = ""
+        level = 0
         if event == "run_started":
             summary = "正在分析任务目标和工作区约束。"
         elif event == "model_request":
@@ -189,18 +204,21 @@ class AgentWorker(QThread):
         elif event == "tool_call":
             tool_name = str(event_data.get("tool", "工具"))
             summary = f"第 {step} 轮：正在使用 {tool_name} 获取可验证结果。"
+            level = 1
         elif event == "tool_result":
             tool_name = str(event_data.get("tool", "工具"))
             result = event_data.get("result")
             succeeded = isinstance(result, Mapping) and result.get("ok") is True
             outcome = "成功" if succeeded else "失败"
             summary = f"第 {step} 轮：{tool_name} 执行{outcome}，正在评估结果。"
+            level = 2
         elif event == "api_retry":
             summary = f"第 {step} 轮：模型服务暂时不可用，正在按策略重试。"
+            level = 1
         elif event == "step_completed":
             summary = f"第 {step} 轮：本轮操作和结果检查已完成。"
         if summary:
-            self.progress_signal.emit(summary)
+            self.progress_signal.emit(level, summary)
 
     def _emit_compact_tool_log(
         self,

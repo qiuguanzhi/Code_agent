@@ -9,7 +9,17 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDir, QModelIndex, QPoint, QSettings, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QDir,
+    QModelIndex,
+    QPoint,
+    QSettings,
+    QTimer,
+    Qt,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -33,7 +43,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
-    QTabWidget,
     QTextBrowser,
     QTextEdit,
     QToolBar,
@@ -43,7 +52,8 @@ from PySide6.QtWidgets import (
 )
 
 from gui.session import Conversation, ConversationStore
-from gui.theme import DARK_COLORS, get_theme
+from gui.theme import get_theme
+from gui.widgets import CodeTabWidget
 from gui.worker import AgentWorker
 from tools.filesystem import (
     DEFAULT_MAX_WRITE_BYTES,
@@ -77,6 +87,7 @@ class MainWindow(QMainWindow):
         self.workspace_root = self._normalize_workspace(workspace_root)
         self.settings = settings or QSettings("MiniCodingAgent", "Desktop")
         self.session_store = ConversationStore(self.settings)
+        self.session_store.reset()
         saved_theme = str(self.settings.value("ui/theme", "dark"))
         self.theme_name = saved_theme if saved_theme in {"dark", "light"} else "dark"
         _, self.theme_colors = get_theme(self.theme_name)
@@ -104,6 +115,9 @@ class MainWindow(QMainWindow):
         self._tab_previews: dict[str, dict[str, Any]] = {}
         self._waiting_blink_on = False
         self._loading_tick = 0
+        self._tool_status_state = "idle"
+        self._tool_status_name = ""
+        self._tool_error_detail = ""
 
         self.setWindowTitle("Mini Coding Agent")
         self.setAcceptDrops(True)
@@ -254,6 +268,12 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(2, 2)
         self.splitter.setSizes([200, 620, 460])
         root_layout.addWidget(self.splitter, 1)
+        self.tool_status_button = QPushButton("🔧 暂无工具调用", root)
+        self.tool_status_button.setObjectName("toolStatusButton")
+        self.tool_status_button.setFixedHeight(30)
+        self.tool_status_button.setEnabled(False)
+        self.tool_status_button.clicked.connect(self._show_tool_error_detail)
+        root_layout.addWidget(self.tool_status_button)
         self.setCentralWidget(root)
 
     def _create_workspace_panel(self) -> QWidget:
@@ -296,6 +316,10 @@ class MainWindow(QMainWindow):
             self._show_workspace_context_menu
         )
         layout.addWidget(self.workspace_tree, 1)
+        self.workspace_empty_label = QLabel("尚未选择工作区", panel)
+        self.workspace_empty_label.setObjectName("workspaceEmptyLabel")
+        self.workspace_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.workspace_empty_label, 1)
         return panel
 
     def _create_conversation_panel(self) -> QWidget:
@@ -319,30 +343,42 @@ class MainWindow(QMainWindow):
         self.conversation_view = QTextBrowser(vertical_splitter)
         self.conversation_view.setObjectName("conversationView")
         self.conversation_view.setPlaceholderText("用户与 Agent 回复将显示在这里。")
-        self.log_view = QTextEdit(vertical_splitter)
-        self.log_view.setObjectName("logView")
-        self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText("工具调用日志将显示在这里。")
-        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        vertical_splitter.addWidget(self.conversation_view)
-        vertical_splitter.addWidget(self.log_view)
-        vertical_splitter.setSizes([360, 260])
-        layout.addWidget(vertical_splitter, 1)
+        self.conversation_view.setOpenLinks(False)
+        self.conversation_view.anchorClicked.connect(self._handle_conversation_link)
 
-        self.thinking_container = QWidget(panel)
+        log_panel = QWidget(vertical_splitter)
+        log_panel.setObjectName("logPanel")
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(8, 8, 8, 8)
+        log_layout.setSpacing(6)
+        self.thinking_container = QWidget(log_panel)
+        self.thinking_container.setObjectName("thinkingContainer")
         thinking_layout = QVBoxLayout(self.thinking_container)
-        thinking_layout.setContentsMargins(0, 0, 0, 0)
-        self.thinking_toggle = QPushButton("▼ 工作过程（高层摘要）", panel)
+        thinking_layout.setContentsMargins(10, 8, 10, 8)
+        self.thinking_toggle = QPushButton("▶ 💭 深度思考", log_panel)
+        self.thinking_toggle.setObjectName("thinkingToggle")
         self.thinking_toggle.setCheckable(True)
-        self.thinking_toggle.setChecked(True)
+        self.thinking_toggle.setChecked(False)
         self.thinking_toggle.toggled.connect(self._toggle_thinking_details)
         thinking_layout.addWidget(self.thinking_toggle)
-        self.thinking_view = QTextBrowser(panel)
+        self.thinking_view = QTextBrowser(log_panel)
         self.thinking_view.setObjectName("thinkingView")
-        self.thinking_view.setMaximumHeight(150)
+        self.thinking_view.setMaximumHeight(180)
+        self.thinking_view.setVisible(False)
         thinking_layout.addWidget(self.thinking_view)
         self.thinking_container.setVisible(False)
-        layout.addWidget(self.thinking_container)
+        log_layout.addWidget(self.thinking_container)
+
+        self.log_view = QTextEdit(log_panel)
+        self.log_view.setObjectName("logView")
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("事件记录")
+        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        log_layout.addWidget(self.log_view, 1)
+        vertical_splitter.addWidget(self.conversation_view)
+        vertical_splitter.addWidget(log_panel)
+        vertical_splitter.setSizes([360, 260])
+        layout.addWidget(vertical_splitter, 1)
 
         self.loading_container = QWidget(panel)
         loading_layout = QHBoxLayout(self.loading_container)
@@ -393,7 +429,7 @@ class MainWindow(QMainWindow):
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.code_tabs = QTabWidget(panel)
+        self.code_tabs = CodeTabWidget(panel)
         self.code_tabs.setObjectName("codeTabs")
         self.code_tabs.setTabsClosable(True)
         self.code_tabs.setTabBarAutoHide(False)
@@ -474,6 +510,7 @@ class MainWindow(QMainWindow):
         self.worker.snapshot_signal.connect(self._store_agent_snapshot)
         self.worker.finished_signal.connect(self._handle_worker_finished)
         self.worker.progress_signal.connect(self._append_process_update)
+        self.worker.tool_status_signal.connect(self.update_tool_status)
         self.confirm_signal.connect(self.worker.resolve_write_confirmation)
         try:
             self.worker.start_agent(
@@ -503,8 +540,48 @@ class MainWindow(QMainWindow):
             "message": message,
         }
         self.session_store.add_log(record, conversation_id=conversation_id)
-        if conversation_id == self.session_store.active_id:
+        if conversation_id == self.session_store.active_id and step == 0:
             self.log_view.append(self._format_log_html(record))
+
+    @Slot(str, str, str)
+    def update_tool_status(self, state: str, tool_name: str, detail: str) -> None:
+        """Show only the current/latest tool in a fixed one-line status control."""
+
+        normalized = state if state in {"running", "success", "error"} else "running"
+        icons = {"running": "🔧", "success": "✅", "error": "❌"}
+        self._tool_status_state = normalized
+        self._tool_status_name = tool_name
+        self._tool_error_detail = detail if normalized == "error" else ""
+        suffix = "  ▸" if normalized == "error" else ""
+        self.tool_status_button.setText(f"{icons[normalized]} {tool_name}{suffix}")
+        self.tool_status_button.setEnabled(normalized == "error")
+        self._refresh_tool_status_style()
+
+    @Slot()
+    def _show_tool_error_detail(self) -> None:
+        """Open the full latest tool failure only when one is available."""
+
+        if self._tool_status_state != "error" or not self._tool_error_detail:
+            return
+        QMessageBox.critical(
+            self,
+            f"{self._tool_status_name} 执行失败",
+            self._tool_error_detail,
+        )
+
+    def _refresh_tool_status_style(self) -> None:
+        """Apply a semantic one-line color without growing the status bar."""
+
+        color_keys = {
+            "idle": "muted",
+            "running": "accent",
+            "success": "success",
+            "error": "error",
+        }
+        color = self.theme_colors[color_keys.get(self._tool_status_state, "muted")]
+        self.tool_status_button.setStyleSheet(
+            f"text-align:left; color:{color}; font-weight:600;"
+        )
 
     def _format_log_html(self, record: dict[str, Any]) -> str:
         """Format a compact record as exactly one visible HTML line."""
@@ -523,22 +600,30 @@ class MainWindow(QMainWindow):
             f'<span style="color:{color}; font-weight:600">{icon} {label}{suffix}</span>'
         )
 
-    @Slot(str)
-    def _append_process_update(self, summary: str) -> None:
+    @Slot(int, str)
+    def _append_process_update(self, level: int, summary: str) -> None:
         """Persist and render one auditable high-level work-process update."""
 
         session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.add_process(summary, conversation_id=session_id)
+        self.session_store.add_process(level, summary, conversation_id=session_id)
         if session_id == self.session_store.active_id:
             self._render_process(self.session_store.active)
 
     def _render_process(self, conversation: Conversation) -> None:
         """Render safe process summaries in the collapsible deep-mode panel."""
 
-        rows = [
-            f'<p style="color:{self.theme_colors["purple"]}">• {escape(item)}</p>'
-            for item in conversation.process
-        ]
+        rows: list[str] = []
+        for index, item in enumerate(conversation.process, start=1):
+            level = item.get("level", 0)
+            text = item.get("text", "")
+            safe_level = level if isinstance(level, int) else 0
+            safe_text = escape(str(text))
+            marker = "▸" if safe_level == 0 else "·"
+            prefix = f"{index}." if safe_level == 0 else marker
+            rows.append(
+                f'<div style="margin-left:{safe_level * 20}px; margin-bottom:6px; '
+                f'color:{self.theme_colors["muted"]}">{prefix} {safe_text}</div>'
+            )
         self.thinking_view.setHtml("".join(rows))
         should_show = self.thinking_mode == "deep" and (
             bool(conversation.process)
@@ -546,6 +631,14 @@ class MainWindow(QMainWindow):
             and self.worker.isRunning()
         )
         self.thinking_container.setVisible(should_show)
+        count = len(conversation.process)
+        running = self.worker is not None and self.worker.isRunning()
+        summary = "思考中..." if running else f"深度思考（{count} 步）"
+        marker = "▼" if self.thinking_toggle.isChecked() else "▶"
+        self.thinking_toggle.setText(f"{marker} 💭 {summary}")
+        self.thinking_view.setVisible(
+            should_show and self.thinking_toggle.isChecked()
+        )
         if should_show:
             scrollbar = self.thinking_view.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -556,7 +649,14 @@ class MainWindow(QMainWindow):
 
         self.thinking_view.setVisible(expanded)
         marker = "▼" if expanded else "▶"
-        self.thinking_toggle.setText(f"{marker} 工作过程（高层摘要）")
+        conversation = self.session_store.active
+        running = self.worker is not None and self.worker.isRunning()
+        summary = (
+            "思考中..."
+            if running
+            else f"深度思考（{len(conversation.process)} 步）"
+        )
+        self.thinking_toggle.setText(f"{marker} 💭 {summary}")
 
     def _start_loading(self) -> None:
         """Show an immediate native indeterminate progress animation."""
@@ -586,7 +686,13 @@ class MainWindow(QMainWindow):
 
         state = self._tab_previews.setdefault(
             file_path,
-            {"code": "", "diff": "", "additions": 0, "deletions": 0},
+            {
+                "code": "",
+                "diff": "",
+                "additions": 0,
+                "deletions": 0,
+                "pending": False,
+            },
         )
         state.update({"code": content, "diff": "", "additions": 0, "deletions": 0})
         self._ensure_code_tab(file_path)
@@ -604,10 +710,21 @@ class MainWindow(QMainWindow):
 
         state = self._tab_previews.setdefault(
             file_path,
-            {"code": "", "diff": "", "additions": 0, "deletions": 0},
+            {
+                "code": "",
+                "diff": "",
+                "additions": 0,
+                "deletions": 0,
+                "pending": False,
+            },
         )
         state.update(
-            {"diff": diff_text, "additions": additions, "deletions": deletions}
+            {
+                "diff": diff_text,
+                "additions": additions,
+                "deletions": deletions,
+                "pending": self.interactive_confirmation,
+            }
         )
         self._ensure_code_tab(file_path)
         self._render_code_tab(file_path)
@@ -625,6 +742,7 @@ class MainWindow(QMainWindow):
             self._tab_editors[file_path] = editor
             index = self.code_tabs.addTab(editor, Path(file_path).name or file_path)
             self.code_tabs.setTabToolTip(index, file_path)
+            self.code_tabs.refresh_empty_placeholder()
         self.code_tabs.setCurrentWidget(editor)
         self.code_view = editor
         return editor
@@ -680,6 +798,7 @@ class MainWindow(QMainWindow):
         if state is None:
             return
         state.update({"diff": "", "additions": 0, "deletions": 0})
+        state["pending"] = False
         if clear_code:
             state["code"] = ""
         self._render_code_tab(file_path)
@@ -700,12 +819,64 @@ class MainWindow(QMainWindow):
             (path for path, editor in self._tab_editors.items() if editor is widget),
             None,
         )
+        if key is not None and self._tab_has_pending_diff(key):
+            if not self._confirm_discard_pending("tab"):
+                return
+            if self._awaiting_confirmation and self._pending_write_path == key:
+                self._reject_pending_change()
+            else:
+                self._clear_diff_decoration(key, clear_code=False)
         self.code_tabs.removeTab(index)
         if key is not None:
             editor = self._tab_editors.pop(key)
             self._tab_previews.pop(key, None)
             editor.deleteLater()
+        self.code_tabs.refresh_empty_placeholder()
         self._code_tab_changed(self.code_tabs.currentIndex())
+
+    def _tab_has_pending_diff(self, file_path: str) -> bool:
+        """Return whether one tab contains a staged, undecided modification."""
+
+        state = self._tab_previews.get(file_path)
+        return bool(
+            state is not None
+            and state.get("pending") is True
+            and str(state.get("diff", ""))
+        )
+
+    def _has_pending_diffs(self) -> bool:
+        """Return whether any open tab still owns an undecided Diff."""
+
+        return any(self._tab_has_pending_diff(path) for path in self._tab_previews)
+
+    def _confirm_discard_pending(self, scope: str) -> bool:
+        """Ask whether staged in-memory changes may be discarded."""
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        if scope == "window":
+            box.setWindowTitle("退出确认")
+            box.setText("仍有未应用的修改，是否放弃并退出？")
+            discard_text = "放弃并退出"
+        elif scope == "workspace":
+            box.setWindowTitle("切换工作区")
+            box.setText("仍有未应用的修改，是否放弃并切换工作区？")
+            discard_text = "放弃并切换"
+        else:
+            box.setWindowTitle("关闭标签")
+            box.setText("有未应用的修改，是否放弃？")
+            discard_text = "放弃修改"
+        discard_button = box.addButton(
+            discard_text,
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_button = box.addButton(
+            "取消",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is discard_button
 
     @Slot(str, str)
     def update_status(self, state: str, message: str) -> None:
@@ -759,6 +930,9 @@ class MainWindow(QMainWindow):
 
         self._awaiting_confirmation = True
         self._pending_write_path = path
+        state = self._tab_previews.get(path)
+        if state is not None:
+            state["pending"] = True
         self.apply_button.setEnabled(True)
         self.reject_button.setEnabled(True)
         self.decision_widget.setVisible(True)
@@ -872,26 +1046,68 @@ class MainWindow(QMainWindow):
             self._render_active_session()
 
     def _render_active_session(self) -> None:
-        """Render stored conversation messages and compact logs."""
+        """Render modern left/right message bubbles and session activity."""
 
         conversation = self.session_store.active
         message_html: list[str] = []
-        for message in conversation.messages:
+        for index, message in enumerate(conversation.messages):
             role = str(message.get("role", "system"))
             content = escape(str(message.get("content", ""))).replace("\n", "<br>")
-            role_labels = {"user": "您", "assistant": "Agent", "system": "系统"}
-            color_keys = {"user": "accent", "assistant": "success", "system": "warning"}
-            label = role_labels.get(role, "系统")
-            color = self.theme_colors[color_keys.get(role, "warning")]
-            message_html.append(
-                f'<p><span style="color:{color}; font-weight:600">{label}：</span>'
-                f'<span style="color:{self.theme_colors["text"]}">{content}</span></p>'
+            can_delete = role in {"user", "assistant"}
+            delete_link = (
+                f'<a href="delete://{conversation.id}/{index}" '
+                f'style="color:{self.theme_colors["muted"]}; text-decoration:none">×</a>'
+                if can_delete
+                else ""
             )
+            if role == "user":
+                background = self.theme_colors.get("user_bubble", "#10a37f")
+                foreground = self.theme_colors.get("user_bubble_text", "#ffffff")
+                row = (
+                    '<table width="100%" cellspacing="0" cellpadding="6"><tr>'
+                    '<td width="18%"></td>'
+                    f'<td align="right" bgcolor="{background}" '
+                    f'style="color:{foreground}; border-radius:12px; padding:10px">'
+                    f'{content}&nbsp;&nbsp;{delete_link}</td></tr></table>'
+                )
+            else:
+                background = self.theme_colors.get(
+                    "assistant_bubble",
+                    self.theme_colors["panel"],
+                )
+                foreground = self.theme_colors["text"]
+                label = "Agent" if role == "assistant" else "系统"
+                row = (
+                    '<table width="100%" cellspacing="0" cellpadding="6"><tr>'
+                    f'<td bgcolor="{background}" style="color:{foreground}; '
+                    f'border-radius:12px; padding:10px"><b>{label}</b><br>{content}'
+                    f'&nbsp;&nbsp;{delete_link}</td><td width="18%"></td>'
+                    '</tr></table>'
+                )
+            message_html.append(row)
         self.conversation_view.setHtml("".join(message_html))
         self.log_view.clear()
         for log in conversation.logs:
-            self.log_view.append(self._format_log_html(log))
+            if log.get("step") == 0:
+                self.log_view.append(self._format_log_html(log))
         self._render_process(conversation)
+
+    @Slot(QUrl)
+    def _handle_conversation_link(self, url: QUrl) -> None:
+        """Permanently delete the message targeted by an in-bubble close link."""
+
+        if url.scheme() != "delete":
+            return
+        conversation_id = url.host()
+        try:
+            message_index = int(url.path().strip("/"))
+        except ValueError:
+            return
+        if not self.session_store.delete_message(conversation_id, message_index):
+            return
+        self._refresh_session_combo()
+        if conversation_id == self.session_store.active_id:
+            self._render_active_session()
 
     @Slot(object, str)
     def _store_agent_snapshot(self, snapshot: object, timestamp: str) -> None:
@@ -988,6 +1204,12 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.update_status("error", "Agent 运行时不能切换工作区")
             return
+        if self._has_pending_diffs():
+            if not self._confirm_discard_pending("workspace"):
+                return
+            for file_path in tuple(self._tab_previews):
+                if self._tab_has_pending_diff(file_path):
+                    self._clear_diff_decoration(file_path, clear_code=False)
         try:
             self._synchronize_process_cwd(workspace)
         except OSError as exc:
@@ -1022,7 +1244,11 @@ class MainWindow(QMainWindow):
         self.workspace_files.clear()
         if self.workspace_root is None:
             self.workspace_tree.setRootIndex(QModelIndex())
+            self.workspace_tree.setVisible(False)
+            self.workspace_empty_label.setVisible(True)
             return
+        self.workspace_empty_label.setVisible(False)
+        self.workspace_tree.setVisible(True)
         root_index = self.workspace_model.setRootPath(str(self.workspace_root))
         self.workspace_tree.setRootIndex(root_index)
         excluded = {".git", ".venv", "venv", "__pycache__", ".pytest_cache"}
@@ -1383,6 +1609,7 @@ class MainWindow(QMainWindow):
         self._render_active_session()
         for file_path in self._tab_editors:
             self._render_code_tab(file_path)
+        self._refresh_tool_status_style()
         current_status = self.statusBar().currentMessage() or "就绪"
         state = "running" if self.worker is not None and self.worker.isRunning() else "ready"
         self.update_status(state, current_status)
@@ -1409,6 +1636,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Persist UI state and defer destruction until the worker exits."""
 
+        if self._has_pending_diffs():
+            if not self._confirm_discard_pending("window"):
+                event.ignore()
+                return
+            if self._awaiting_confirmation:
+                self._reject_pending_change()
+            else:
+                for file_path in tuple(self._tab_previews):
+                    if self._tab_has_pending_diff(file_path):
+                        self._clear_diff_decoration(file_path, clear_code=False)
         self.session_store.save()
         self.settings.setValue("ui/theme", self.theme_name)
         self.settings.setValue("ui/thinking_mode", self.thinking_mode)

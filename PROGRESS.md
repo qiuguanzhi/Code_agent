@@ -339,3 +339,30 @@ Status: Implemented; awaiting user acceptance
 ### Pending items
 
 - User visual acceptance of the optimized desktop interface
+
+## GUI Round 3 — Staging, Logs, Messages, and Visual Refresh
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `gui/widgets.py`: non-interactive black empty-tab placeholder with automatic first/last tab visibility
+- `gui/main_window.py`: pending-Diff close/exit confirmation, staged-change state, Diff decision lifecycle, deep-process block inside logs, latest-tool status line, deletable message bubbles, and empty-start workspace behavior
+- `gui/session.py`: permanent message deletion, startup reset, and hierarchical high-level process records
+- `gui/worker.py`: hierarchical safe-process signals and running/success/error tool-status signals with full failure detail
+- `gui/theme.py`: ChatGPT Windows Desktop-inspired light/dark QSS across the complete widget tree
+- `main.py`: no-argument GUI startup no longer preloads the current directory
+- `tests/test_gui.py` and `tests/test_cli.py`: coverage for every Round 3 state transition and regression requirement
+- `process.md`: append-only per-task implementation, test, and limitation record
+
+### Test status
+
+- Status: Pass
+- Focused regression: `pytest tests/test_gui.py tests/test_cli.py -q` → 27 passed
+- Full regression: `pytest tests/ -q` → 77 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the test symlink
+
+### Pending items
+
+- User visual acceptance of Round 3

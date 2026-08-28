@@ -18,7 +18,7 @@ class Conversation:
     title: str
     messages: list[dict[str, Any]] = field(default_factory=list)
     logs: list[dict[str, Any]] = field(default_factory=list)
-    process: list[str] = field(default_factory=list)
+    process: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -48,7 +48,17 @@ class Conversation:
             return None
         clean_messages = [dict(item) for item in messages if isinstance(item, dict)]
         clean_logs = [dict(item) for item in logs if isinstance(item, dict)]
-        clean_process = [item for item in process if isinstance(item, str)]
+        clean_process: list[dict[str, Any]] = []
+        for item in process:
+            if isinstance(item, str):
+                clean_process.append({"level": 0, "text": item})
+            elif isinstance(item, dict):
+                text = item.get("text")
+                level = item.get("level", 0)
+                if isinstance(text, str) and isinstance(level, int):
+                    clean_process.append(
+                        {"level": max(0, min(level, 3)), "text": text}
+                    )
         return cls(identifier, title, clean_messages, clean_logs, clean_process)
 
 
@@ -142,6 +152,15 @@ class ConversationStore:
         self.save()
         return conversation
 
+    def reset(self) -> Conversation:
+        """Discard persisted conversations and start one empty session."""
+
+        conversation = self._make_conversation()
+        self.conversations = [conversation]
+        self.active_id = conversation.id
+        self.save()
+        return conversation
+
     def activate(self, conversation_id: str) -> bool:
         """Activate an existing conversation."""
 
@@ -192,6 +211,25 @@ class ConversationStore:
                 self.save()
                 return
 
+    def delete_message(self, conversation_id: str, index: int) -> bool:
+        """Delete one message permanently and recalculate the session title."""
+
+        conversation = self.get(conversation_id)
+        if conversation is None or not 0 <= index < len(conversation.messages):
+            return False
+        del conversation.messages[index]
+        first_user = next(
+            (
+                str(message.get("content", "")).strip()
+                for message in conversation.messages
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        conversation.title = first_user[:20] or "新会话"
+        self.save()
+        return True
+
     def add_log(
         self,
         log: dict[str, Any],
@@ -208,6 +246,7 @@ class ConversationStore:
 
     def add_process(
         self,
+        level: int,
         summary: str,
         *,
         conversation_id: str | None = None,
@@ -217,5 +256,7 @@ class ConversationStore:
         conversation = self.get(conversation_id or self.active_id)
         if conversation is None or not summary.strip():
             return
-        conversation.process.append(summary.strip())
+        conversation.process.append(
+            {"level": max(0, min(level, 3)), "text": summary.strip()}
+        )
         self.save()
