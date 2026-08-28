@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,20 +22,6 @@ from utils.diff import generate_unified_diff, truncate_diff
 ConfirmationCallback = Callable[[str], bool]
 
 
-EVENT_PRESENTATION: dict[str, tuple[str, str, str]] = {
-    "run_started": ("🚀", "开始", "#89b4fa"),
-    "model_request": ("🧠", "思考", "#cba6f7"),
-    "model_response": ("💬", "响应", "#cba6f7"),
-    "api_retry": ("↻", "重试", "#f9e2af"),
-    "tool_call": ("🔧", "工具", "#f9e2af"),
-    "tool_result": ("✓", "结果", "#a6e3a1"),
-    "step_completed": ("✓", "步骤", "#89b4fa"),
-    "run_completed": ("✅", "完成", "#a6e3a1"),
-    "run_stopped": ("■", "停止", "#f9e2af"),
-    "run_failed": ("✕", "错误", "#f38ba8"),
-}
-
-
 class AgentWorker(QThread):
     """Run one real Agent session and translate lifecycle events into signals."""
 
@@ -42,8 +29,9 @@ class AgentWorker(QThread):
     code_signal = Signal(str, str)
     diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
+    progress_signal = Signal(str)
     confirmation_signal = Signal(str)
-    snapshot_signal = Signal(object)
+    snapshot_signal = Signal(object, str)
     finished_signal = Signal(bool, str)
 
     def __init__(
@@ -123,6 +111,9 @@ class AgentWorker(QThread):
                 interactive=self._interactive,
                 confirm_write=self._confirm_write if self._interactive else None,
             )
+            snapshot_timestamp = datetime.now().astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
             result = run_agent(self._task, cfg, self._handle_update)
         except Exception as exc:
             self._finish_with_error(f"{type(exc).__name__}: {exc}")
@@ -130,7 +121,7 @@ class AgentWorker(QThread):
 
         success = result.status == "completed"
         summary = self._format_summary(result)
-        self.snapshot_signal.emit(result.state.initial_snapshot)
+        self.snapshot_signal.emit(result.state.initial_snapshot, snapshot_timestamp)
         self.status_signal.emit("ready" if success else "error", result.answer)
         self.finished_signal.emit(success, summary)
 
@@ -161,14 +152,8 @@ class AgentWorker(QThread):
         message = str(update.get("message", ""))
         data = update.get("data")
         event_data = data if isinstance(data, Mapping) else {}
-
-        icon, label, color = EVENT_PRESENTATION.get(
-            event,
-            ("•", event, "#89b4fa"),
-        )
-        if event == "tool_result" and event_data.get("ok") is False:
-            icon, color = "✕", "#f38ba8"
-        self.log_signal.emit(step, icon, label, color, message)
+        if self.mode == "goal":
+            self._emit_safe_progress(event, step, event_data)
 
         if event == "model_request":
             self.status_signal.emit("running", f"第 {step} 步：模型思考中")
@@ -176,14 +161,74 @@ class AgentWorker(QThread):
             tool_name = str(event_data.get("tool", "工具"))
             self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
             if tool_name == "write_file" and self._interactive:
-                self._prepare_interactive_write(event_data, step)
+                self._prepare_interactive_write(event_data)
         elif event == "tool_result":
             self._emit_tool_preview(event_data)
+            self._emit_compact_tool_log(step, event_data)
+
+    def _emit_safe_progress(
+        self,
+        event: str,
+        step: int,
+        event_data: Mapping[str, Any],
+    ) -> None:
+        """Expose high-level lifecycle summaries without private model reasoning."""
+
+        summary = ""
+        if event == "run_started":
+            summary = "正在分析任务目标和工作区约束。"
+        elif event == "model_request":
+            summary = f"第 {step} 轮：检查当前上下文并选择下一步操作。"
+        elif event == "model_response":
+            count = event_data.get("tool_call_count", 0)
+            summary = (
+                f"第 {step} 轮：已形成操作方案，准备执行 {count} 个工具。"
+                if isinstance(count, int) and count > 0
+                else f"第 {step} 轮：已整理最终答复。"
+            )
+        elif event == "tool_call":
+            tool_name = str(event_data.get("tool", "工具"))
+            summary = f"第 {step} 轮：正在使用 {tool_name} 获取可验证结果。"
+        elif event == "tool_result":
+            tool_name = str(event_data.get("tool", "工具"))
+            result = event_data.get("result")
+            succeeded = isinstance(result, Mapping) and result.get("ok") is True
+            outcome = "成功" if succeeded else "失败"
+            summary = f"第 {step} 轮：{tool_name} 执行{outcome}，正在评估结果。"
+        elif event == "api_retry":
+            summary = f"第 {step} 轮：模型服务暂时不可用，正在按策略重试。"
+        elif event == "step_completed":
+            summary = f"第 {step} 轮：本轮操作和结果检查已完成。"
+        if summary:
+            self.progress_signal.emit(summary)
+
+    def _emit_compact_tool_log(
+        self,
+        step: int,
+        event_data: Mapping[str, Any],
+    ) -> None:
+        """Emit exactly one compact line for one completed tool call."""
+
+        tool_name = str(event_data.get("tool", "unknown_tool"))
+        result = event_data.get("result")
+        if isinstance(result, Mapping) and result.get("ok") is True:
+            self.log_signal.emit(step, "🔧", tool_name, "tool_success", "")
+            return
+
+        reason = "工具执行失败"
+        if isinstance(result, Mapping):
+            error = result.get("error")
+            if isinstance(error, Mapping):
+                raw_reason = error.get("message") or error.get("code")
+                if isinstance(raw_reason, str) and raw_reason.strip():
+                    reason = raw_reason.strip()
+        if len(reason) > 120:
+            reason = reason[:117] + "..."
+        self.log_signal.emit(step, "❌", tool_name, "error", reason)
 
     def _prepare_interactive_write(
         self,
         event_data: Mapping[str, Any],
-        step: int,
     ) -> None:
         """Generate a pre-write Diff and block until the user decides."""
 
@@ -212,11 +257,8 @@ class AgentWorker(QThread):
                 generate_unified_diff(original_content, new_content, path)
             )
         except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
-            self.log_signal.emit(
-                step,
-                "✕",
-                "Diff",
-                "#f38ba8",
+            self.status_signal.emit(
+                "error",
                 f"无法生成写入预览，已拒绝修改：{exc}",
             )
             self._confirmation_result = False
@@ -258,6 +300,17 @@ class AgentWorker(QThread):
 
         if tool_name == "write_file":
             if self._interactive:
+                if self._workspace is not None and file_path:
+                    try:
+                        target = resolve_in_workspace(
+                            self._workspace,
+                            file_path,
+                            must_exist=True,
+                        )
+                        content = target.read_text(encoding="utf-8")
+                    except (OSError, RuntimeError, UnicodeError, ValueError):
+                        return
+                    self.code_signal.emit(file_path, content)
                 return
             diff_text = meta.get("diff")
             if file_path and isinstance(diff_text, str):
@@ -301,6 +354,5 @@ class AgentWorker(QThread):
     def _finish_with_error(self, message: str) -> None:
         """Emit a stable terminal error without leaking an exception from QThread."""
 
-        self.log_signal.emit(0, "✕", "错误", "#f38ba8", message)
         self.status_signal.emit("error", message)
         self.finished_signal.emit(False, message)

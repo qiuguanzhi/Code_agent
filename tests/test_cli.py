@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import main as main_module
 from main import build_parser, main
 
 
@@ -54,3 +55,24 @@ def test_cli_reports_missing_workspace_and_task(
 
     assert exit_code == 2
     assert "--workspace" in capsys.readouterr().err
+
+
+def test_no_arguments_launches_gui_from_current_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow ``python main.py`` to start the desktop application directly."""
+
+    received: Path | None = None
+
+    def fake_run_gui(workspace_root: Path | None = None) -> int:
+        """Capture GUI routing without opening an event loop."""
+
+        nonlocal received
+        received = workspace_root
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "run_gui", fake_run_gui)
+    assert main_module.main([]) == 0
+    assert received == tmp_path

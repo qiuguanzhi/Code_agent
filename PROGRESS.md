@@ -288,3 +288,54 @@ Status: Implemented; awaiting user acceptance
 ### Pending items
 
 - Wait for user acceptance of Phase 6
+
+## GUI Enhancement — Enhance.md
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `gui/session.py`: QSettings-backed conversations with independent messages and compact logs
+- `gui/worker.py`: one completed-tool log per call; model request/response chatter removed from the log channel
+- `gui/main_window.py`: immediate input clearing, three-column workspace, collapsible file list, closable multi-file tabs, drag import/preview choice, visible waiting state, single-slot timestamped snapshots, and persistent theme switching
+- `gui/theme.py`: complete semantic dark/light QSS palettes
+- `tests/test_gui.py`: headless regression coverage for every item in the enhancement acceptance list
+- `process.md`: implementation summary, commands, results, and checked acceptance list
+
+### Test status
+
+- Status: Pass
+- GUI regression: `pytest tests/test_gui.py -q` → 14 passed
+- Full regression: `pytest tests/ -q` → 67 passed, 1 skipped
+- Network/API usage: none; deterministic FakeProvider tests exercise the real Agent loop and local tools
+- Skip reason: the current Windows environment does not permit creation of the symlink used by one path-guard test
+
+### Pending items
+
+- User visual acceptance of the enhanced desktop interface
+
+## GUI Core Optimization — promove.md
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `main.py`: no-argument desktop startup from the project/current directory while explicit `--cli` behavior remains unchanged
+- `gui/main_window.py`: switchable workspace with synchronized process cwd, native editable-operation file tree, first-tab visibility, empty task input, no redundant run action, quick/deep selector, progress animation, and strict Diff action lifecycle
+- `gui/worker.py`: safe high-level deep-mode progress events and post-write code refresh without exposing model private reasoning
+- `gui/session.py`: persistent high-level process summaries per conversation
+- `gui/theme.py`: filesystem tree, native progress bar, and loading-label styling for both themes
+- `tests/test_gui.py` and `tests/test_cli.py`: regression coverage for all nine requested optimizations
+- `process.md`: append-only implementation and acceptance record for every item
+
+### Test status
+
+- Status: Pass
+- Focused regression: `pytest tests/test_gui.py tests/test_cli.py -q` → 22 passed
+- Full regression: `pytest tests/ -q` → 72 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the test symlink
+
+### Pending items
+
+- User visual acceptance of the optimized desktop interface

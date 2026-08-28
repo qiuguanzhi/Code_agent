@@ -152,8 +152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Validate configuration, run the agent, and return a process exit code."""
 
     args = build_parser().parse_args(argv)
-    if args.gui:
-        return run_gui(args.workspace)
+    if args.gui or (not args.cli and args.task is None):
+        return run_gui(args.workspace or Path.cwd())
 
     if args.workspace is None or args.task is None:
         print("CLI 模式需要 --workspace 和任务文本。", file=sys.stderr)
