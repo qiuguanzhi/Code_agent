@@ -5,15 +5,22 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, Slot
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFontDatabase, QKeySequence
+from PySide6.QtCore import QTimer, Qt, Signal, Slot
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QDragEnterEvent,
+    QDropEvent,
+    QFontDatabase,
+    QKeySequence,
+)
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QSplitter,
     QTextEdit,
@@ -23,7 +30,13 @@ from PySide6.QtWidgets import (
 )
 
 from gui.worker import AgentWorker
-from utils.snapshot import rollback_to_snapshot, save_workspace_snapshot
+from tools.filesystem import resolve_in_workspace, sha256_file_streaming, write_file
+from utils.snapshot import (
+    SNAPSHOT_META_KEY,
+    discard_workspace_snapshot,
+    rollback_to_snapshot,
+    save_workspace_snapshot,
+)
 
 
 STATUS_COLORS: dict[str, str] = {
@@ -36,6 +49,8 @@ STATUS_COLORS: dict[str, str] = {
 class MainWindow(QMainWindow):
     """Display one real Agent run while keeping all work off the GUI thread."""
 
+    confirm_signal = Signal(bool)
+
     def __init__(self, workspace_root: Path | None = None) -> None:
         """Initialize the menus, toolbar, split view, input, and status bar."""
 
@@ -47,12 +62,15 @@ class MainWindow(QMainWindow):
         self.max_steps = 20
         self.worker: AgentWorker | None = None
         self._close_pending = False
+        self._awaiting_confirmation = False
+        self._pending_write_path = ""
         self._latest_file_path = ""
         self._latest_code = ""
         self._latest_diff = ""
         self._latest_diff_counts = (0, 0)
 
         self.setWindowTitle("Mini Coding Agent")
+        self.setAcceptDrops(True)
         self.resize(1180, 760)
         self.setMinimumSize(860, 560)
 
@@ -187,12 +205,12 @@ class MainWindow(QMainWindow):
         self.apply_button = QPushButton("应用修改", right_panel)
         self.apply_button.setObjectName("applyButton")
         self.apply_button.setEnabled(False)
-        self.apply_button.clicked.connect(self._apply_placeholder_change)
+        self.apply_button.clicked.connect(self._apply_pending_change)
         decision_layout.addWidget(self.apply_button)
         self.reject_button = QPushButton("拒绝", right_panel)
         self.reject_button.setObjectName("rejectButton")
         self.reject_button.setEnabled(False)
-        self.reject_button.clicked.connect(self._reject_placeholder_change)
+        self.reject_button.clicked.connect(self._reject_pending_change)
         decision_layout.addWidget(self.reject_button)
         right_layout.addLayout(decision_layout)
 
@@ -254,8 +272,10 @@ class MainWindow(QMainWindow):
         self.worker.code_signal.connect(self.update_code)
         self.worker.diff_signal.connect(self.update_diff)
         self.worker.status_signal.connect(self.update_status)
-        self.worker.confirmation_signal.connect(self._request_write_confirmation)
+        self.worker.confirmation_signal.connect(self._mark_confirmation_pending)
+        self.worker.snapshot_signal.connect(self._store_agent_snapshot)
         self.worker.finished_signal.connect(self._handle_worker_finished)
+        self.confirm_signal.connect(self.worker.resolve_write_confirmation)
         try:
             self.worker.start_agent(
                 task,
@@ -264,6 +284,10 @@ class MainWindow(QMainWindow):
                 self.interactive_confirmation,
             )
         except (RuntimeError, ValueError) as exc:
+            try:
+                self.confirm_signal.disconnect(self.worker.resolve_write_confirmation)
+            except RuntimeError:
+                pass
             self.send_button.setEnabled(True)
             self.run_action.setEnabled(True)
             self.update_status("error", str(exc))
@@ -286,6 +310,9 @@ class MainWindow(QMainWindow):
     def update_code(self, file_path: str, content: str) -> None:
         """Display the latest page returned by the real read_file tool."""
 
+        if self._latest_file_path and self._latest_file_path != file_path:
+            self._latest_diff = ""
+            self._latest_diff_counts = (0, 0)
         self._latest_file_path = file_path
         self._latest_code = content
         self._refresh_code_panel()
@@ -300,12 +327,19 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Display a successful write_file Diff and its change counts."""
 
+        if self._latest_file_path and self._latest_file_path != file_path:
+            self._latest_code = ""
         self._latest_file_path = file_path
         self._latest_diff = diff_text
         self._latest_diff_counts = (additions, deletions)
         self._refresh_code_panel()
-        self.apply_button.setEnabled(True)
-        self.reject_button.setEnabled(True)
+        waiting_for_user = (
+            self.interactive_confirmation
+            and self.worker is not None
+            and self.worker.isRunning()
+        )
+        self.apply_button.setEnabled(waiting_for_user)
+        self.reject_button.setEnabled(waiting_for_user)
 
     def _refresh_code_panel(self) -> None:
         """Render the latest code and diff in their shared preview panel."""
@@ -313,14 +347,38 @@ class MainWindow(QMainWindow):
         sections: list[str] = []
         if self._latest_code:
             header = f"# 文件：{self._latest_file_path or '未知'}"
-            sections.append(header + "\n" + self._latest_code.rstrip())
+            sections.append(
+                '<div style="color:#89b4fa; font-weight:600">'
+                f"{escape(header)}</div>"
+                '<pre style="color:#cdd6f4; background:#11111b">'
+                f"{escape(self._latest_code.rstrip())}</pre>"
+            )
         if self._latest_diff:
             additions, deletions = self._latest_diff_counts
-            sections.append(
+            diff_header = (
                 f"# Unified Diff：{self._latest_file_path or '未知'} "
-                f"(+{additions} / -{deletions})\n{self._latest_diff.rstrip()}"
+                f"(+{additions} / -{deletions})"
             )
-        self.code_view.setPlainText("\n\n".join(sections))
+            colored_lines: list[str] = []
+            for line in self._latest_diff.rstrip().splitlines():
+                safe_line = escape(line)
+                if line.startswith("+") and not line.startswith("+++"):
+                    color = "#a6e3a1"
+                elif line.startswith("-") and not line.startswith("---"):
+                    color = "#f38ba8"
+                elif line.startswith("@@"):
+                    color = "#cba6f7"
+                else:
+                    color = "#6c7086"
+                colored_lines.append(f'<span style="color:{color}">{safe_line}</span>')
+            sections.append(
+                '<div style="color:#f9e2af; font-weight:600">'
+                f"{escape(diff_header)}</div>"
+                '<pre style="background:#11111b">'
+                + "\n".join(colored_lines)
+                + "</pre>"
+            )
+        self.code_view.setHtml("<br>".join(sections))
 
     @Slot(str, str)
     def update_status(self, state: str, message: str) -> None:
@@ -339,6 +397,15 @@ class MainWindow(QMainWindow):
 
         self.send_button.setEnabled(True)
         self.run_action.setEnabled(True)
+        self._awaiting_confirmation = False
+        self._pending_write_path = ""
+        self.apply_button.setEnabled(False)
+        self.reject_button.setEnabled(False)
+        if self.worker is not None:
+            try:
+                self.confirm_signal.disconnect(self.worker.resolve_write_confirmation)
+            except RuntimeError:
+                pass
         color = "#a6e3a1" if success else "#f38ba8"
         self.update_log(0, "🏁", "总结", color, message)
         final_message = message.splitlines()[0] if message else "Agent 已结束"
@@ -347,18 +414,24 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.close)
 
     @Slot(str)
-    def _request_write_confirmation(self, path: str) -> None:
-        """Ask on the GUI thread and return the decision to the waiting worker."""
+    def _mark_confirmation_pending(self, path: str) -> None:
+        """Record that the worker is blocked on the visible Diff decision."""
 
-        confirmed = QMessageBox.question(
-            self,
-            "确认文件修改",
-            f"允许 Agent 修改以下文件？\n\n{path}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) == QMessageBox.StandardButton.Yes
-        if self.worker is not None:
-            self.worker.resolve_write_confirmation(confirmed)
+        self._awaiting_confirmation = True
+        self._pending_write_path = path
+        self.apply_button.setEnabled(True)
+        self.reject_button.setEnabled(True)
+        self.update_status("running", f"等待确认修改：{path}")
+
+    @Slot(object)
+    def _store_agent_snapshot(self, snapshot: object) -> None:
+        """Retain the completed run's initial snapshot for toolbar rollback."""
+
+        if not isinstance(snapshot, dict):
+            return
+        if all(isinstance(key, str) and isinstance(value, str) for key, value in snapshot.items()):
+            discard_workspace_snapshot(self.snapshot_data)
+            self.snapshot_data = dict(snapshot)
 
     @Slot()
     def _open_workspace(self) -> None:
@@ -376,6 +449,7 @@ class MainWindow(QMainWindow):
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status("error", f"工作区无效：{exc}")
             return
+        discard_workspace_snapshot(self.snapshot_data)
         self.snapshot_data = {}
         self._refresh_workspace_label()
         self.update_status("ready", "工作区已打开")
@@ -389,30 +463,47 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _save_snapshot(self) -> None:
-        """Capture metadata through the existing Phase 2 snapshot hook."""
+        """Capture verified file content through the snapshot hook."""
 
         if self.workspace_root is None:
             self.update_status("error", "请先打开工作区")
             return
         try:
-            self.snapshot_data = save_workspace_snapshot(self.workspace_root)
+            new_snapshot = save_workspace_snapshot(self.workspace_root)
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status("error", f"快照保存失败：{exc}")
             return
-        self.update_status("ready", f"已记录 {len(self.snapshot_data)} 个文件的快照")
+        discard_workspace_snapshot(self.snapshot_data)
+        self.snapshot_data = new_snapshot
+        file_count = sum(1 for path in self.snapshot_data if path != SNAPSHOT_META_KEY)
+        self.update_status("ready", f"已记录 {file_count} 个文件的快照")
 
     @Slot()
     def _rollback_snapshot(self) -> None:
-        """Call the Phase 2 rollback stub without claiming restoration succeeded."""
+        """Restore the workspace from the most recent content snapshot."""
 
+        if self.worker is not None and self.worker.isRunning():
+            self.update_status("error", "Agent 运行时不能回退")
+            return
         if not self.snapshot_data:
             self.update_status("error", "尚未保存快照")
             return
         restored = rollback_to_snapshot(self.snapshot_data)
         if restored:
-            self.update_status("ready", "已回退到快照")
+            self._latest_diff = ""
+            self._latest_diff_counts = (0, 0)
+            if self.workspace_root is not None and self._latest_file_path:
+                restored_file = self.workspace_root / self._latest_file_path
+                try:
+                    self._latest_code = restored_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    self._latest_code = ""
+            self._refresh_code_panel()
+            self.update_status("ready", "已回退到初始快照")
+            self.update_log(0, "↩", "回退", "#a6e3a1", "已回退到初始快照")
         else:
-            self.update_status("error", "回退功能尚未完整实现")
+            self.update_status("error", "快照回退失败")
+            self.update_log(0, "✕", "回退", "#f38ba8", "快照回退失败")
 
     def _set_mode(self, mode: str, checked: bool) -> None:
         """Update the displayed Agent mode when its checked action fires."""
@@ -425,29 +516,123 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _set_interactive_confirmation(self, checked: bool) -> None:
-        """Record whether write_file calls require a GUI confirmation dialog."""
+        """Record whether write_file calls require a Diff button decision."""
 
         self.interactive_confirmation = checked
         state = "开启" if checked else "关闭"
         self.statusBar().showMessage(f"交互确认已{state}")
 
     @Slot()
-    def _apply_placeholder_change(self) -> None:
-        """Acknowledge a Diff already written by the Agent in Phase 5."""
+    def _apply_pending_change(self) -> None:
+        """Approve the pending Diff and release the Agent worker."""
 
-        self.update_log(0, "✓", "Diff", "#a6e3a1", "已确认查看当前修改。")
+        if not self._awaiting_confirmation:
+            return
+        path = self._pending_write_path
+        self._awaiting_confirmation = False
+        self._pending_write_path = ""
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
+        self.update_log(0, "✓", "确认", "#a6e3a1", f"已允许修改：{path}")
+        self.update_status("running", "已确认，Agent 继续执行")
+        self.confirm_signal.emit(True)
 
     @Slot()
-    def _reject_placeholder_change(self) -> None:
-        """Dismiss the Diff preview without pretending to undo the write."""
+    def _reject_pending_change(self) -> None:
+        """Reject the pending Diff so the tool returns user_aborted."""
 
-        self.update_log(0, "!", "Diff", "#f9e2af", "已关闭 Diff；本操作不会回退文件。")
-        self._latest_diff = ""
-        self._refresh_code_panel()
+        if not self._awaiting_confirmation:
+            return
+        path = self._pending_write_path
+        self._awaiting_confirmation = False
+        self._pending_write_path = ""
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
+        self.update_log(0, "✕", "确认", "#f38ba8", f"已拒绝修改：{path}")
+        self.update_status("running", "已拒绝，Agent 将重新思考")
+        self.confirm_signal.emit(False)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        """Accept drags that contain at least one local regular file."""
+
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        if any(Path(url.toLocalFile()).is_file() for url in urls if url.isLocalFile()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        """Atomically import dropped UTF-8 files into the workspace root."""
+
+        if self.workspace_root is None:
+            self.update_status("error", "请先打开工作区")
+            event.ignore()
+            return
+        if self.worker is not None and self.worker.isRunning():
+            self.update_status("error", "Agent 运行时不能导入文件")
+            event.ignore()
+            return
+
+        imported = 0
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        for url in urls:
+            if not url.isLocalFile():
+                continue
+            try:
+                source = Path(url.toLocalFile()).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.update_log(0, "✕", "导入", "#f38ba8", f"文件路径无效：{exc}")
+                continue
+            if not source.is_file():
+                continue
+            try:
+                content = source.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                self.update_log(0, "✕", "导入", "#f38ba8", f"无法读取 {source.name}：{exc}")
+                continue
+
+            try:
+                destination = resolve_in_workspace(
+                    self.workspace_root,
+                    source.name,
+                    must_exist=False,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.update_log(0, "✕", "导入", "#f38ba8", f"目标路径无效：{exc}")
+                continue
+            expected_hash = sha256_file_streaming(destination) if destination.is_file() else ""
+            result = write_file(
+                self.workspace_root,
+                source.name,
+                content,
+                expected_hash,
+            )
+            if result.get("ok") is not True:
+                error = result.get("error")
+                message = error.get("message", "未知错误") if isinstance(error, dict) else "未知错误"
+                self.update_log(
+                    0,
+                    "✕",
+                    "导入",
+                    "#f38ba8",
+                    f"导入 {source.name} 失败：{message}",
+                )
+                continue
+            imported += 1
+            self.update_log(
+                0,
+                "↓",
+                "导入",
+                "#a6e3a1",
+                f"文件 {source.name} 已导入工作区",
+            )
+            self.update_code(source.name, content)
+
+        if imported:
+            self.update_status("ready", f"已导入 {imported} 个文件")
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Defer destruction until an active Agent thread exits safely."""

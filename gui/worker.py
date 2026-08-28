@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from collections.abc import Callable, Mapping
@@ -13,6 +14,8 @@ from PySide6.QtCore import QThread, Signal
 from agent.loop import AgentConfig, AgentRunResult, run_agent
 from providers.base import ModelProvider
 from providers.openai_compatible import create_provider_from_env
+from tools.filesystem import resolve_in_workspace
+from utils.diff import generate_unified_diff, truncate_diff
 
 
 ConfirmationCallback = Callable[[str], bool]
@@ -40,6 +43,7 @@ class AgentWorker(QThread):
     diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
     confirmation_signal = Signal(str)
+    snapshot_signal = Signal(object)
     finished_signal = Signal(bool, str)
 
     def __init__(
@@ -63,6 +67,7 @@ class AgentWorker(QThread):
         self._interactive = False
         self._confirmation_event = threading.Event()
         self._confirmation_result = False
+        self._prepared_confirmation_path: str | None = None
 
     def start_agent(
         self,
@@ -125,11 +130,17 @@ class AgentWorker(QThread):
 
         success = result.status == "completed"
         summary = self._format_summary(result)
+        self.snapshot_signal.emit(result.state.initial_snapshot)
         self.status_signal.emit("ready" if success else "error", result.answer)
         self.finished_signal.emit(success, summary)
 
     def _confirm_write(self, path: str) -> bool:
         """Obtain a write decision from an injected callback or the GUI thread."""
+
+        if self._prepared_confirmation_path == path:
+            confirmed = self._confirmation_result
+            self._prepared_confirmation_path = None
+            return confirmed
 
         if self.confirmation_callback is not None:
             return bool(self.confirmation_callback(path))
@@ -164,8 +175,69 @@ class AgentWorker(QThread):
         elif event == "tool_call":
             tool_name = str(event_data.get("tool", "工具"))
             self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
+            if tool_name == "write_file" and self._interactive:
+                self._prepare_interactive_write(event_data, step)
         elif event == "tool_result":
             self._emit_tool_preview(event_data)
+
+    def _prepare_interactive_write(
+        self,
+        event_data: Mapping[str, Any],
+        step: int,
+    ) -> None:
+        """Generate a pre-write Diff and block until the user decides."""
+
+        if self._workspace is None:
+            return
+        raw_arguments = event_data.get("arguments_json")
+        if not isinstance(raw_arguments, str):
+            return
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(arguments, dict):
+            return
+        path = arguments.get("path")
+        new_content = arguments.get("content")
+        if not isinstance(path, str) or not isinstance(new_content, str):
+            return
+
+        try:
+            target = resolve_in_workspace(self._workspace, path, must_exist=False)
+            original_content = (
+                target.read_text(encoding="utf-8") if target.exists() else ""
+            )
+            diff_text = truncate_diff(
+                generate_unified_diff(original_content, new_content, path)
+            )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            self.log_signal.emit(
+                step,
+                "✕",
+                "Diff",
+                "#f38ba8",
+                f"无法生成写入预览，已拒绝修改：{exc}",
+            )
+            self._confirmation_result = False
+            self._prepared_confirmation_path = path
+            return
+
+        additions, deletions = self._count_diff_changes(diff_text)
+        self._confirmation_result = False
+        self._confirmation_event.clear()
+        self.diff_signal.emit(path, diff_text, additions, deletions)
+        self.confirmation_signal.emit(path)
+        self.status_signal.emit("running", f"等待确认修改：{path}")
+
+        if self.confirmation_callback is not None:
+            self._confirmation_result = bool(self.confirmation_callback(path))
+        else:
+            while not self._confirmation_event.wait(timeout=0.1):
+                if self.isInterruptionRequested():
+                    self._confirmation_result = False
+                    break
+        self._prepared_confirmation_path = path
 
     def _emit_tool_preview(self, event_data: Mapping[str, Any]) -> None:
         """Emit code or Diff previews from one successful tool-result payload."""
@@ -185,6 +257,8 @@ class AgentWorker(QThread):
             return
 
         if tool_name == "write_file":
+            if self._interactive:
+                return
             diff_text = meta.get("diff")
             if file_path and isinstance(diff_text, str):
                 additions, deletions = self._count_diff_changes(diff_text)

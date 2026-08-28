@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from agent.state import AgentState, ToolCall
 from tools.filesystem import sha256_file_streaming
 from tools.registry import WRITE_POLICY, ToolRegistry
@@ -54,13 +52,22 @@ def test_workspace_snapshot_records_hash_and_modification_time(tmp_path: Path) -
     assert isinstance(metadata["mtime_ns"], int)
 
 
-def test_rollback_placeholder_reports_not_implemented(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    result = rollback_to_snapshot({"main.py": "snapshot-data"})
+def test_rollback_restores_original_files_and_removes_new_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "main.py"
+    target.write_text("original\n", encoding="utf-8", newline="\n")
+    original_hash = sha256_file_streaming(target)
+    snapshot = save_workspace_snapshot(workspace)
 
-    assert result is False
-    assert capsys.readouterr().out.strip() == "Rollback not fully implemented yet"
+    target.write_text("changed\n", encoding="utf-8", newline="\n")
+    added = workspace / "added.txt"
+    added.write_text("new\n", encoding="utf-8", newline="\n")
+
+    assert rollback_to_snapshot(snapshot) is True
+    assert sha256_file_streaming(target) == original_hash
+    assert target.read_text(encoding="utf-8") == "original\n"
+    assert added.exists() is False
 
 
 def test_generate_unified_diff_and_truncate() -> None:

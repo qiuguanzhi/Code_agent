@@ -199,7 +199,7 @@ python main.py --gui
 
 ## Phase 5 — GUI and Agent Binding
 
-Status: Implemented; awaiting user acceptance
+Status: Accepted by user
 
 ### Completed modules
 
@@ -242,4 +242,49 @@ python main.py --gui --workspace ./examples/buggy_calculator
 
 ### Pending items
 
-- Wait for user acceptance of Phase 5
+- None for Phase 5
+
+## Phase 6 — Interactive Diff, Rollback, and Drag Import
+
+Status: Implemented; awaiting user acceptance
+
+### Completed modules
+
+- `gui/worker.py`: generates the Unified Diff before `write_file`, emits the preview, blocks on `threading.Event`, and passes the cached button decision to the existing confirmation hook
+- `gui/main_window.py`: `confirm_signal(bool)` connects apply/reject buttons to the blocked worker; Diff additions are green and deletions are red
+- `utils/snapshot.py`: content-preserving temporary backups, manifest/path validation, backup and restored-file SHA-256 verification, atomic file restoration, and removal of regular files created after capture
+- `gui/main_window.py`: receives `AgentState.initial_snapshot`, performs toolbar rollback, refreshes the visible file, and records the rollback in status/log panels
+- `gui/main_window.py`: accepts local-file drops, reads UTF-8 content, atomically imports by basename through the workspace-safe filesystem tool, logs the import, and displays the file
+- `tests/test_extensions.py`: the obsolete rollback placeholder assertion now verifies real content restoration and removal of a post-snapshot file
+
+### Interaction behavior
+
+- With `设置 → 交互确认` enabled, a model `write_file` call cannot touch disk until the user clicks `应用修改`.
+- `应用修改` emits `confirm_signal(True)` and lets the validated write continue.
+- `拒绝` emits `confirm_signal(False)`; `ToolRegistry` returns `user_aborted`, leaves the file unchanged, and the result is returned to the model for its next reasoning step.
+- The latest completed Agent run publishes its initial snapshot to the window. The toolbar rollback action restores verified content and reports `已回退到初始快照`.
+- Dropped files are imported only while the Agent is idle and only when they decode as UTF-8 text.
+
+### Test and manual verification status
+
+- Status: Pass
+- Focused regression: `pytest tests/test_extensions.py tests/test_gui.py tests/test_agent_loop.py -q`
+- Focused result: 16 passed
+- Full regression: `pytest tests/ -v`
+- Full result: 59 passed, 1 skipped
+- Example logic check: real write → rejected write remains unchanged → dropped external Markdown import → toolbar rollback; passed and left `examples/buggy_calculator` unchanged
+- GUI event check: pre-write Diff visible → apply button releases worker and modifies file → rollback restores it; reject button releases worker with no write and a second model-thinking step; passed
+- Network/API usage: none for verification
+- Skip reason: Windows did not grant permission to create a test symlink.
+
+### Known limitations
+
+- Snapshots copy regular files and intentionally do not follow or restore symbolic links.
+- Snapshot disk usage is approximately the size of the selected workspace and temporary backups are removed when replaced or when the process exits.
+- Drag import supports UTF-8 text within the existing `write_file` size limit and imports into the workspace root using the source basename.
+- A same-named dropped file is atomically replaced; users should save a snapshot first when they need a reversible import.
+- Diff previews retain the existing 12,000-character head/tail limit.
+
+### Pending items
+
+- Wait for user acceptance of Phase 6
