@@ -366,3 +366,29 @@ Status: Implemented; awaiting user acceptance
 ### Pending items
 
 - User visual acceptance of Round 3
+
+## GUI Corrective Regression — 2026-08-28
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `gui/main_window.py`: removed the stray empty-editor/empty-tab artifact; GUI Agent writes now always require Diff approval; workspace code tabs support separate manual editing and explicit save; complete-conversation deletion is wired to the session header; fixed-width fonts are normalized before use.
+- `gui/widgets.py`: replaced HTML/table messages with native bordered, rounded, selectable message bubbles and per-message delete controls.
+- `gui/session.py`: supports permanent deletion of an entire conversation with safe selection/empty-session recovery.
+- `gui/theme.py`: native bubble, empty code surface, manual-save row, and delete-control styles for both themes; obsolete black placeholder styling removed.
+- `tests/test_gui.py`: regression coverage for the exact empty-state artifact, mandatory approval of modified and newly generated files, reject-without-write, manual edit/save separation, complete history deletion, native bubble structure, and Qt font warnings.
+- `process.md`: recorded root causes, behavior changes, and verification evidence.
+
+### Test status
+
+- Status: Pass
+- GUI regression: `pytest tests/test_gui.py -q` → 28 passed
+- Full regression: `pytest tests/ -q` → 82 passed, 1 skipped
+- Visual check: empty state and pending-Diff state rendered offscreen and inspected; no stray top-left rectangle remains, and Diff decision controls are visible.
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the symlink used by one path-guard test
+
+### Pending items
+
+- User visual acceptance of the corrected desktop interface

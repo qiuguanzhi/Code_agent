@@ -18,9 +18,10 @@ LIGHT_COLORS: dict[str, str] = {
     "hover": "#ececf1",
     "pressed": "#d2d2d9",
     "button_text": "#ffffff",
-    "user_bubble": "#10a37f",
-    "user_bubble_text": "#ffffff",
-    "assistant_bubble": "#ececf1",
+    "user_bubble": "#e9f6f1",
+    "user_bubble_text": "#163d34",
+    "assistant_bubble": "#f1f1f4",
+    "system_bubble": "#fff7e8",
     "thinking_background": "#f0f0f0",
 }
 
@@ -39,9 +40,10 @@ DARK_COLORS: dict[str, str] = {
     "hover": "#40414f",
     "pressed": "#4d4d5c",
     "button_text": "#ffffff",
-    "user_bubble": "#10a37f",
-    "user_bubble_text": "#ffffff",
-    "assistant_bubble": "#2d2d3a",
+    "user_bubble": "#244c43",
+    "user_bubble_text": "#e7fff7",
+    "assistant_bubble": "#2b2c38",
+    "system_bubble": "#443a29",
     "thinking_background": "#40414f",
 }
 
@@ -143,10 +145,48 @@ QLineEdit, QComboBox {{ background-color: {colors['panel']}; padding: 9px 11px; 
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus, QTreeView:focus {{
     border-color: {colors['accent']};
 }}
-QTextBrowser#conversationView {{
+QScrollArea#conversationView, QWidget#conversationContent {{
     background-color: {colors['background']};
     border: 0;
-    padding: 8px;
+}}
+QScrollArea#conversationView > QWidget > QWidget {{
+    background-color: {colors['background']};
+}}
+QFrame#userBubble, QFrame#assistantBubble, QFrame#systemBubble {{
+    border: 1px solid {colors['border']};
+    border-radius: 12px;
+}}
+QFrame#userBubble {{
+    background-color: {colors['user_bubble']};
+    border-color: {colors['accent']};
+}}
+QFrame#assistantBubble {{
+    background-color: {colors['assistant_bubble']};
+}}
+QFrame#systemBubble {{
+    background-color: {colors['system_bubble']};
+    border-color: {colors['warning']};
+}}
+QFrame#userBubble QLabel {{ color: {colors['user_bubble_text']}; }}
+QFrame#assistantBubble QLabel, QFrame#systemBubble QLabel {{ color: {colors['text']}; }}
+QFrame#userBubble QLabel, QFrame#assistantBubble QLabel,
+QFrame#systemBubble QLabel {{ background: transparent; border: 0; }}
+QLabel#messageRoleLabel {{
+    font-size: 11px;
+    font-weight: 700;
+}}
+QLabel#messageContent {{ font-size: 14px; }}
+QToolButton#messageDeleteButton {{
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    color: {colors['muted']};
+    padding: 1px 5px;
+    font-size: 16px;
+}}
+QToolButton#messageDeleteButton:hover {{
+    background-color: {colors['hover']};
+    color: {colors['error']};
 }}
 QWidget#logPanel {{
     background-color: {colors['panel']};
@@ -192,11 +232,16 @@ QTabBar::tab {{
     padding: 7px 14px;
 }}
 QTabBar::tab:selected {{ color: {colors['text']}; background: {colors['hover']}; }}
-QLabel#emptyTabPlaceholder {{
-    background-color: #000000;
-    color: #8e8e93;
+QStackedWidget#codeStack, QWidget#codeEmptyPage, QLabel#codeEmptyLabel {{
+    background-color: {colors['code_background']};
+    color: {colors['muted']};
     border: 0;
     border-radius: 0;
+}}
+QLabel#codeEmptyLabel {{ font-size: 13px; }}
+QLabel#manualFileStatus {{
+    background: transparent;
+    color: {colors['muted']};
     font-size: 12px;
 }}
 QSplitter::handle {{ background-color: {colors['border']}; width: 4px; height: 4px; }}

@@ -229,3 +229,31 @@ pytest tests/ -q
 ```
 
 唯一跳过项是当前 Windows 环境不允许创建测试符号链接，与本轮 GUI 改造无关。测试使用 `FakeProvider` 和本地临时工作区，不访问网络、不消耗真实 API。
+
+---
+
+## 2026-08-28 GUI 纠偏回归 — 空白区、审批、编辑、历史与气泡
+
+### 根因与修复
+
+1. **空代码区残留矩形**：旧兼容 `QTextEdit` 和隐藏的空 `QTabWidget` 会以 Qt 默认 `100×30` 几何留在空白页左上角。兼容编辑器现已强制隐藏；零 Tab 时把 `QTabWidget` 从 `QStackedWidget` 移除，首个文件打开时再加入。空白区只保留同背景的“未打开文件”页面。
+2. **Agent 修改没有 Diff/审批**：GUI 此前默认关闭 `interactive_confirmation`。GUI 现强制开启且不可关闭；修改现有文件和新建文件都会在写盘前展示 Unified Diff，并阻塞等待“应用修改/拒绝”。拒绝会保留原文件内容供查看，磁盘不变。
+3. **Qt 字体警告**：等宽字体统一经 `_fixed_width_font()` 创建；若系统字体没有有效 point size，则显式设置 10pt。测试安装 Qt 消息处理器，确认启动和打开代码文件时没有 `Point size <= 0`。
+4. **手动代码编辑**：工作区文件 Tab 现在可直接编辑；修改仅标记 `*` 和启用“保存文件”，点击保存后才用 SHA-256 乐观锁与原子写入落盘。此路径不显示 Agent Diff，也不复用 Agent 审批状态。
+5. **删除历史对话**：会话栏新增“删除会话”，确认后永久删除选中会话的消息、日志和过程记录；删除最后一个会话时自动创建一个全新的空会话。单条消息删除仍独立保留。
+6. **对话气泡视觉**：由富文本表格改为原生 `QFrame` 气泡；用户/Agent 左右对齐，使用真实 12px 圆角、1px 边框、内边距、角色标题和独立删除按钮，亮暗主题均使用柔和分层配色。
+
+### 验证结果
+
+```powershell
+$env:QT_QPA_PLATFORM='offscreen'
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 28 passed
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 82 passed, 1 skipped
+```
+
+- 已生成并人工检查空状态与 Diff 状态离屏截图；空白页无残留 Tab/编辑器矩形。
+- 新文件和已有文件的批准、拒绝路径均由真实 `AgentWorker + FakeProvider + 本地工具` 闭环覆盖，未访问网络。
+- 唯一跳过项仍为 Windows 当前账户无创建测试符号链接权限。

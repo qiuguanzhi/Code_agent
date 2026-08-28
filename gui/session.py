@@ -170,6 +170,27 @@ class ConversationStore:
         self.save()
         return True
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete an entire historical conversation and select a safe neighbor."""
+
+        index = next(
+            (
+                item_index
+                for item_index, conversation in enumerate(self.conversations)
+                if conversation.id == conversation_id
+            ),
+            -1,
+        )
+        if index < 0:
+            return False
+        del self.conversations[index]
+        if not self.conversations:
+            self.conversations.append(self._make_conversation())
+        next_index = min(index, len(self.conversations) - 1)
+        self.active_id = self.conversations[next_index].id
+        self.save()
+        return True
+
     def add_message(
         self,
         role: str,

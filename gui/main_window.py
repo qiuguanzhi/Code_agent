@@ -16,7 +16,6 @@ from PySide6.QtCore import (
     QSettings,
     QTimer,
     Qt,
-    QUrl,
     Signal,
     Slot,
 )
@@ -25,6 +24,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QFontDatabase,
     QKeySequence,
 )
@@ -43,6 +43,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QStackedWidget,
+    QTabWidget,
     QTextBrowser,
     QTextEdit,
     QToolBar,
@@ -53,7 +55,7 @@ from PySide6.QtWidgets import (
 
 from gui.session import Conversation, ConversationStore
 from gui.theme import get_theme
-from gui.widgets import CodeTabWidget
+from gui.widgets import ConversationScrollArea
 from gui.worker import AgentWorker
 from tools.filesystem import (
     DEFAULT_MAX_WRITE_BYTES,
@@ -101,7 +103,10 @@ class MainWindow(QMainWindow):
             else "quick"
         )
         self.mode = "goal" if self.thinking_mode == "deep" else "auto"
-        self.interactive_confirmation = False
+        # Desktop writes are always staged for explicit user approval.  Manual
+        # editor saves use their own button and intentionally do not enter this
+        # Agent confirmation path.
+        self.interactive_confirmation = True
         self.max_steps = 20
         self.worker: AgentWorker | None = None
         self._running_session_id: str | None = None
@@ -113,6 +118,7 @@ class MainWindow(QMainWindow):
         self.workspace_files: set[str] = set()
         self._tab_editors: dict[str, QTextEdit] = {}
         self._tab_previews: dict[str, dict[str, Any]] = {}
+        self._rendering_editor = False
         self._waiting_blink_on = False
         self._loading_tick = 0
         self._tool_status_state = "idle"
@@ -161,6 +167,15 @@ class MainWindow(QMainWindow):
             raise ValueError("workspace must be a directory")
         return resolved
 
+    @staticmethod
+    def _fixed_width_font() -> QFont:
+        """Return a valid fixed-width font without Qt's negative-size warning."""
+
+        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        if font.pointSizeF() <= 0:
+            font.setPointSize(10)
+        return font
+
     def _create_actions(self) -> None:
         """Create menu and toolbar actions."""
 
@@ -179,8 +194,11 @@ class MainWindow(QMainWindow):
         self.rollback_action.setShortcut(QKeySequence("Ctrl+R"))
         self.rollback_action.triggered.connect(self._rollback_snapshot)
 
-        self.interactive_action = QAction("交互确认", self, checkable=True)
+        self.interactive_action = QAction("Agent 文件修改必须批准", self, checkable=True)
         self.interactive_action.setObjectName("interactiveAction")
+        self.interactive_action.setChecked(True)
+        self.interactive_action.setEnabled(False)
+        self.interactive_action.setToolTip("GUI 模式下，Agent 的 write_file 始终先显示 Diff")
         self.interactive_action.toggled.connect(self._set_interactive_confirmation)
 
         self.rollback_toolbar_action = QAction("↩ 回退", self)
@@ -337,14 +355,17 @@ class MainWindow(QMainWindow):
         self.new_session_button = QPushButton("＋ 新建", panel)
         self.new_session_button.clicked.connect(self._new_session)
         session_row.addWidget(self.new_session_button)
+        self.delete_session_button = QPushButton("删除会话", panel)
+        self.delete_session_button.setObjectName("deleteSessionButton")
+        self.delete_session_button.clicked.connect(self._delete_active_session)
+        session_row.addWidget(self.delete_session_button)
         layout.addLayout(session_row)
 
         vertical_splitter = QSplitter(Qt.Orientation.Vertical, panel)
-        self.conversation_view = QTextBrowser(vertical_splitter)
-        self.conversation_view.setObjectName("conversationView")
-        self.conversation_view.setPlaceholderText("用户与 Agent 回复将显示在这里。")
-        self.conversation_view.setOpenLinks(False)
-        self.conversation_view.anchorClicked.connect(self._handle_conversation_link)
+        self.conversation_view = ConversationScrollArea(vertical_splitter)
+        self.conversation_view.delete_requested.connect(
+            self._delete_conversation_message
+        )
 
         log_panel = QWidget(vertical_splitter)
         log_panel.setObjectName("logPanel")
@@ -373,7 +394,7 @@ class MainWindow(QMainWindow):
         self.log_view.setObjectName("logView")
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("事件记录")
-        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.log_view.setFont(self._fixed_width_font())
         log_layout.addWidget(self.log_view, 1)
         vertical_splitter.addWidget(self.conversation_view)
         vertical_splitter.addWidget(log_panel)
@@ -424,22 +445,54 @@ class MainWindow(QMainWindow):
         return panel
 
     def _create_code_panel(self) -> QWidget:
-        """Create closable IDE-style file tabs and Diff decision buttons."""
+        """Create empty state, editable file tabs, save, and Diff decisions."""
 
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.code_tabs = CodeTabWidget(panel)
+
+        self.code_stack = QStackedWidget(panel)
+        self.code_stack.setObjectName("codeStack")
+        self.code_empty_page = QWidget(self.code_stack)
+        self.code_empty_page.setObjectName("codeEmptyPage")
+        empty_layout = QVBoxLayout(self.code_empty_page)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_label = QLabel("未打开文件", self.code_empty_page)
+        empty_label.setObjectName("codeEmptyLabel")
+        empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_label, 1)
+        self.code_stack.addWidget(self.code_empty_page)
+
+        self.code_tabs = QTabWidget(self.code_stack)
         self.code_tabs.setObjectName("codeTabs")
         self.code_tabs.setTabsClosable(True)
         self.code_tabs.setTabBarAutoHide(False)
         self.code_tabs.tabCloseRequested.connect(self._close_code_tab)
         self.code_tabs.currentChanged.connect(self._code_tab_changed)
-        layout.addWidget(self.code_tabs, 1)
+        self.code_stack.addWidget(self.code_tabs)
+        self.code_stack.setCurrentWidget(self.code_empty_page)
+        layout.addWidget(self.code_stack, 1)
 
         self._empty_code_view = QTextEdit(panel)
         self._empty_code_view.setReadOnly(True)
+        # Compatibility target for code_view while the stack shows its real
+        # empty page.  An unparented layout child defaults to a visible 100x30
+        # editor, which was the stray rounded rectangle reported by users.
+        self._empty_code_view.hide()
         self.code_view = self._empty_code_view
+        self._sync_code_stack()
+
+        manual_row = QHBoxLayout()
+        self.manual_file_status = QLabel("选择工作区文件后可手动编辑", panel)
+        self.manual_file_status.setObjectName("manualFileStatus")
+        manual_row.addWidget(self.manual_file_status)
+        manual_row.addStretch(1)
+        self.manual_save_button = QPushButton("保存文件", panel)
+        self.manual_save_button.setObjectName("manualSaveButton")
+        self.manual_save_button.setEnabled(False)
+        self.manual_save_button.clicked.connect(self._save_manual_file)
+        manual_row.addWidget(self.manual_save_button)
+        layout.addLayout(manual_row)
 
         self.decision_widget = QWidget(panel)
         decisions = QHBoxLayout(self.decision_widget)
@@ -684,6 +737,7 @@ class MainWindow(QMainWindow):
     def update_code(self, file_path: str, content: str) -> None:
         """Open or update a file tab from Agent read_file or drag preview."""
 
+        workspace_backed, base_sha256 = self._workspace_backing(file_path)
         state = self._tab_previews.setdefault(
             file_path,
             {
@@ -692,11 +746,42 @@ class MainWindow(QMainWindow):
                 "additions": 0,
                 "deletions": 0,
                 "pending": False,
+                "workspace_backed": False,
+                "base_sha256": "",
+                "dirty": False,
             },
         )
-        state.update({"code": content, "diff": "", "additions": 0, "deletions": 0})
+        state.update(
+            {
+                "code": content,
+                "diff": "",
+                "additions": 0,
+                "deletions": 0,
+                "pending": False,
+                "workspace_backed": workspace_backed,
+                "base_sha256": base_sha256,
+                "dirty": False,
+            }
+        )
         self._ensure_code_tab(file_path)
         self._render_code_tab(file_path)
+
+    def _workspace_backing(self, file_path: str) -> tuple[bool, str]:
+        """Return whether a preview maps to a current regular workspace file."""
+
+        if self.workspace_root is None:
+            return False, ""
+        try:
+            target = resolve_in_workspace(
+                self.workspace_root,
+                file_path,
+                must_exist=True,
+            )
+            if not target.is_file():
+                return False, ""
+            return True, sha256_file_streaming(target)
+        except (OSError, RuntimeError, ValueError):
+            return False, ""
 
     @Slot(str, str, int, int)
     def update_diff(
@@ -708,6 +793,20 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Open a colorized Diff in its file tab."""
 
+        workspace_backed, base_sha256 = self._workspace_backing(file_path)
+        original_content = ""
+        if workspace_backed and self.workspace_root is not None:
+            try:
+                target = resolve_in_workspace(
+                    self.workspace_root,
+                    file_path,
+                    must_exist=True,
+                )
+                original_content = target.read_text(encoding="utf-8")
+            except (OSError, RuntimeError, UnicodeError, ValueError):
+                workspace_backed = False
+                base_sha256 = ""
+
         state = self._tab_previews.setdefault(
             file_path,
             {
@@ -716,14 +815,21 @@ class MainWindow(QMainWindow):
                 "additions": 0,
                 "deletions": 0,
                 "pending": False,
+                "workspace_backed": False,
+                "base_sha256": "",
+                "dirty": False,
             },
         )
         state.update(
             {
+                "code": original_content,
                 "diff": diff_text,
                 "additions": additions,
                 "deletions": deletions,
-                "pending": self.interactive_confirmation,
+                "pending": True,
+                "workspace_backed": workspace_backed,
+                "base_sha256": base_sha256,
+                "dirty": False,
             }
         )
         self._ensure_code_tab(file_path)
@@ -736,60 +842,187 @@ class MainWindow(QMainWindow):
         if editor is None:
             editor = QTextEdit(self.code_tabs)
             editor.setObjectName("codeView")
-            editor.setReadOnly(True)
-            editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+            editor.setAcceptRichText(False)
+            editor.setFont(self._fixed_width_font())
             editor.setPlaceholderText("无代码预览")
+            editor.textChanged.connect(
+                lambda path=file_path: self._on_editor_text_changed(path)
+            )
             self._tab_editors[file_path] = editor
             index = self.code_tabs.addTab(editor, Path(file_path).name or file_path)
             self.code_tabs.setTabToolTip(index, file_path)
-            self.code_tabs.refresh_empty_placeholder()
+            self._sync_code_stack()
         self.code_tabs.setCurrentWidget(editor)
         self.code_view = editor
         return editor
 
     def _render_code_tab(self, file_path: str) -> None:
-        """Render code and Diff using the active semantic theme palette."""
+        """Render an editable plain file or a read-only colorized Diff."""
 
         editor = self._tab_editors.get(file_path)
         state = self._tab_previews.get(file_path)
         if editor is None or state is None:
             return
-        sections: list[str] = []
-        code = str(state.get("code", ""))
-        if code:
-            sections.append(
-                f'<div style="color:{self.theme_colors["accent"]}; font-weight:600">'
-                f"{escape('# 文件：' + file_path)}</div>"
-                f'<pre style="color:{self.theme_colors["text"]}; '
-                f'background:{self.theme_colors["code_background"]}">'
-                f"{escape(code.rstrip())}</pre>"
-            )
         diff_text = str(state.get("diff", ""))
-        if diff_text:
-            additions = int(state.get("additions", 0))
-            deletions = int(state.get("deletions", 0))
-            colored_lines: list[str] = []
-            for line in diff_text.rstrip().splitlines():
-                if line.startswith("+") and not line.startswith("+++"):
-                    color = self.theme_colors["success"]
-                elif line.startswith("-") and not line.startswith("---"):
-                    color = self.theme_colors["error"]
-                elif line.startswith("@@"):
-                    color = self.theme_colors["purple"]
-                else:
-                    color = self.theme_colors["muted"]
-                colored_lines.append(
-                    f'<span style="color:{color}">{escape(line)}</span>'
+        self._rendering_editor = True
+        try:
+            if diff_text:
+                editor.setReadOnly(True)
+                additions = int(state.get("additions", 0))
+                deletions = int(state.get("deletions", 0))
+                colored_lines: list[str] = []
+                for line in diff_text.rstrip().splitlines():
+                    if line.startswith("+") and not line.startswith("+++"):
+                        color = self.theme_colors["success"]
+                    elif line.startswith("-") and not line.startswith("---"):
+                        color = self.theme_colors["error"]
+                    elif line.startswith("@@"):
+                        color = self.theme_colors["purple"]
+                    else:
+                        color = self.theme_colors["muted"]
+                    colored_lines.append(
+                        f'<span style="color:{color}">{escape(line)}</span>'
+                    )
+                header = f"Unified Diff：{file_path} (+{additions} / -{deletions})"
+                editor.setHtml(
+                    f'<div style="color:{self.theme_colors["warning"]}; '
+                    f'font-weight:700; margin-bottom:8px">{escape(header)}</div>'
+                    f'<pre style="background:{self.theme_colors["code_background"]}">'
+                    + "\n".join(colored_lines)
+                    + "</pre>"
                 )
-            header = f"# Unified Diff：{file_path} (+{additions} / -{deletions})"
-            sections.append(
-                f'<div style="color:{self.theme_colors["warning"]}; font-weight:600">'
-                f"{escape(header)}</div>"
-                f'<pre style="background:{self.theme_colors["code_background"]}">'
-                + "\n".join(colored_lines)
-                + "</pre>"
+            else:
+                editor.setReadOnly(not bool(state.get("workspace_backed")))
+                editor.setPlainText(str(state.get("code", "")))
+                editor.document().setModified(bool(state.get("dirty")))
+        finally:
+            self._rendering_editor = False
+        self._refresh_manual_save_control()
+
+    @Slot()
+    def _save_manual_file(self) -> None:
+        """Persist the active user's plain-text edits without Agent Diff approval."""
+
+        file_path = self._current_code_path()
+        if file_path is None or self.workspace_root is None:
+            return
+        state = self._tab_previews.get(file_path)
+        editor = self._tab_editors.get(file_path)
+        if state is None or editor is None:
+            return
+        if state.get("pending") is True or state.get("diff"):
+            self.update_status("error", "请先处理 Agent 提出的 Diff")
+            return
+        if state.get("workspace_backed") is not True:
+            self.update_status("error", "仅预览文件不能直接保存到工作区")
+            return
+        result = write_file(
+            self.workspace_root,
+            file_path,
+            editor.toPlainText(),
+            str(state.get("base_sha256", "")),
+        )
+        if result.get("ok") is not True:
+            error = result.get("error")
+            reason = (
+                str(error.get("message", "保存失败"))
+                if isinstance(error, dict)
+                else "保存失败"
             )
-        editor.setHtml("<br>".join(sections))
+            self.update_status("error", reason)
+            return
+        meta = result.get("meta")
+        new_hash = str(meta.get("sha256", "")) if isinstance(meta, dict) else ""
+        state.update(
+            {
+                "code": editor.toPlainText(),
+                "base_sha256": new_hash,
+                "dirty": False,
+            }
+        )
+        editor.document().setModified(False)
+        self._set_tab_dirty(file_path, False)
+        self._refresh_manual_save_control()
+        self.update_status("ready", f"已手动保存：{file_path}")
+
+    def _on_editor_text_changed(self, file_path: str) -> None:
+        """Track manual edits without mixing them into Agent Diff state."""
+
+        if self._rendering_editor:
+            return
+        state = self._tab_previews.get(file_path)
+        editor = self._tab_editors.get(file_path)
+        if state is None or editor is None or state.get("diff"):
+            return
+        state["code"] = editor.toPlainText()
+        if state.get("workspace_backed") is True:
+            state["dirty"] = True
+            self._set_tab_dirty(file_path, True)
+        self._refresh_manual_save_control()
+
+    def _current_code_path(self) -> str | None:
+        """Return the path represented by the current code tab."""
+
+        widget = self.code_tabs.currentWidget()
+        return next(
+            (path for path, editor in self._tab_editors.items() if editor is widget),
+            None,
+        )
+
+    def _set_tab_dirty(self, file_path: str, dirty: bool) -> None:
+        """Reflect unsaved manual state with a conventional tab asterisk."""
+
+        editor = self._tab_editors.get(file_path)
+        if editor is None:
+            return
+        index = self.code_tabs.indexOf(editor)
+        if index < 0:
+            return
+        base_name = Path(file_path).name or file_path
+        self.code_tabs.setTabText(index, f"{base_name}*" if dirty else base_name)
+
+    def _refresh_manual_save_control(self) -> None:
+        """Enable manual save only for a dirty, editable workspace file."""
+
+        file_path = self._current_code_path()
+        state = self._tab_previews.get(file_path) if file_path is not None else None
+        enabled = bool(
+            state is not None
+            and state.get("workspace_backed") is True
+            and state.get("dirty") is True
+            and not state.get("diff")
+            and state.get("pending") is not True
+        )
+        self.manual_save_button.setEnabled(enabled)
+        if state is None:
+            text = "选择工作区文件后可手动编辑"
+        elif state.get("diff"):
+            text = "Agent 修改提案：请批准或拒绝"
+        elif state.get("workspace_backed") is not True:
+            text = "仅预览（不可保存）"
+        elif state.get("dirty") is True:
+            text = "有未保存的手动修改"
+        else:
+            text = "可手动编辑"
+        self.manual_file_status.setText(text)
+
+    def _sync_code_stack(self) -> None:
+        """Show a seamless empty page or the real tab widget, never a fake tab."""
+
+        if self.code_tabs.count() == 0:
+            # Removing the unused QTabWidget also prevents Qt from leaving its
+            # default 100x30 pane painted over the empty page on some Windows
+            # styles/platform plugins.
+            if self.code_stack.indexOf(self.code_tabs) >= 0:
+                self.code_stack.removeWidget(self.code_tabs)
+            self.code_tabs.hide()
+            self.code_stack.setCurrentWidget(self.code_empty_page)
+            self.code_view = self._empty_code_view
+        else:
+            if self.code_stack.indexOf(self.code_tabs) < 0:
+                self.code_stack.addWidget(self.code_tabs)
+            self.code_tabs.show()
+            self.code_stack.setCurrentWidget(self.code_tabs)
 
     def _clear_diff_decoration(self, file_path: str, *, clear_code: bool) -> None:
         """Remove every Diff format immediately after a user decision."""
@@ -809,6 +1042,7 @@ class MainWindow(QMainWindow):
 
         widget = self.code_tabs.widget(index) if index >= 0 else None
         self.code_view = widget if isinstance(widget, QTextEdit) else self._empty_code_view
+        self._refresh_manual_save_control()
 
     @Slot(int)
     def _close_code_tab(self, index: int) -> None:
@@ -826,12 +1060,24 @@ class MainWindow(QMainWindow):
                 self._reject_pending_change()
             else:
                 self._clear_diff_decoration(key, clear_code=False)
+        if key is not None:
+            state = self._tab_previews.get(key)
+            if state is not None and state.get("dirty") is True:
+                decision = QMessageBox.question(
+                    self,
+                    "未保存的手动修改",
+                    f"{key} 有未保存的手动修改，是否放弃并关闭？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if decision != QMessageBox.StandardButton.Yes:
+                    return
         self.code_tabs.removeTab(index)
         if key is not None:
             editor = self._tab_editors.pop(key)
             self._tab_previews.pop(key, None)
             editor.deleteLater()
-        self.code_tabs.refresh_empty_placeholder()
+        self._sync_code_stack()
         self._code_tab_changed(self.code_tabs.currentIndex())
 
     def _tab_has_pending_diff(self, file_path: str) -> bool:
@@ -985,11 +1231,7 @@ class MainWindow(QMainWindow):
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
-        self._clear_diff_decoration(path, clear_code=True)
-        editor = self._tab_editors.get(path)
-        if editor is not None:
-            editor.clear()
-            editor.setPlaceholderText("无代码预览")
+        self._clear_diff_decoration(path, clear_code=False)
         session_id = self._running_session_id or self.session_store.active_id
         self.session_store.update_waiting_message(
             f"⛔ 已拒绝修改：{path}",
@@ -1037,6 +1279,26 @@ class MainWindow(QMainWindow):
         self._refresh_session_combo()
         self._render_active_session()
 
+    @Slot()
+    def _delete_active_session(self) -> None:
+        """Delete the complete active historical conversation after confirmation."""
+
+        conversation = self.session_store.active
+        decision = QMessageBox.question(
+            self,
+            "删除历史对话",
+            f"确定永久删除“{conversation.title}”及其全部消息和日志吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+        if not self.session_store.delete_conversation(conversation.id):
+            return
+        self._refresh_session_combo()
+        self._render_active_session()
+        self.update_status("ready", "历史对话已删除")
+
     @Slot(int)
     def _switch_session(self, index: int) -> None:
         """Switch both message and log views to the selected session."""
@@ -1049,60 +1311,24 @@ class MainWindow(QMainWindow):
         """Render modern left/right message bubbles and session activity."""
 
         conversation = self.session_store.active
-        message_html: list[str] = []
-        for index, message in enumerate(conversation.messages):
-            role = str(message.get("role", "system"))
-            content = escape(str(message.get("content", ""))).replace("\n", "<br>")
-            can_delete = role in {"user", "assistant"}
-            delete_link = (
-                f'<a href="delete://{conversation.id}/{index}" '
-                f'style="color:{self.theme_colors["muted"]}; text-decoration:none">×</a>'
-                if can_delete
-                else ""
-            )
-            if role == "user":
-                background = self.theme_colors.get("user_bubble", "#10a37f")
-                foreground = self.theme_colors.get("user_bubble_text", "#ffffff")
-                row = (
-                    '<table width="100%" cellspacing="0" cellpadding="6"><tr>'
-                    '<td width="18%"></td>'
-                    f'<td align="right" bgcolor="{background}" '
-                    f'style="color:{foreground}; border-radius:12px; padding:10px">'
-                    f'{content}&nbsp;&nbsp;{delete_link}</td></tr></table>'
-                )
-            else:
-                background = self.theme_colors.get(
-                    "assistant_bubble",
-                    self.theme_colors["panel"],
-                )
-                foreground = self.theme_colors["text"]
-                label = "Agent" if role == "assistant" else "系统"
-                row = (
-                    '<table width="100%" cellspacing="0" cellpadding="6"><tr>'
-                    f'<td bgcolor="{background}" style="color:{foreground}; '
-                    f'border-radius:12px; padding:10px"><b>{label}</b><br>{content}'
-                    f'&nbsp;&nbsp;{delete_link}</td><td width="18%"></td>'
-                    '</tr></table>'
-                )
-            message_html.append(row)
-        self.conversation_view.setHtml("".join(message_html))
+        self.conversation_view.set_messages(
+            conversation.id,
+            conversation.messages,
+        )
         self.log_view.clear()
         for log in conversation.logs:
             if log.get("step") == 0:
                 self.log_view.append(self._format_log_html(log))
         self._render_process(conversation)
 
-    @Slot(QUrl)
-    def _handle_conversation_link(self, url: QUrl) -> None:
-        """Permanently delete the message targeted by an in-bubble close link."""
+    @Slot(str, int)
+    def _delete_conversation_message(
+        self,
+        conversation_id: str,
+        message_index: int,
+    ) -> None:
+        """Permanently delete a message requested by its native bubble."""
 
-        if url.scheme() != "delete":
-            return
-        conversation_id = url.host()
-        try:
-            message_index = int(url.path().strip("/"))
-        except ValueError:
-            return
         if not self.session_store.delete_message(conversation_id, message_index):
             return
         self._refresh_session_combo()
@@ -1210,6 +1436,9 @@ class MainWindow(QMainWindow):
             for file_path in tuple(self._tab_previews):
                 if self._tab_has_pending_diff(file_path):
                     self._clear_diff_decoration(file_path, clear_code=False)
+        if not self._close_all_code_tabs():
+            self.update_status("ready", "已取消切换工作区")
+            return
         try:
             self._synchronize_process_cwd(workspace)
         except OSError as exc:
@@ -1219,7 +1448,6 @@ class MainWindow(QMainWindow):
         self.snapshot_data = {}
         self.snapshot_timestamp = None
         self.workspace_root = workspace
-        self._close_all_code_tabs()
         self._populate_workspace_files()
         self._refresh_workspace_label()
         self._refresh_snapshot_label()
@@ -1582,11 +1810,15 @@ class MainWindow(QMainWindow):
             self.update_code(file_path, content)
         self._populate_workspace_files()
 
-    def _close_all_code_tabs(self) -> None:
-        """Close and forget all code previews when the workspace changes."""
+    def _close_all_code_tabs(self) -> bool:
+        """Close all previews, stopping safely if a dirty-tab prompt is cancelled."""
 
         while self.code_tabs.count():
+            previous_count = self.code_tabs.count()
             self._close_code_tab(0)
+            if self.code_tabs.count() == previous_count:
+                return False
+        return True
 
     @Slot()
     def _toggle_theme(self) -> None:
@@ -1627,11 +1859,14 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _set_interactive_confirmation(self, checked: bool) -> None:
-        """Enable or disable Diff button confirmation for write_file."""
+        """Keep GUI Agent writes on the mandatory Diff-approval path."""
 
-        self.interactive_confirmation = checked
-        state = "开启" if checked else "关闭"
-        self.statusBar().showMessage(f"交互确认已{state}")
+        self.interactive_confirmation = True
+        if not checked:
+            self.interactive_action.blockSignals(True)
+            self.interactive_action.setChecked(True)
+            self.interactive_action.blockSignals(False)
+        self.statusBar().showMessage("Agent 文件修改审批已开启")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Persist UI state and defer destruction until the worker exits."""
