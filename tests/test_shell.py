@@ -1,6 +1,7 @@
 """Tests for bounded, timeout-aware command execution."""
 
 import sys
+import time
 from pathlib import Path
 
 from tools.shell import BoundedHeadTailBuffer, build_sanitized_env, run_command
@@ -115,3 +116,24 @@ def test_run_command_rejects_shell_executable(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert result["error"]["code"] == "invalid_command"
 
+
+def test_run_command_cancels_long_process_within_two_seconds(tmp_path: Path) -> None:
+    """Poll the stop flag and terminate the entire child process group promptly."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    started = time.monotonic()
+
+    result = run_command(
+        workspace,
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        timeout_seconds=20,
+        max_output_chars=1_000,
+        should_stop=lambda: time.monotonic() - started >= 0.2,
+    )
+
+    duration = time.monotonic() - started
+    assert result["ok"] is False
+    assert result["error"]["code"] == "cancelled"
+    assert result["meta"]["cancelled"] is True
+    assert duration < 2.0

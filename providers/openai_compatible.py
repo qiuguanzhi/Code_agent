@@ -20,6 +20,10 @@ class ProviderResponseError(ValueError):
     """Raised when a provider response cannot be normalized safely."""
 
 
+class ProviderStopRequested(RuntimeError):
+    """Raised before transport when cooperative cancellation is already set."""
+
+
 def _field(value: Any, name: str, default: Any = None) -> Any:
     """Read a field from an SDK object or a plain mapping."""
 
@@ -51,6 +55,8 @@ class OpenAICompatibleProvider(ModelProvider):
         model: str,
         *,
         extra_body: Mapping[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
         temperature: float = 0.0,
     ) -> None:
         if not model.strip():
@@ -58,6 +64,8 @@ class OpenAICompatibleProvider(ModelProvider):
         self.client = client
         self.model = model
         self.extra_body = dict(extra_body or {})
+        self.reasoning_effort = reasoning_effort
+        self.should_stop = should_stop
         self.temperature = temperature
 
     def complete(
@@ -67,14 +75,21 @@ class OpenAICompatibleProvider(ModelProvider):
     ) -> AssistantTurn:
         """Make one non-streaming request and preserve native protocol fields."""
 
+        if self.should_stop is not None and self.should_stop():
+            raise ProviderStopRequested("user requested stop before model request")
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": list(messages),
+            "tools": list(tools),
+            "tool_choice": "auto",
+            "temperature": self.temperature,
+            "stream": False,
+            "extra_body": self.extra_body,
+        }
+        if self.reasoning_effort is not None:
+            request["reasoning_effort"] = self.reasoning_effort
         response = self.client.chat.completions.create(
-            model=self.model,
-            messages=list(messages),
-            tools=list(tools),
-            tool_choice="auto",
-            temperature=self.temperature,
-            stream=False,
-            extra_body=self.extra_body,
+            **request,
         )
         choices = _field(response, "choices", [])
         if not isinstance(choices, Sequence) or not choices:
@@ -121,6 +136,8 @@ class OpenAICompatibleProvider(ModelProvider):
             protocol_message["tool_calls"] = protocol_calls
 
         reasoning_content = _field(message, "reasoning_content")
+        if reasoning_content is None:
+            reasoning_content = _field(message, "reasoning")
         if reasoning_content is not None:
             if not isinstance(reasoning_content, str):
                 raise ProviderResponseError("reasoning_content must be text or null")
@@ -138,16 +155,31 @@ class OpenAICompatibleProvider(ModelProvider):
             usage=_usage_dict(_field(response, "usage")),
         )
 
+    def set_stop_callback(self, callback: Callable[[], bool]) -> None:
+        """Attach the worker cancellation flag before the first request."""
+
+        self.should_stop = callback
+
+    def cancel(self) -> None:
+        """Best-effort transport cancellation for an in-flight SDK request."""
+
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
 
 def create_provider_from_env(
     provider_name: str,
     *,
     model: str | None = None,
+    mode: str = "auto",
     client_factory: Callable[..., Any] = OpenAI,
 ) -> OpenAICompatibleProvider:
     """Build a DeepSeek or Bailian provider using environment-only secrets."""
 
     normalized = provider_name.strip().lower()
+    if mode not in {"auto", "goal"}:
+        raise ProviderConfigurationError("mode must be 'auto' or 'goal'")
     resolved_model = model or os.getenv("AGENT_MODEL")
     if not resolved_model:
         raise ProviderConfigurationError("AGENT_MODEL is required")
@@ -158,7 +190,17 @@ def create_provider_from_env(
             raise ProviderConfigurationError("DEEPSEEK_API_KEY is required")
         base_url = os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
         client = client_factory(api_key=api_key, base_url=base_url, max_retries=0)
-        return OpenAICompatibleProvider(client, resolved_model)
+        thinking_body: dict[str, Any]
+        if mode == "goal":
+            thinking_body = {"thinking": {"type": "enabled"}}
+        else:
+            thinking_body = {"thinking": {"type": "disabled"}}
+        return OpenAICompatibleProvider(
+            client,
+            resolved_model,
+            extra_body=thinking_body,
+            reasoning_effort="high" if mode == "goal" else None,
+        )
 
     if normalized in {"bailian", "dashscope"}:
         api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -171,8 +213,7 @@ def create_provider_from_env(
         return OpenAICompatibleProvider(
             client,
             resolved_model,
-            extra_body={"enable_thinking": False},
+            extra_body={"enable_thinking": mode == "goal"},
         )
 
     raise ProviderConfigurationError(f"unsupported provider: {provider_name}")
-

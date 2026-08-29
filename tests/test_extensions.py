@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agent.state import AgentState, ToolCall
 from tools.filesystem import sha256_file_streaming
-from tools.registry import WRITE_POLICY, ToolRegistry
+from tools.registry import WRITE_POLICY, ToolRegistry, ToolStopRequested
 from utils.diff import generate_unified_diff, truncate_diff
 from utils.snapshot import rollback_to_snapshot, save_workspace_snapshot
 
@@ -121,4 +123,20 @@ def test_rejected_write_does_not_touch_disk(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert result["error"]["code"] == "user_aborted"
     assert result["meta"]["confirmed_by_user"] is False
+    assert target.read_text(encoding="utf-8") == "original\n"
+
+
+def test_tool_registry_checks_stop_before_dispatch(tmp_path: Path) -> None:
+    """Never enter a local tool after cancellation was requested."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "main.py"
+    target.write_text("original\n", encoding="utf-8")
+    registry = ToolRegistry(workspace, should_stop=lambda: True)
+    call = _write_call("main.py", "changed\n", sha256_file_streaming(target))
+
+    with pytest.raises(ToolStopRequested):
+        registry.execute_one_call(call, AgentState())
+
     assert target.read_text(encoding="utf-8") == "original\n"

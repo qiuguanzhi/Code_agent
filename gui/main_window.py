@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from datetime import datetime
 from html import escape
@@ -11,6 +12,7 @@ from typing import Any
 
 from PySide6.QtCore import (
     QDir,
+    QEvent,
     QModelIndex,
     QPoint,
     QSettings,
@@ -26,7 +28,11 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QFontDatabase,
+    QIcon,
+    QKeyEvent,
     QKeySequence,
+    QTextCharFormat,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,6 +50,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QStyle,
     QTabWidget,
     QTextBrowser,
     QTextEdit,
@@ -55,7 +62,7 @@ from PySide6.QtWidgets import (
 
 from gui.session import Conversation, ConversationStore
 from gui.theme import get_theme
-from gui.widgets import ConversationScrollArea
+from gui.widgets import ConversationScrollArea, FileMentionPopup
 from gui.worker import AgentWorker
 from tools.filesystem import (
     DEFAULT_MAX_WRITE_BYTES,
@@ -124,6 +131,8 @@ class MainWindow(QMainWindow):
         self._tool_status_state = "idle"
         self._tool_status_name = ""
         self._tool_error_detail = ""
+        self._mention_span: tuple[int, int] | None = None
+        self._updating_mention_text = False
 
         self.setWindowTitle("Mini Coding Agent")
         self.setAcceptDrops(True)
@@ -186,8 +195,15 @@ class MainWindow(QMainWindow):
 
         self.save_snapshot_action = QAction("保存快照", self)
         self.save_snapshot_action.setObjectName("saveSnapshotAction")
-        self.save_snapshot_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_snapshot_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.save_snapshot_action.triggered.connect(self._save_snapshot)
+
+        self.save_file_action = QAction("保存当前文件", self)
+        self.save_file_action.setObjectName("saveCurrentFileAction")
+        self.save_file_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_file_action.setEnabled(False)
+        self.save_file_action.triggered.connect(self._save_manual_file)
+        self.addAction(self.save_file_action)
 
         self.rollback_action = QAction("退回初始快照", self)
         self.rollback_action.setObjectName("rollbackAction")
@@ -209,6 +225,7 @@ class MainWindow(QMainWindow):
 
         file_menu = self.menuBar().addMenu("文件")
         file_menu.addAction(self.open_workspace_action)
+        file_menu.addAction(self.save_file_action)
         file_menu.addAction(self.save_snapshot_action)
         file_menu.addAction(self.rollback_action)
 
@@ -344,6 +361,7 @@ class MainWindow(QMainWindow):
         """Create session history, message stream, compact logs, and input."""
 
         panel = QWidget(self)
+        panel.setObjectName("conversationPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         session_row = QHBoxLayout()
@@ -372,23 +390,25 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_panel)
         log_layout.setContentsMargins(8, 8, 8, 8)
         log_layout.setSpacing(6)
-        self.thinking_container = QWidget(log_panel)
+        self.thinking_container = QWidget(panel)
         self.thinking_container.setObjectName("thinkingContainer")
         thinking_layout = QVBoxLayout(self.thinking_container)
         thinking_layout.setContentsMargins(10, 8, 10, 8)
-        self.thinking_toggle = QPushButton("▶ 💭 深度思考", log_panel)
+        self.thinking_toggle = QPushButton("▶ 💭 深度思考", self.thinking_container)
         self.thinking_toggle.setObjectName("thinkingToggle")
         self.thinking_toggle.setCheckable(True)
         self.thinking_toggle.setChecked(False)
         self.thinking_toggle.toggled.connect(self._toggle_thinking_details)
         thinking_layout.addWidget(self.thinking_toggle)
-        self.thinking_view = QTextBrowser(log_panel)
+        self.thinking_view = QTextBrowser(self.thinking_container)
         self.thinking_view.setObjectName("thinkingView")
         self.thinking_view.setMaximumHeight(180)
         self.thinking_view.setVisible(False)
         thinking_layout.addWidget(self.thinking_view)
         self.thinking_container.setVisible(False)
-        log_layout.addWidget(self.thinking_container)
+        # Keep provider reasoning before the conversation/final answer rather
+        # than mixing it into the compact tool-event log below.
+        layout.addWidget(self.thinking_container)
 
         self.log_view = QTextEdit(log_panel)
         self.log_view.setObjectName("logView")
@@ -425,8 +445,15 @@ class MainWindow(QMainWindow):
         self.task_input = QLineEdit(panel)
         self.task_input.setObjectName("taskInput")
         self.task_input.setPlaceholderText("")
+        self.task_input.setMaxLength(1_000_000)
         self.task_input.returnPressed.connect(self._submit_task)
+        self.task_input.textChanged.connect(self._handle_mention_text)
+        self.task_input.installEventFilter(self)
         input_row.addWidget(self.task_input, 1)
+        self.file_mention_popup = FileMentionPopup(self)
+        self.file_mention_popup.mention_selected.connect(
+            self._insert_file_mention
+        )
         self.send_button = QPushButton("发送", panel)
         self.send_button.setObjectName("sendButton")
         self.send_button.clicked.connect(self._submit_task)
@@ -522,13 +549,17 @@ class MainWindow(QMainWindow):
     def _submit_task(self) -> None:
         """Capture, clear, persist, and submit one user message."""
 
+        if self.worker is not None and self.worker.isRunning():
+            if self._running_session_id == self.session_store.active_id:
+                self._stop_agent()
+            else:
+                self.update_status("running", "另一个会话的 Agent 仍在运行")
+            return
+        self.file_mention_popup.hide()
         task = self.task_input.text().strip()
         if not task:
             return
         self.task_input.clear()
-        if self.worker is not None and self.worker.isRunning():
-            self.update_status("error", "已有任务正在运行")
-            return
         conversation = self.session_store.active
         self.session_store.add_message("user", task, conversation_id=conversation.id)
         self._refresh_session_combo()
@@ -547,8 +578,9 @@ class MainWindow(QMainWindow):
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
-        self.send_button.setEnabled(False)
+        self.task_input.setEnabled(False)
         self.thinking_mode_combo.setEnabled(False)
+        self._set_send_button_mode(True)
         self._start_loading()
         if self.thinking_mode == "deep":
             self.thinking_container.setVisible(True)
@@ -563,6 +595,7 @@ class MainWindow(QMainWindow):
         self.worker.snapshot_signal.connect(self._store_agent_snapshot)
         self.worker.finished_signal.connect(self._handle_worker_finished)
         self.worker.progress_signal.connect(self._append_process_update)
+        self.worker.reasoning_signal.connect(self._append_reasoning)
         self.worker.tool_status_signal.connect(self.update_tool_status)
         self.confirm_signal.connect(self.worker.resolve_write_confirmation)
         try:
@@ -574,11 +607,131 @@ class MainWindow(QMainWindow):
             )
         except (RuntimeError, ValueError) as exc:
             self._disconnect_confirmation()
-            self.send_button.setEnabled(True)
+            self.task_input.setEnabled(True)
             self.thinking_mode_combo.setEnabled(True)
+            self._set_send_button_mode(False)
             self._stop_loading()
             self._running_session_id = None
             self.update_status("error", str(exc))
+
+    @Slot()
+    def _stop_agent(self) -> None:
+        """Request cooperative cancellation without discarding partial state."""
+
+        if self.worker is None or not self.worker.isRunning():
+            return
+        self.worker.stop()
+        self.send_button.setEnabled(False)
+        self.send_button.setToolTip("正在停止 Agent")
+        self.update_status("running", "正在停止 Agent……")
+
+    def _set_send_button_mode(self, running: bool, *, enabled: bool = True) -> None:
+        """Switch the submit control between text-send and stop-circle modes."""
+
+        self.send_button.setProperty("stopMode", running)
+        self.send_button.setText("" if running else "发送")
+        self.send_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+            if running
+            else QIcon()
+        )
+        self.send_button.setToolTip("停止当前任务" if running else "发送任务")
+        self.send_button.setEnabled(enabled)
+        style = self.send_button.style()
+        style.unpolish(self.send_button)
+        style.polish(self.send_button)
+        self.send_button.update()
+
+    @Slot(str)
+    def _handle_mention_text(self, text: str) -> None:
+        """Open and filter workspace mentions for the token at the caret."""
+
+        if self._updating_mention_text:
+            return
+        if self.workspace_root is None:
+            self._mention_span = None
+            self.file_mention_popup.hide()
+            return
+        caret = self.task_input.cursorPosition()
+        prefix = text[:caret]
+        match = re.search(r"(?<!\S)@([^\s]*)$", prefix)
+        if match is None:
+            self._mention_span = None
+            self.file_mention_popup.hide()
+            return
+        query = match.group(1)
+        self._mention_span = (match.start(), match.end())
+        if query.casefold() == "workplace":
+            self._insert_file_mention("workplace")
+            return
+        self.file_mention_popup.set_files(sorted(self.workspace_files))
+        self.file_mention_popup.show_matches(self.task_input, query)
+
+    @Slot(str)
+    def _insert_file_mention(self, value: str) -> None:
+        """Replace the active @ token with one path or a workspace summary."""
+
+        if self._mention_span is None:
+            return
+        start, end = self._mention_span
+        text = self.task_input.text()
+        replacement = (
+            self._workspace_reference_summary()
+            if value == "workplace"
+            else f"@{value}"
+        )
+        suffix = " " if end == len(text) or not text[end:].startswith(" ") else ""
+        updated = text[:start] + replacement + suffix + text[end:]
+        self._updating_mention_text = True
+        try:
+            self.task_input.setText(updated)
+            self.task_input.setCursorPosition(start + len(replacement) + len(suffix))
+        finally:
+            self._updating_mention_text = False
+        self._mention_span = None
+        self.file_mention_popup.hide()
+
+    def _workspace_reference_summary(self) -> str:
+        """Build a compact all-file path and size summary for @workplace."""
+
+        entries: list[str] = []
+        if self.workspace_root is not None:
+            for relative_path in sorted(self.workspace_files, key=str.casefold):
+                try:
+                    target = resolve_in_workspace(
+                        self.workspace_root,
+                        relative_path,
+                        must_exist=True,
+                    )
+                    size = target.stat().st_size
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                entries.append(f"{relative_path} ({size} bytes)")
+        joined = "; ".join(entries) if entries else "无"
+        return f"[工作区文件: {joined}]"
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        """Route mention-popup navigation keys while preserving normal input."""
+
+        if (
+            watched is self.task_input
+            and self.file_mention_popup.isVisible()
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+        ):
+            key = event.key()
+            if key == Qt.Key.Key_Down:
+                self.file_mention_popup.move_current(1)
+                return True
+            if key == Qt.Key.Key_Up:
+                self.file_mention_popup.move_current(-1)
+                return True
+            if key in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab}:
+                return self.file_mention_popup.choose_current()
+            if key == Qt.Key.Key_Escape:
+                self.file_mention_popup.hide()
+                return True
+        return super().eventFilter(watched, event)
 
     @Slot(int, str, str, str, str)
     def update_log(self, step: int, icon: str, label: str, color: str, message: str) -> None:
@@ -591,17 +744,22 @@ class MainWindow(QMainWindow):
             "label": label,
             "color": color,
             "message": message,
+            "visible": step == 0 or label.startswith("modified "),
         }
         self.session_store.add_log(record, conversation_id=conversation_id)
-        if conversation_id == self.session_store.active_id and step == 0:
+        if conversation_id == self.session_store.active_id and record["visible"]:
             self.log_view.append(self._format_log_html(record))
 
     @Slot(str, str, str)
     def update_tool_status(self, state: str, tool_name: str, detail: str) -> None:
         """Show only the current/latest tool in a fixed one-line status control."""
 
-        normalized = state if state in {"running", "success", "error"} else "running"
-        icons = {"running": "🔧", "success": "✅", "error": "❌"}
+        normalized = (
+            state
+            if state in {"running", "success", "error", "cancelled"}
+            else "running"
+        )
+        icons = {"running": "🔧", "success": "✅", "error": "❌", "cancelled": "↩"}
         self._tool_status_state = normalized
         self._tool_status_name = tool_name
         self._tool_error_detail = detail if normalized == "error" else ""
@@ -630,6 +788,7 @@ class MainWindow(QMainWindow):
             "running": "accent",
             "success": "success",
             "error": "error",
+            "cancelled": "muted",
         }
         color = self.theme_colors[color_keys.get(self._tool_status_state, "muted")]
         self.tool_status_button.setStyleSheet(
@@ -662,31 +821,41 @@ class MainWindow(QMainWindow):
         if session_id == self.session_store.active_id:
             self._render_process(self.session_store.active)
 
+    @Slot(str)
+    def _append_reasoning(self, reasoning: str) -> None:
+        """Persist native deep-mode reasoning for the session that owns the run."""
+
+        if self.thinking_mode != "deep":
+            return
+        session_id = self._running_session_id or self.session_store.active_id
+        self.session_store.append_reasoning(reasoning, conversation_id=session_id)
+        if session_id == self.session_store.active_id:
+            self._render_process(self.session_store.active)
+
     def _render_process(self, conversation: Conversation) -> None:
         """Render safe process summaries in the collapsible deep-mode panel."""
 
-        rows: list[str] = []
-        for index, item in enumerate(conversation.process, start=1):
-            level = item.get("level", 0)
-            text = item.get("text", "")
-            safe_level = level if isinstance(level, int) else 0
-            safe_text = escape(str(text))
-            marker = "▸" if safe_level == 0 else "·"
-            prefix = f"{index}." if safe_level == 0 else marker
-            rows.append(
-                f'<div style="margin-left:{safe_level * 20}px; margin-bottom:6px; '
-                f'color:{self.theme_colors["muted"]}">{prefix} {safe_text}</div>'
+        narrative = conversation.reasoning.strip()
+        if not narrative:
+            narrative = "\n\n".join(
+                str(item.get("text", "")).strip()
+                for item in conversation.process
+                if str(item.get("text", "")).strip()
             )
-        self.thinking_view.setHtml("".join(rows))
+        self.thinking_view.setPlainText(narrative)
         should_show = self.thinking_mode == "deep" and (
-            bool(conversation.process)
+            bool(narrative)
             or self.worker is not None
             and self.worker.isRunning()
+            and self._running_session_id == conversation.id
         )
         self.thinking_container.setVisible(should_show)
-        count = len(conversation.process)
-        running = self.worker is not None and self.worker.isRunning()
-        summary = "思考中..." if running else f"深度思考（{count} 步）"
+        running = (
+            self.worker is not None
+            and self.worker.isRunning()
+            and self._running_session_id == conversation.id
+        )
+        summary = "思考中..." if running else "深度思考"
         marker = "▼" if self.thinking_toggle.isChecked() else "▶"
         self.thinking_toggle.setText(f"{marker} 💭 {summary}")
         self.thinking_view.setVisible(
@@ -705,9 +874,7 @@ class MainWindow(QMainWindow):
         conversation = self.session_store.active
         running = self.worker is not None and self.worker.isRunning()
         summary = (
-            "思考中..."
-            if running
-            else f"深度思考（{len(conversation.process)} 步）"
+            "思考中..." if running else "深度思考"
         )
         self.thinking_toggle.setText(f"{marker} 💭 {summary}")
 
@@ -735,7 +902,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def update_code(self, file_path: str, content: str) -> None:
-        """Open or update a file tab from Agent read_file or drag preview."""
+        """Open or update a file tab after a write or an explicit user action."""
 
         workspace_backed, base_sha256 = self._workspace_backing(file_path)
         state = self._tab_previews.setdefault(
@@ -749,6 +916,7 @@ class MainWindow(QMainWindow):
                 "workspace_backed": False,
                 "base_sha256": "",
                 "dirty": False,
+                "step": 0,
             },
         )
         state.update(
@@ -761,8 +929,12 @@ class MainWindow(QMainWindow):
                 "workspace_backed": workspace_backed,
                 "base_sha256": base_sha256,
                 "dirty": False,
+                "step": self.worker.current_step if self.worker is not None else 0,
             }
         )
+        if workspace_backed:
+            self.workspace_files.add(file_path)
+            self.file_mention_popup.set_files(sorted(self.workspace_files))
         self._ensure_code_tab(file_path)
         self._render_code_tab(file_path)
 
@@ -818,6 +990,7 @@ class MainWindow(QMainWindow):
                 "workspace_backed": False,
                 "base_sha256": "",
                 "dirty": False,
+                "step": 0,
             },
         )
         state.update(
@@ -830,6 +1003,7 @@ class MainWindow(QMainWindow):
                 "workspace_backed": workspace_backed,
                 "base_sha256": base_sha256,
                 "dirty": False,
+                "step": self.worker.current_step if self.worker is not None else 0,
             }
         )
         self._ensure_code_tab(file_path)
@@ -893,7 +1067,16 @@ class MainWindow(QMainWindow):
                 )
             else:
                 editor.setReadOnly(not bool(state.get("workspace_backed")))
+                # A Diff was rendered as HTML.  Recreate a genuinely plain
+                # document so no green/red span format can leak into code.
+                editor.clear()
+                editor.document().setDefaultStyleSheet("")
                 editor.setPlainText(str(state.get("code", "")))
+                cursor = editor.textCursor()
+                cursor.select(QTextCursor.SelectionType.Document)
+                cursor.setCharFormat(QTextCharFormat())
+                cursor.clearSelection()
+                editor.setTextCursor(cursor)
                 editor.document().setModified(bool(state.get("dirty")))
         finally:
             self._rendering_editor = False
@@ -994,6 +1177,7 @@ class MainWindow(QMainWindow):
             and state.get("pending") is not True
         )
         self.manual_save_button.setEnabled(enabled)
+        self.save_file_action.setEnabled(enabled)
         if state is None:
             text = "选择工作区文件后可手动编辑"
         elif state.get("diff"):
@@ -1095,6 +1279,27 @@ class MainWindow(QMainWindow):
 
         return any(self._tab_has_pending_diff(path) for path in self._tab_previews)
 
+    def _has_dirty_manual_edits(self) -> bool:
+        """Return whether any open workspace editor has unsaved user text."""
+
+        return any(
+            state.get("dirty") is True
+            for state in self._tab_previews.values()
+        )
+
+    def _confirm_discard_dirty(self, scope: str) -> bool:
+        """Confirm discarding all unsaved manual edits for a broad operation."""
+
+        action = "退出" if scope == "window" else "切换工作区"
+        decision = QMessageBox.question(
+            self,
+            f"{action}确认",
+            f"仍有未保存的手动修改，是否放弃并{action}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return decision == QMessageBox.StandardButton.Yes
+
     def _confirm_discard_pending(self, scope: str) -> bool:
         """Ask whether staged in-memory changes may be discarded."""
 
@@ -1133,7 +1338,12 @@ class MainWindow(QMainWindow):
         color_keys = {"ready": "success", "running": "warning", "error": "error"}
         color = self.theme_colors[color_keys[normalized]]
         self.status_indicator.setText(f"● {labels[normalized]}")
-        self.status_indicator.setStyleSheet(f"color:{color}; font-weight:600")
+        self.status_indicator.setStyleSheet(
+            f"color:{color}; font-weight:600;"
+            f"background-color:{self.theme_colors['toolbar_card']};"
+            f"border:1px solid {self.theme_colors['border']};"
+            "border-radius:8px; padding:5px 9px;"
+        )
         self.statusBar().showMessage(message)
 
     @Slot(bool, str)
@@ -1142,21 +1352,31 @@ class MainWindow(QMainWindow):
 
         session_id = self._running_session_id or self.session_store.active_id
         self.session_store.add_message("assistant", message, conversation_id=session_id)
-        if session_id == self.session_store.active_id:
-            self._render_active_session()
-        self.send_button.setEnabled(True)
-        self.thinking_mode_combo.setEnabled(True)
+        is_active = session_id == self.session_store.active_id
+        stopped_by_user = "原因：user_stopped" in message
         self._awaiting_confirmation = False
         self._pending_write_path = ""
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
-        self._stop_loading()
-        self._stop_waiting_indicator()
         self._disconnect_confirmation()
-        first_line = message.splitlines()[0] if message else "Agent 已结束"
-        self.update_status("ready" if success else "error", first_line)
         self._running_session_id = None
+        first_line = message.splitlines()[0] if message else "Agent 已结束"
+        if stopped_by_user:
+            first_line = "已停止"
+        if is_active:
+            self._render_active_session()
+            self.task_input.setEnabled(True)
+            self.thinking_mode_combo.setEnabled(True)
+            self._set_send_button_mode(False)
+            self._stop_loading()
+            self._stop_waiting_indicator()
+            final_state = "ready" if success or stopped_by_user else "error"
+            self.update_status(final_state, first_line)
+        else:
+            # The completed run belongs to a background session.  Its answer is
+            # persisted there, but the newly selected conversation stays intact.
+            self._sync_active_run_controls()
         if self._close_pending:
             QTimer.singleShot(0, self.close)
 
@@ -1179,9 +1399,6 @@ class MainWindow(QMainWindow):
         state = self._tab_previews.get(path)
         if state is not None:
             state["pending"] = True
-        self.apply_button.setEnabled(True)
-        self.reject_button.setEnabled(True)
-        self.decision_widget.setVisible(True)
         session_id = self._running_session_id or self.session_store.active_id
         self.session_store.add_message(
             "system",
@@ -1190,10 +1407,13 @@ class MainWindow(QMainWindow):
             waiting=True,
         )
         if session_id == self.session_store.active_id:
+            self.apply_button.setEnabled(True)
+            self.reject_button.setEnabled(True)
+            self.decision_widget.setVisible(True)
             self._render_active_session()
-        self.waiting_indicator.setVisible(True)
-        self.waiting_timer.start()
-        self.update_status("running", f"等待确认修改：{path}")
+            self.waiting_indicator.setVisible(True)
+            self.waiting_timer.start()
+            self.update_status("running", f"等待确认修改：{path}")
 
     @Slot()
     def _apply_pending_change(self) -> None:
@@ -1202,6 +1422,13 @@ class MainWindow(QMainWindow):
         if not self._awaiting_confirmation:
             return
         path = self._pending_write_path
+        state = self._tab_previews.get(path, {})
+        step = state.get("step", 0)
+        safe_step = step if isinstance(step, int) and not isinstance(step, bool) else 0
+        additions = state.get("additions", 0)
+        deletions = state.get("deletions", 0)
+        safe_additions = additions if isinstance(additions, int) else 0
+        safe_deletions = deletions if isinstance(deletions, int) else 0
         self._awaiting_confirmation = False
         self._pending_write_path = ""
         self.apply_button.setEnabled(False)
@@ -1215,6 +1442,13 @@ class MainWindow(QMainWindow):
         )
         if session_id == self.session_store.active_id:
             self._render_active_session()
+        self.update_log(
+            safe_step,
+            "📝",
+            f"modified {Path(path).name} (+{safe_additions} -{safe_deletions})",
+            "success",
+            "",
+        )
         self._stop_waiting_indicator()
         self.update_status("running", "已确认，Agent 继续执行")
         self.confirm_signal.emit(True)
@@ -1278,6 +1512,7 @@ class MainWindow(QMainWindow):
         self.session_store.create()
         self._refresh_session_combo()
         self._render_active_session()
+        self._sync_active_run_controls()
 
     @Slot()
     def _delete_active_session(self) -> None:
@@ -1306,6 +1541,38 @@ class MainWindow(QMainWindow):
         conversation_id = self.session_combo.itemData(index)
         if isinstance(conversation_id, str) and self.session_store.activate(conversation_id):
             self._render_active_session()
+            self._sync_active_run_controls()
+
+    def _sync_active_run_controls(self) -> None:
+        """Reflect only the selected session's run in loading and send controls."""
+
+        worker_running = (
+            self.worker is not None
+            and self.worker.isRunning()
+            and self._running_session_id is not None
+        )
+        active_running = (
+            worker_running
+            and self._running_session_id == self.session_store.active_id
+        )
+        self.task_input.setEnabled(not worker_running)
+        self.thinking_mode_combo.setEnabled(not worker_running)
+        if active_running:
+            self._set_send_button_mode(True)
+            self._start_loading()
+            if self._awaiting_confirmation:
+                self.apply_button.setEnabled(True)
+                self.reject_button.setEnabled(True)
+                self.decision_widget.setVisible(True)
+                self.waiting_indicator.setVisible(True)
+                self.waiting_timer.start()
+        else:
+            self._set_send_button_mode(False, enabled=not worker_running)
+            self._stop_loading()
+            self._stop_waiting_indicator()
+            self.apply_button.setEnabled(False)
+            self.reject_button.setEnabled(False)
+            self.decision_widget.setVisible(False)
 
     def _render_active_session(self) -> None:
         """Render modern left/right message bubbles and session activity."""
@@ -1317,7 +1584,7 @@ class MainWindow(QMainWindow):
         )
         self.log_view.clear()
         for log in conversation.logs:
-            if log.get("step") == 0:
+            if log.get("visible") is True or log.get("step") == 0:
                 self.log_view.append(self._format_log_html(log))
         self._render_process(conversation)
 
@@ -1471,6 +1738,7 @@ class MainWindow(QMainWindow):
 
         self.workspace_files.clear()
         if self.workspace_root is None:
+            self.file_mention_popup.set_files([])
             self.workspace_tree.setRootIndex(QModelIndex())
             self.workspace_tree.setVisible(False)
             self.workspace_empty_label.setVisible(True)
@@ -1490,8 +1758,7 @@ class MainWindow(QMainWindow):
             if candidate.is_symlink() or not candidate.is_file():
                 continue
             self.workspace_files.add(relative.as_posix())
-            if len(self.workspace_files) >= 2_000:
-                break
+        self.file_mention_popup.set_files(sorted(self.workspace_files))
 
     @Slot(QModelIndex)
     def _activate_workspace_index(self, index: QModelIndex) -> None:
@@ -1871,6 +2138,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Persist UI state and defer destruction until the worker exits."""
 
+        self.file_mention_popup.hide()
         if self._has_pending_diffs():
             if not self._confirm_discard_pending("window"):
                 event.ignore()
@@ -1881,12 +2149,15 @@ class MainWindow(QMainWindow):
                 for file_path in tuple(self._tab_previews):
                     if self._tab_has_pending_diff(file_path):
                         self._clear_diff_decoration(file_path, clear_code=False)
+        if self._has_dirty_manual_edits() and not self._confirm_discard_dirty("window"):
+            event.ignore()
+            return
         self.session_store.save()
         self.settings.setValue("ui/theme", self.theme_name)
         self.settings.setValue("ui/thinking_mode", self.thinking_mode)
         self.settings.sync()
         if self.worker is not None and self.worker.isRunning():
-            self.worker.requestInterruption()
+            self.worker.stop()
             self._close_pending = True
             self.update_status("running", "正在等待 Agent 安全停止……")
             event.ignore()

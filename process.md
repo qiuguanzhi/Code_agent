@@ -257,3 +257,129 @@ $env:QT_QPA_PLATFORM='offscreen'
 - 已生成并人工检查空状态与 Diff 状态离屏截图；空白页无残留 Tab/编辑器矩形。
 - 新文件和已有文件的批准、拒绝路径均由真实 `AgentWorker + FakeProvider + 本地工具` 闭环覆盖，未访问网络。
 - 唯一跳过项仍为 Windows 当前账户无创建测试符号链接权限。
+
+---
+
+## 2026-08-29 14:59 第3轮 任务 #1 - 模型读取不自动打开文件
+
+- **修改内容**：`AgentWorker` 将 `read_file` 明确作为仅供模型上下文使用的操作，不再发射 `code_signal`；写入 Diff、新建文件和用户主动打开/拖入文件仍会创建代码标签。
+- **涉及文件**：`gui/worker.py`、`tests/test_gui.py`
+- **测试结果**：通过。连续读取三个文件片段时 `code_signal` 与 `diff_signal` 均为 0；写入审批回归仍正常打开对应标签。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 任务 #2 - 响应式会话气泡宽度
+
+- **修改内容**：消息气泡宽度改为父视口宽度的 85%，最大 780px、最小 240px；滚动区尺寸变化时同步更新所有用户与 Agent 气泡。
+- **涉及文件**：`gui/widgets.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证 700px 与 1200px 两种视口下分别按比例伸缩及 780px 封顶。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 任务 #3 - 用户拒绝使用中性工具状态
+
+- **修改内容**：识别 `write_file/user_aborted`，工具状态改为中性的 `↩` 与“用户已拒绝修改”，不再显示红色失败图标或错误详情；真实工具异常仍保留 `❌`。
+- **涉及文件**：`gui/worker.py`、`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。拒绝写入后磁盘不变、工具状态非失败且没有 modified 日志。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 任务 #4 - Ctrl+S 与未保存编辑保护
+
+- **修改内容**：新增 `Ctrl+S` 当前文件保存动作，快照快捷键调整为 `Ctrl+Shift+S`；保留低调样式的保存按钮；标签关闭、工作区切换和应用退出均保护 dirty 手动编辑。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。快捷动作写盘并清除 dirty；未保存状态下退出可取消或确认放弃。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 任务 #5 - 运行中会话隔离
+
+- **修改内容**：运行任务绑定到 `_running_session_id`；新建/切换会话会按活跃会话同步加载动画、确认区和发送控件；后台会话完成只写回自身消息，不刷新当前新会话。
+- **涉及文件**：`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。旧 Worker 运行时新会话立即为空且无加载动画，旧任务完成后答案仅存在旧会话。
+- **遗留问题**：当前仍采用单 Worker 串行模型；后台任务运行期间新会话不能同时发起第二个 Agent 任务。
+
+## 2026-08-29 14:59 第3轮 任务 #6 - 快速/深度思考模式
+
+- **修改内容**：快速模式向 DeepSeek 发送关闭 thinking、向百炼发送 `enable_thinking=False`，且 GUI 丢弃推理内容；深度模式启用 thinking（DeepSeek 同时使用 high reasoning effort），持久化 `reasoning_content` 并在最终回答之前以默认折叠、连续叙述的灰色区块展示。
+- **涉及文件**：`providers/openai_compatible.py`、`gui/worker.py`、`gui/session.py`、`gui/main_window.py`、`gui/theme.py`、`tests/test_providers.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证两家 Provider 的模式参数、快速模式无推理信号、深度模式默认折叠且展开后无枚举前缀。
+- **遗留问题**：实际响应速度仍受模型、网络与供应商排队影响；本地测试只验证请求参数和 UI 行为，不访问真实 API。
+
+## 2026-08-29 14:59 第3轮 任务 #7 - 工具栏状态卡片
+
+- **修改内容**：亮暗主题新增独立 `toolbar_card` 语义色，运行状态、工作区路径与快照时间统一使用圆角、边框和独立背景。
+- **涉及文件**：`gui/theme.py`、`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证两个主题的卡片色均不同于工具栏 panel 色，三个 objectName 均命中专属 QSS。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 任务 #8 - Agent 协作式停止
+
+- **修改内容**：运行后发送按钮变为圆形 `⏹`；点击会设置 Worker 停止事件并释放可能阻塞的写入确认。Agent 在模型请求、模型响应和工具调用前后检查停止状态，返回 `user_stopped` 并保留已有会话状态。
+- **涉及文件**：`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`gui/theme.py`、`tests/test_agent_loop.py`、`tests/test_gui.py`
+- **测试结果**：通过。阻塞模型返回后的下一检查点能优雅停止，按钮恢复、状态非错误、用户消息和停止摘要均保留。
+- **遗留问题**：正在执行的同步供应商请求或单个系统命令不能被 Python 立即强杀；会在该调用返回或超时后的最近检查点退出。
+
+## 2026-08-29 14:59 第3轮 任务 #9 - 文件修改统计日志
+
+- **修改内容**：Diff 暂存状态保存 Agent step 与增删行数；仅在用户点击“应用修改”后追加 `[N] 📝 modified filename (+X -Y)` 可见记录，拒绝不追加。
+- **涉及文件**：`gui/main_window.py`、`gui/session.py`、`tests/test_gui.py`
+- **测试结果**：通过。应用 `calc.py` 的单行替换后显示 `[1] 📝 modified calc.py (+1 -1)`，拒绝路径无 modified 记录。
+- **遗留问题**：无。
+
+## 2026-08-29 14:59 第3轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 35 passed
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 92 passed, 1 skipped
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。全部新增测试使用 FakeProvider 与临时工作区，不访问网络、不消耗真实 API。
+
+---
+
+## 2026-08-29 15:57 第4轮 任务 #1 - 进一步增大消息气泡宽度
+
+- **修改内容**：取消 780px 固定上限，由 `ConversationScrollArea.resizeEvent()` 按视口宽度动态设置 85% 最大宽度；长消息使用至少 80% 的面板宽度，普通最小宽度为 300px；会话内容边距由 8px 缩减为 4px。
+- **涉及文件**：`gui/widgets.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。200 字符长消息占会话视口 80% 以上，字体度量计算的换行不超过 3 行，窗口缩放后宽度实时更新。
+- **遗留问题**：Qt QSS 不支持百分比 `max-width`，因此采用控件级动态尺寸计算，视觉结果与 85% 要求一致。
+
+## 2026-08-29 15:57 第4轮 任务 #2 - 快速停止与标准停止按钮
+
+- **修改内容**：运行时发送按钮改为红色圆形 `SP_MediaStop` 标准图标并增加深色悬停态；停止标志下沉到 Agent 主循环、Provider 请求前、工具注册器执行前后及 Shell 进程轮询。长时间 Shell 命令每 50ms 检查一次并终止进程树；OpenAI 兼容 Provider 支持请求前拒绝及传输层 best-effort `close()`。
+- **涉及文件**：`agent/loop.py`、`gui/main_window.py`、`gui/worker.py`、`gui/theme.py`、`providers/openai_compatible.py`、`tools/registry.py`、`tools/shell.py`、`tests/test_agent_loop.py`、`tests/test_extensions.py`、`tests/test_gui.py`、`tests/test_providers.py`、`tests/test_shell.py`
+- **测试结果**：通过。10 秒子进程在发出停止后 2 秒内结束；Provider 已停止时不进入 SDK 请求；GUI 在 2 秒内恢复发送按钮并显示“已停止”。
+- **遗留问题**：第三方 HTTP 客户端是否能瞬时取消已进入内核的网络调用取决于其 `close()` 实现；无论如何 Agent 会在请求返回后的最近检查点退出。
+
+## 2026-08-29 15:57 第4轮 任务 #3 - @ 文件与 @workplace 引用
+
+- **修改内容**：新增窗口内 `FileMentionPopup`，输入 `@` 后列出工作区普通文件并支持文件名/路径的子串与字符序列模糊匹配；鼠标或上下键、Enter/Tab 可选中并插入 `@relative/path`。输入 `@workplace` 会替换为全部工作区文件的相对路径和字节大小摘要，作为用户消息正文发送。
+- **涉及文件**：`gui/widgets.py`、`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证 `@hel` 能筛选并插入 `@src/helper.py`，`@workplace` 能展开 `calc.py` 与嵌套文件列表及大小。提示窗改为主窗口子控件后，Qt 测试进程正常退出。
+- **遗留问题**：为控制上下文大小，`@workplace` 插入路径和大小摘要，不直接内联所有文件内容；Agent 可据此按需调用 `read_file`。
+
+## 2026-08-29 15:57 第4轮 任务 #4 - 恢复完整深度思考显示
+
+- **修改内容**：Provider 同时兼容 `reasoning_content` 和 `reasoning` 响应字段；Goal 模式把完整推理累积到 `AgentState.reasoning`，Worker 通过专用 `reasoning_signal` 实时发送，并在事件信号缺失时从最终状态补发。主窗口继续以默认折叠、连续自然语言和独立灰色背景渲染；快速模式不发送也不显示推理。
+- **涉及文件**：`agent/state.py`、`agent/loop.py`、`providers/openai_compatible.py`、`gui/worker.py`、`gui/main_window.py`、`gui/session.py`、`gui/theme.py`、`tests/test_agent_loop.py`、`tests/test_gui.py`、`tests/test_providers.py`
+- **测试结果**：通过。验证备用字段规范化、AgentState 完整保存、深度模式折叠/展开及连续文本，快速模式仍无思考区块。
+- **遗留问题**：仅在模型或兼容网关实际返回 reasoning 字段时显示原生推理；不支持该字段的模型仍显示已有的高层过程摘要。
+
+## 2026-08-29 15:57 第4轮 任务 #5 - 应用后清除 Diff 颜色
+
+- **修改内容**：代码 Tab 从 Diff HTML 返回普通代码时，显式执行 `clear()`、清空 document stylesheet、`setPlainText()`，并用空 `QTextCharFormat` 重置整个文档字符格式；主题切换会重新执行同一纯文本渲染路径。
+- **涉及文件**：`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。应用修改后代码内容正确且 HTML 中不存在成功绿色；切换亮暗主题后仍无绿色或红色 Diff 标记残留。
+- **遗留问题**：无。
+
+## 2026-08-29 15:57 第4轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 36 passed, PYTEST_EXIT=0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 98 passed, 1 skipped, PYTEST_EXIT=0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。所有本轮测试均使用 FakeProvider、临时工作区和本地子进程，不访问真实模型 API。

@@ -253,3 +253,70 @@ def test_interactive_rejection_prevents_write(tmp_path: Path) -> None:
     assert requested_paths == ["calc.py"]
     assert calculator.read_text(encoding="utf-8") == original_content
     assert result.state.changed_files == {}
+
+
+def test_run_agent_honors_cooperative_stop_before_next_tool(tmp_path: Path) -> None:
+    """Stop at a safe checkpoint while retaining messages already collected."""
+
+    workspace, calculator = _create_buggy_workspace(tmp_path)
+    provider = FakeProvider(
+        [
+            _tool_turn(
+                "write-1",
+                "write_file",
+                {
+                    "path": "calc.py",
+                    "content": "should not be written\n",
+                    "expected_sha256": sha256_file_streaming(calculator),
+                },
+            )
+        ]
+    )
+    checks = 0
+
+    def should_stop() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    original = calculator.read_text(encoding="utf-8")
+    cfg = AgentConfig(
+        workspace=workspace,
+        provider=provider,
+        should_stop=should_stop,
+    )
+
+    result = run_agent("stop before executing the tool", cfg)
+
+    assert result.status == "stopped"
+    assert result.reason == "user_stopped"
+    assert calculator.read_text(encoding="utf-8") == original
+    assert result.state.messages[0]["role"] == "system"
+    assert result.state.messages[1]["role"] == "user"
+
+
+def test_goal_mode_preserves_complete_reasoning_in_agent_state(tmp_path: Path) -> None:
+    """Keep provider reasoning available for late GUI delivery and inspection."""
+
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    reasoning = "Inspect the current behavior.\nThen validate the proposed fix."
+    turn = AssistantTurn(
+        content="Done.",
+        tool_calls=[],
+        protocol_message={
+            "role": "assistant",
+            "content": "Done.",
+            "reasoning_content": reasoning,
+        },
+        finish_reason="stop",
+    )
+    cfg = AgentConfig(
+        workspace=workspace,
+        provider=FakeProvider([turn]),
+        mode="goal",
+    )
+
+    result = run_agent("reason deeply", cfg)
+
+    assert result.status == "completed"
+    assert result.state.reasoning == reasoning

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
@@ -12,8 +13,15 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QMimeData, QSettings, Qt, QUrl, qInstallMessageHandler
+from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QSignalSpy
-from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+)
 
 import main as main_module
 from agent.state import AssistantTurn, ToolCall
@@ -451,9 +459,7 @@ def test_worker_emits_exactly_one_compact_log_per_tool(
 
     assert log_spy.count() == 1
     assert list(log_spy.at(0)) == [1, "🔧", "read_file", "tool_success", ""]
-    assert code_spy.count() == 1
-    assert code_spy.at(0)[0] == "calc.py"
-    assert "def divide" in code_spy.at(0)[1]
+    assert code_spy.count() == 0
     assert finished_spy.count() == 1
     assert finished_spy.at(0)[0] is True
 
@@ -583,7 +589,8 @@ def test_send_clears_input_and_binds_real_agent(
         assert window.session_store.active.logs[0]["label"] == "read_file"
         assert "思考" not in window.log_view.toPlainText()
         assert "模型" not in window.log_view.toPlainText()
-        assert "def divide" in window.code_view.toPlainText()
+        assert window.code_tabs.count() == 0
+        assert window.code_view.toPlainText() == ""
         assert "读取 calc.py" in window.conversation_view.toPlainText()
         assert window.send_button.isEnabled() is True
         assert "就绪" in window.status_indicator.text()
@@ -670,7 +677,7 @@ def test_deep_mode_shows_process_and_native_loading_feedback(
         assert window.loading_container.isVisible() is False
         assert window.thinking_container.isVisible() is True
         assert window.thinking_view.isVisible() is False
-        assert window.thinking_container.parent().objectName() == "logPanel"
+        assert window.thinking_container.parent().objectName() == "conversationPanel"
         window.thinking_toggle.click()
         assert window.thinking_view.isVisible() is True
         process_text = window.thinking_view.toPlainText()
@@ -733,11 +740,23 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
         assert target.read_text(encoding="utf-8") == expected
         if confirmed:
             assert "return 0 if b == 0" in window.code_view.toPlainText()
+            assert (
+                window.theme_colors["success"].lstrip("#").casefold()
+                not in window.code_view.toHtml().casefold()
+            )
+            window._toggle_theme()
+            assert (
+                window.theme_colors["success"].lstrip("#").casefold()
+                not in window.code_view.toHtml().casefold()
+            )
         resolved_text = "已允许修改" if confirmed else "已拒绝修改"
         assert resolved_text in window.conversation_view.toPlainText()
         assert window.waiting_indicator.isVisible() is False
-        assert window.log_view.toPlainText() == ""
-        expected_icon = "✅" if confirmed else "❌"
+        if confirmed:
+            assert "[1] 📝 modified calc.py (+1 -1)" in window.log_view.toPlainText()
+        else:
+            assert "modified calc.py" not in window.log_view.toPlainText()
+        expected_icon = "✅" if confirmed else "↩"
         assert window.tool_status_button.text().startswith(expected_icon)
         assert window.decision_widget.isVisible() is False
     finally:
@@ -1248,3 +1267,330 @@ def test_gui_flag_forwards_optional_workspace_without_api_key(
 
     assert main_module.main(["--gui", "--workspace", str(tmp_path)]) == 0
     assert received_workspace == tmp_path
+
+
+def test_multiple_agent_reads_never_open_code_tabs(
+    qt_app: QApplication,
+    workspace: Path,
+) -> None:
+    """Keep repeated model context reads out of the user's editor workspace."""
+
+    provider = FakeProvider(
+        [
+            _tool_turn(
+                f"read-{index}",
+                "read_file",
+                {
+                    "path": "calc.py",
+                    "start_line": index,
+                    "max_lines": 1,
+                    "max_chars": 1_000,
+                },
+            )
+            for index in range(1, 4)
+        ]
+        + [_final_turn()]
+    )
+    worker = AgentWorker(provider=provider)
+    code_spy = QSignalSpy(worker.code_signal)
+    diff_spy = QSignalSpy(worker.diff_signal)
+
+    worker.start_agent("连续读取", workspace, max_steps=6, interactive=False)
+    assert worker.wait(2_000) is True
+    qt_app.processEvents()
+    assert code_spy.count() == 0
+    assert diff_spy.count() == 0
+
+
+def test_message_bubbles_use_at_least_80_percent_of_conversation_width(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Use the conversation width responsively without creating wide text walls."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.session_store.add_message("assistant", "word " * 40)
+        window._render_active_session()
+        window.conversation_view.resize(700, 400)
+        qt_app.processEvents()
+        bubble = window.conversation_view.bubbles[0].bubble_frame
+        expected = int(window.conversation_view.viewport().width() * 0.85)
+        assert bubble.maximumWidth() == max(80, expected)
+        assert bubble.minimumWidth() >= int(
+            window.conversation_view.viewport().width() * 0.80
+        )
+
+        window.conversation_view.resize(1_200, 400)
+        qt_app.processEvents()
+        expected_wide = int(window.conversation_view.viewport().width() * 0.85)
+        assert bubble.maximumWidth() == expected_wide
+        assert bubble.width() >= int(window.conversation_view.viewport().width() * 0.80)
+        content_label = bubble.findChild(QLabel, "messageContent")
+        assert content_label is not None
+        line_height = max(1, content_label.fontMetrics().lineSpacing())
+        wrapped_rect = content_label.fontMetrics().boundingRect(
+            0,
+            0,
+            content_label.width(),
+            10_000,
+            int(Qt.TextFlag.TextWordWrap),
+            content_label.text(),
+        )
+        assert wrapped_rect.height() / line_height <= 3.5
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_ctrl_s_saves_manual_edits_and_close_warns_when_dirty(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind Ctrl+S to the editor and protect unsaved text on application exit."""
+
+    target = workspace / "calc.py"
+    original = target.read_text(encoding="utf-8")
+    window = MainWindow(workspace, settings=gui_settings)
+    window.show()
+    window.update_code("calc.py", original)
+    window.code_view.setPlainText(original + "# saved with shortcut\n")
+    assert window.save_file_action.shortcut() == QKeySequence("Ctrl+S")
+    window.save_file_action.trigger()
+    qt_app.processEvents()
+    assert target.read_text(encoding="utf-8").endswith("# saved with shortcut\n")
+    assert window.save_file_action.isEnabled() is False
+
+    window.code_view.setPlainText(window.code_view.toPlainText() + "# dirty\n")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.No,
+    )
+    window.close()
+    qt_app.processEvents()
+    assert window.isVisible() is True
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.close()
+    qt_app.processEvents()
+    assert window.isVisible() is False
+
+
+class BlockingFinalProvider(ModelProvider):
+    """Hold one model request until a GUI-session assertion has been made."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def complete(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+    ) -> AssistantTurn:
+        """Wait deterministically and then return a final answer."""
+
+        _ = (messages, tools)
+        self.entered.set()
+        self.release.wait(timeout=2.0)
+        return _final_turn("后台会话已完成。")
+
+
+def test_new_session_does_not_inherit_background_run_ui_or_answer(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Let the old task finish in its owner session while a new chat stays empty."""
+
+    provider = BlockingFinalProvider()
+
+    class BlockingWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = BlockingWindow(workspace, settings=gui_settings)
+    try:
+        old_id = window.session_store.active_id
+        window.task_input.setText("旧会话任务")
+        window.send_button.click()
+        assert provider.entered.wait(timeout=1.0)
+        assert window.loading_container.isHidden() is False
+
+        window._new_session()
+        new_id = window.session_store.active_id
+        assert new_id != old_id
+        assert window.conversation_view.toPlainText() == ""
+        assert window.loading_container.isHidden() is True
+
+        provider.release.set()
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+        assert window.session_store.active_id == new_id
+        assert window.conversation_view.toPlainText() == ""
+        old_session = window.session_store.get(old_id)
+        assert old_session is not None
+        assert any(
+            "后台会话已完成" in str(item.get("content"))
+            for item in old_session.messages
+        )
+    finally:
+        provider.release.set()
+        if window.worker is not None and window.worker.isRunning():
+            window.worker.stop()
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
+def test_send_button_becomes_stop_and_preserves_partial_session(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Stop cooperatively and keep the existing user message plus stop summary."""
+
+    provider = BlockingFinalProvider()
+
+    class BlockingWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = BlockingWindow(workspace, settings=gui_settings)
+    try:
+        window.task_input.setText("可以停止的任务")
+        window.send_button.click()
+        assert provider.entered.wait(timeout=1.0)
+        qt_app.processEvents()
+        assert window.send_button.text() == ""
+        assert window.send_button.icon().isNull() is False
+        assert window.send_button.property("stopMode") is True
+
+        stop_started = time.monotonic()
+        window.send_button.click()
+        provider.release.set()
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+        assert time.monotonic() - stop_started < 2.0
+        assert window.send_button.text() == "发送"
+        assert "可以停止的任务" in window.conversation_view.toPlainText()
+        assert "已按用户请求停止" in window.conversation_view.toPlainText()
+        assert "错误" not in window.status_indicator.text()
+        assert window.statusBar().currentMessage() == "已停止"
+    finally:
+        provider.release.set()
+        if window.worker is not None and window.worker.isRunning():
+            window.worker.stop()
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
+def test_toolbar_status_cards_use_a_distinct_surface() -> None:
+    """Keep toolbar status labels visually separate from their toolbar surface."""
+
+    assert DARK_COLORS["toolbar_card"] != DARK_COLORS["panel"]
+    assert LIGHT_COLORS["toolbar_card"] != LIGHT_COLORS["panel"]
+    for selector in ("statusIndicator", "workspaceLabel", "snapshotLabel"):
+        assert f"QLabel#{selector}" in DARK_THEME
+
+
+def test_deep_mode_shows_native_reasoning_as_collapsed_narrative(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Render provider reasoning continuously in deep mode and keep it collapsed."""
+
+    reasoning = "先检查目标文件。\n然后验证修改不会破坏现有行为。"
+    turn = AssistantTurn(
+        content="分析完成。",
+        tool_calls=[],
+        protocol_message={
+            "role": "assistant",
+            "content": "分析完成。",
+            "reasoning_content": reasoning,
+        },
+        finish_reason="stop",
+    )
+    provider = FakeProvider([turn])
+
+    class ReasoningWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = ReasoningWindow(workspace, settings=gui_settings)
+    try:
+        deep_index = window.thinking_mode_combo.findData("deep")
+        window.thinking_mode_combo.setCurrentIndex(deep_index)
+        window.task_input.setText("深度分析")
+        window.send_button.click()
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+
+        assert window.session_store.active.reasoning == reasoning
+        assert window.thinking_container.isHidden() is False
+        assert window.thinking_view.isHidden() is True
+        window.thinking_toggle.click()
+        assert window.thinking_view.toPlainText() == reasoning
+        assert "1." not in window.thinking_view.toPlainText()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_file_mentions_filter_insert_and_expand_workplace(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Offer fuzzy file mentions and expand @workplace into paths plus sizes."""
+
+    nested = workspace / "src"
+    nested.mkdir()
+    (nested / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.task_input.setText("检查 @hel")
+        qt_app.processEvents()
+        assert window.file_mention_popup.isVisible() is True
+        listed = [
+            window.file_mention_popup.list_widget.item(index).data(
+                Qt.ItemDataRole.UserRole
+            )
+            for index in range(window.file_mention_popup.list_widget.count())
+        ]
+        assert "src/helper.py" in listed
+        helper_row = listed.index("src/helper.py")
+        window.file_mention_popup.list_widget.setCurrentRow(helper_row)
+        assert window.file_mention_popup.choose_current() is True
+        assert "@src/helper.py" in window.task_input.text()
+
+        window.task_input.setText("概览 @workplace")
+        qt_app.processEvents()
+        text = window.task_input.text()
+        assert "@workplace" not in text
+        assert "[工作区文件:" in text
+        assert "calc.py (" in text
+        assert "src/helper.py (" in text
+        assert "bytes" in text
+    finally:
+        window.file_mention_popup.hide()
+        window.close()
+        qt_app.processEvents()

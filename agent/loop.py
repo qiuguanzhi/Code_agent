@@ -12,17 +12,22 @@ from typing import Any
 from agent.context import ContextBudgetError, fit_context
 from agent.state import AgentState, AssistantTurn
 from providers.base import ModelProvider
-from tools.registry import ToolRegistry
+from tools.registry import ToolRegistry, ToolStopRequested
 from utils.snapshot import save_workspace_snapshot
 
 
 UpdateCallback = Callable[[dict[str, Any]], None]
 ConfirmWriteCallback = Callable[[str], bool]
 SleepCallback = Callable[[float], None]
+StopCallback = Callable[[], bool]
 
 
 class ModelRetryExhausted(RuntimeError):
     """Raised after all configured transient API retries fail."""
+
+
+class AgentStopRequested(RuntimeError):
+    """Raised at a cooperative checkpoint after a user stop request."""
 
 
 @dataclass(slots=True)
@@ -42,6 +47,7 @@ class AgentConfig:
     verbose: bool = False
     confirm_write: ConfirmWriteCallback | None = None
     sleep_fn: SleepCallback = field(default=time.sleep, repr=False)
+    should_stop: StopCallback | None = field(default=None, repr=False)
     system_prompt_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -119,9 +125,13 @@ def call_model_with_retry(
     """Call a provider with bounded exponential backoff."""
 
     for attempt in range(1, cfg.max_api_attempts + 1):
+        if cfg.should_stop is not None and cfg.should_stop():
+            raise AgentStopRequested("user requested stop")
         try:
             return cfg.provider.complete(messages, tools)
         except Exception as exc:
+            if cfg.should_stop is not None and cfg.should_stop():
+                raise AgentStopRequested("user requested stop") from exc
             if not _is_retriable_exception(exc) or attempt >= cfg.max_api_attempts:
                 raise ModelRetryExhausted(str(exc)) from exc
             delay = cfg.retry_base_seconds * (2 ** (attempt - 1))
@@ -174,6 +184,14 @@ def _stopped(
     return AgentRunResult(status=status, reason=reason, answer=answer, state=state)
 
 
+def _user_stopped(state: AgentState, on_update: UpdateCallback | None) -> AgentRunResult:
+    """Build and emit the common cooperative user-stop result."""
+
+    answer = "Agent 已按用户请求停止。"
+    _emit(on_update, "run_stopped", state.step, answer, reason="user_stopped")
+    return _stopped("stopped", "user_stopped", answer, state)
+
+
 def run_agent(
     task: str,
     cfg: AgentConfig,
@@ -201,11 +219,14 @@ def run_agent(
         write_policy={"require_confirmation": cfg.interactive},
         max_same_call=cfg.max_same_call,
         confirm_write=cfg.confirm_write,
+        should_stop=cfg.should_stop,
     )
     _emit(on_update, "run_started", 0, "Agent 已启动", mode=cfg.mode)
 
     for step in range(1, cfg.max_steps + 1):
         state.step = step
+        if cfg.should_stop is not None and cfg.should_stop():
+            return _user_stopped(state, on_update)
         elapsed = time.monotonic() - state.started_at
         if elapsed > cfg.max_wall_seconds:
             answer = f"Agent 已达到墙钟时间上限（{cfg.max_wall_seconds:.0f} 秒）。"
@@ -232,13 +253,21 @@ def run_agent(
                 on_update,
                 step=step,
             )
+        except AgentStopRequested:
+            return _user_stopped(state, on_update)
         except ModelRetryExhausted as exc:
             answer = f"模型 API 请求失败：{exc}"
             _emit(on_update, "run_failed", step, answer, reason="model_api_error")
             return _stopped("failed", "model_api_error", answer, state)
 
+        if cfg.should_stop is not None and cfg.should_stop():
+            return _user_stopped(state, on_update)
+
         state.messages.append(turn.protocol_message)
         reasoning = turn.protocol_message.get("reasoning_content")
+        if cfg.mode == "goal" and isinstance(reasoning, str) and reasoning.strip():
+            separator = "\n\n" if state.reasoning else ""
+            state.reasoning += separator + reasoning.strip()
         _emit(
             on_update,
             "model_response",
@@ -257,6 +286,8 @@ def run_agent(
             return _stopped("stopped", "empty_response", answer, state)
 
         for call in turn.tool_calls:
+            if cfg.should_stop is not None and cfg.should_stop():
+                return _user_stopped(state, on_update)
             _emit(
                 on_update,
                 "tool_call",
@@ -266,7 +297,10 @@ def run_agent(
                 tool_call_id=call.id,
                 arguments_json=call.arguments_json,
             )
-            encoded_result = registry.execute_one_call(call, state)
+            try:
+                encoded_result = registry.execute_one_call(call, state)
+            except ToolStopRequested:
+                return _user_stopped(state, on_update)
             state.messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": encoded_result}
             )
@@ -283,6 +317,9 @@ def run_agent(
                 ok=result.get("ok"),
                 result=result,
             )
+
+            if cfg.should_stop is not None and cfg.should_stop():
+                return _user_stopped(state, on_update)
 
             error = result.get("error")
             error_code = error.get("code") if isinstance(error, Mapping) else None

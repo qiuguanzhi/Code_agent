@@ -14,6 +14,7 @@ from providers.openai_compatible import (
     OpenAICompatibleProvider,
     ProviderConfigurationError,
     ProviderResponseError,
+    ProviderStopRequested,
     create_provider_from_env,
 )
 from tools.schemas import get_tool_schemas
@@ -141,6 +142,42 @@ def test_provider_normalizes_final_text_response() -> None:
     assert turn.protocol_message == {"role": "assistant", "content": "Done"}
 
 
+def test_provider_accepts_reasoning_alias_and_stores_protocol_field() -> None:
+    """Normalize gateways that expose reasoning instead of reasoning_content."""
+
+    message = SimpleNamespace(
+        content="Done",
+        tool_calls=None,
+        reasoning_content=None,
+        reasoning="continuous reasoning",
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        usage=None,
+    )
+    provider = OpenAICompatibleProvider(FakeClient(response), "fake-model")
+
+    turn = provider.complete([], get_tool_schemas())
+
+    assert turn.protocol_message["reasoning_content"] == "continuous reasoning"
+
+
+def test_provider_does_not_send_request_after_stop() -> None:
+    """Reject a cancelled request before entering the SDK transport."""
+
+    client = FakeClient(_tool_call_response())
+    provider = OpenAICompatibleProvider(
+        client,
+        "fake-model",
+        should_stop=lambda: True,
+    )
+
+    with pytest.raises(ProviderStopRequested):
+        provider.complete([], get_tool_schemas())
+
+    assert client.chat.completions.last_request is None
+
+
 def test_provider_rejects_malformed_tool_call() -> None:
     malformed_call = SimpleNamespace(
         id="call-1",
@@ -180,6 +217,8 @@ def test_deepseek_factory_reads_key_and_model_from_environment(
     provider = create_provider_from_env("deepseek", client_factory=factory)
 
     assert provider.model == "test-model-from-env"
+    assert provider.extra_body == {"thinking": {"type": "disabled"}}
+    assert provider.reasoning_effort is None
     assert factory.calls == [
         {
             "api_key": "test-key-from-env",
@@ -187,6 +226,40 @@ def test_deepseek_factory_reads_key_and_model_from_environment(
             "max_retries": 0,
         }
     ]
+
+
+def test_deepseek_goal_mode_enables_native_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enable thinking and high effort only for the deep/goal GUI mode."""
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("AGENT_MODEL", "deepseek-reasoner")
+    provider = create_provider_from_env(
+        "deepseek",
+        mode="goal",
+        client_factory=RecordingClientFactory(),
+    )
+
+    assert provider.extra_body == {"thinking": {"type": "enabled"}}
+    assert provider.reasoning_effort == "high"
+
+
+def test_bailian_thinking_switch_follows_agent_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Map quick/deep to Bailian's documented enable_thinking flag."""
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://example.invalid/compatible-mode/v1")
+    monkeypatch.setenv("AGENT_MODEL", "qwen-model")
+    factory = RecordingClientFactory()
+
+    quick = create_provider_from_env("bailian", mode="auto", client_factory=factory)
+    deep = create_provider_from_env("bailian", mode="goal", client_factory=factory)
+
+    assert quick.extra_body == {"enable_thinking": False}
+    assert deep.extra_body == {"enable_thinking": True}
 
 
 def test_factory_rejects_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

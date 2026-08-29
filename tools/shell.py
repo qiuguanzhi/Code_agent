@@ -6,7 +6,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from threading import Thread
 from typing import Any, TextIO
@@ -163,10 +163,12 @@ def _kill_process_tree(process: subprocess.Popen[str]) -> None:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=5,
+                timeout=1,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+        if process.poll() is None:
             process.kill()
         return
 
@@ -191,6 +193,7 @@ def run_command(
     *,
     allowed_executables: Collection[str] = DEFAULT_ALLOWED_EXECUTABLES,
     environment: Mapping[str, str] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run one allow-listed executable with ``shell=False`` inside a workspace.
 
@@ -253,16 +256,23 @@ def run_command(
     reader = Thread(target=_drain_stdout, args=(process.stdout, output), daemon=True)
     reader.start()
     timed_out = False
+    cancelled = False
+    deadline = started_at + timeout_seconds
+    while process.poll() is None:
+        if should_stop is not None and should_stop():
+            cancelled = True
+            _kill_process_tree(process)
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _kill_process_tree(process)
+            break
+        time.sleep(0.05)
     try:
-        exit_code = process.wait(timeout=timeout_seconds)
+        exit_code = process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_tree(process)
-        try:
-            exit_code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            exit_code = process.wait(timeout=5)
+        process.kill()
+        exit_code = process.wait(timeout=5)
     finally:
         reader.join(timeout=2)
         if reader.is_alive():
@@ -272,7 +282,9 @@ def run_command(
     duration_ms = round((time.monotonic() - started_at) * 1_000)
     rendered_output = output.render()
     error_code: str | None
-    if timed_out:
+    if cancelled:
+        error_code = "cancelled"
+    elif timed_out:
         error_code = "timeout"
     elif exit_code != 0:
         error_code = "nonzero_exit"
@@ -288,7 +300,9 @@ def run_command(
             else {
                 "code": error_code,
                 "message": (
-                    "command exceeded its timeout"
+                    "command cancelled by user"
+                    if cancelled
+                    else "command exceeded its timeout"
                     if timed_out
                     else f"command exited with code {exit_code}"
                 ),
@@ -299,9 +313,9 @@ def run_command(
             "cwd": cwd,
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "cancelled": cancelled,
             "duration_ms": duration_ms,
             "output_chars": output.total_chars,
             "output_truncated": output.truncated,
         },
     }
-

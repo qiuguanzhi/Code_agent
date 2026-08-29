@@ -43,6 +43,7 @@ class AgentState:
     changed_file_hashes: dict[str, str] = field(default_factory=dict)
     last_test_result: str | None = None
     initial_snapshot: dict[str, str] = field(default_factory=dict)
+    reasoning: str = ""
     mode: str = "auto"
 
     def __post_init__(self) -> None:

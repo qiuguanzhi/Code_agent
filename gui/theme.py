@@ -23,6 +23,8 @@ LIGHT_COLORS: dict[str, str] = {
     "assistant_bubble": "#f1f1f4",
     "system_bubble": "#fff7e8",
     "thinking_background": "#f0f0f0",
+    "toolbar_card": "#eef1f4",
+    "stop_hover": "#b50c14",
 }
 
 DARK_COLORS: dict[str, str] = {
@@ -45,6 +47,8 @@ DARK_COLORS: dict[str, str] = {
     "assistant_bubble": "#2b2c38",
     "system_bubble": "#443a29",
     "thinking_background": "#40414f",
+    "toolbar_card": "#242632",
+    "stop_hover": "#d64f5f",
 }
 
 
@@ -79,6 +83,12 @@ QMenu::separator {{ height: 1px; background: {colors['border']}; margin: 6px 8px
 QToolBar {{ border-bottom: 1px solid {colors['border']}; spacing: 9px; padding: 7px 10px; }}
 QToolBar::separator {{ background: {colors['border']}; width: 1px; margin: 4px 7px; }}
 QLabel#snapshotLabel, QLabel#waitingIndicator {{ color: {colors['warning']}; }}
+QLabel#statusIndicator, QLabel#workspaceLabel, QLabel#snapshotLabel {{
+    background-color: {colors['toolbar_card']};
+    border: 1px solid {colors['border']};
+    border-radius: 8px;
+    padding: 5px 9px;
+}}
 QLabel#workspaceEmptyLabel {{ color: {colors['muted']}; font-size: 12px; }}
 QPushButton, QToolButton {{
     background-color: {colors['panel']};
@@ -102,6 +112,26 @@ QPushButton#sendButton {{
     color: {colors['button_text']};
     border: 0;
     font-weight: 600;
+}}
+QPushButton#sendButton[stopMode="true"] {{
+    background-color: {colors['error']};
+    border-radius: 18px;
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    padding: 0;
+}}
+QPushButton#sendButton[stopMode="true"]:hover {{
+    background-color: {colors['stop_hover']};
+    border: 0;
+}}
+QPushButton#manualSaveButton {{
+    background: transparent;
+    color: {colors['muted']};
+    border-color: {colors['border']};
+    padding: 4px 10px;
+    font-size: 12px;
 }}
 QPushButton#applyButton {{
     background-color: {colors['success']};
@@ -149,6 +179,7 @@ QScrollArea#conversationView, QWidget#conversationContent {{
     background-color: {colors['background']};
     border: 0;
 }}
+QWidget#conversationContent {{ padding: 0; }}
 QScrollArea#conversationView > QWidget > QWidget {{
     background-color: {colors['background']};
 }}
@@ -187,6 +218,22 @@ QToolButton#messageDeleteButton {{
 QToolButton#messageDeleteButton:hover {{
     background-color: {colors['hover']};
     color: {colors['error']};
+}}
+QFrame#fileMentionPopup {{
+    background-color: {colors['panel']};
+    border: 1px solid {colors['border']};
+    border-radius: 8px;
+}}
+QListWidget#fileMentionList {{
+    background-color: {colors['panel']};
+    border: 0;
+    border-radius: 6px;
+    padding: 3px;
+}}
+QListWidget#fileMentionList::item {{ padding: 6px 9px; border-radius: 5px; }}
+QListWidget#fileMentionList::item:selected {{
+    background-color: {colors['hover']};
+    color: {colors['text']};
 }}
 QWidget#logPanel {{
     background-color: {colors['panel']};

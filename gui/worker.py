@@ -30,6 +30,7 @@ class AgentWorker(QThread):
     diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
     progress_signal = Signal(int, str)
+    reasoning_signal = Signal(str)
     tool_status_signal = Signal(str, str, str)
     confirmation_signal = Signal(str)
     snapshot_signal = Signal(object, str)
@@ -57,6 +58,10 @@ class AgentWorker(QThread):
         self._confirmation_event = threading.Event()
         self._confirmation_result = False
         self._prepared_confirmation_path: str | None = None
+        self._stop_event = threading.Event()
+        self.current_step = 0
+        self._active_provider: ModelProvider | None = None
+        self._reasoning_emitted = False
 
     def start_agent(
         self,
@@ -86,7 +91,29 @@ class AgentWorker(QThread):
         self._interactive = interactive
         self._confirmation_event.clear()
         self._confirmation_result = False
+        self._stop_event.clear()
+        self.current_step = 0
+        self._reasoning_emitted = False
         self.start()
+
+    def stop(self) -> None:
+        """Request cooperative cancellation and release any confirmation wait."""
+
+        self._stop_event.set()
+        self.requestInterruption()
+        self._confirmation_result = False
+        self._confirmation_event.set()
+        cancel = getattr(self._active_provider, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
+    def is_stop_requested(self) -> bool:
+        """Return whether the GUI requested this run to stop."""
+
+        return self._stop_event.is_set() or self.isInterruptionRequested()
 
     def resolve_write_confirmation(self, confirmed: bool) -> None:
         """Release a worker waiting for a GUI write-confirmation decision."""
@@ -103,7 +130,14 @@ class AgentWorker(QThread):
 
         self.status_signal.emit("running", "Agent 正在运行")
         try:
-            provider = self.provider or create_provider_from_env(self.provider_name)
+            provider = self.provider or create_provider_from_env(
+                self.provider_name,
+                mode=self.mode,
+            )
+            self._active_provider = provider
+            set_stop_callback = getattr(provider, "set_stop_callback", None)
+            if callable(set_stop_callback):
+                set_stop_callback(self.is_stop_requested)
             cfg = AgentConfig(
                 workspace=self._workspace,
                 provider=provider,
@@ -111,6 +145,7 @@ class AgentWorker(QThread):
                 mode=self.mode,
                 interactive=self._interactive,
                 confirm_write=self._confirm_write if self._interactive else None,
+                should_stop=self.is_stop_requested,
             )
             snapshot_timestamp = datetime.now().astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
@@ -121,10 +156,18 @@ class AgentWorker(QThread):
             return
 
         success = result.status == "completed"
+        stopped_by_user = result.reason == "user_stopped"
+        if self.mode == "goal" and result.state.reasoning and not self._reasoning_emitted:
+            self.reasoning_signal.emit(result.state.reasoning)
+            self._reasoning_emitted = True
         summary = self._format_summary(result)
         self.snapshot_signal.emit(result.state.initial_snapshot, snapshot_timestamp)
-        self.status_signal.emit("ready" if success else "error", result.answer)
+        self.status_signal.emit(
+            "ready" if success or stopped_by_user else "error",
+            "已停止" if stopped_by_user else result.answer,
+        )
         self.finished_signal.emit(success, summary)
+        self._active_provider = None
 
     def _confirm_write(self, path: str) -> bool:
         """Obtain a write decision from an injected callback or the GUI thread."""
@@ -150,6 +193,7 @@ class AgentWorker(QThread):
 
         event = str(update.get("event", "event"))
         step = self._safe_step(update.get("step"))
+        self.current_step = step
         message = str(update.get("message", ""))
         data = update.get("data")
         event_data = data if isinstance(data, Mapping) else {}
@@ -158,6 +202,11 @@ class AgentWorker(QThread):
 
         if event == "model_request":
             self.status_signal.emit("running", f"第 {step} 步：模型思考中")
+        elif event == "model_response":
+            reasoning = event_data.get("reasoning")
+            if self.mode == "goal" and isinstance(reasoning, str) and reasoning.strip():
+                self.reasoning_signal.emit(reasoning.strip())
+                self._reasoning_emitted = True
         elif event == "tool_call":
             tool_name = str(event_data.get("tool", "工具"))
             self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
@@ -169,7 +218,14 @@ class AgentWorker(QThread):
             self._emit_compact_tool_log(step, event_data)
             tool_name = str(event_data.get("tool", "unknown_tool"))
             result = event_data.get("result")
-            if isinstance(result, Mapping) and result.get("ok") is True:
+            error_code = self._result_error_code(result)
+            if tool_name == "write_file" and error_code == "user_aborted":
+                self.tool_status_signal.emit(
+                    "cancelled",
+                    tool_name,
+                    "用户已拒绝修改",
+                )
+            elif isinstance(result, Mapping) and result.get("ok") is True:
                 self.tool_status_signal.emit("success", tool_name, "")
             else:
                 detail = json.dumps(
@@ -229,6 +285,18 @@ class AgentWorker(QThread):
 
         tool_name = str(event_data.get("tool", "unknown_tool"))
         result = event_data.get("result")
+        if (
+            tool_name == "write_file"
+            and self._result_error_code(result) == "user_aborted"
+        ):
+            self.log_signal.emit(
+                step,
+                "↩",
+                tool_name,
+                "muted",
+                "用户已拒绝修改",
+            )
+            return
         if isinstance(result, Mapping) and result.get("ok") is True:
             self.log_signal.emit(step, "🔧", tool_name, "tool_success", "")
             return
@@ -311,9 +379,8 @@ class AgentWorker(QThread):
         file_path = str(meta.get("path", ""))
 
         if tool_name == "read_file":
-            content = result.get("data")
-            if file_path and isinstance(content, str):
-                self.code_signal.emit(file_path, content)
+            # Agent reads are context-only. Opening tabs is reserved for user
+            # actions and actual/new file writes.
             return
 
         if tool_name == "write_file":
@@ -340,6 +407,18 @@ class AgentWorker(QThread):
         """Normalize an untrusted callback step without raising in a Qt slot."""
 
         return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @staticmethod
+    def _result_error_code(result: object) -> str | None:
+        """Extract a structured tool error code without trusting result shape."""
+
+        if not isinstance(result, Mapping):
+            return None
+        error = result.get("error")
+        if not isinstance(error, Mapping):
+            return None
+        code = error.get("code")
+        return code if isinstance(code, str) else None
 
     @staticmethod
     def _count_diff_changes(diff_text: str) -> tuple[int, int]:
@@ -374,3 +453,4 @@ class AgentWorker(QThread):
 
         self.status_signal.emit("error", message)
         self.finished_signal.emit(False, message)
+        self._active_provider = None

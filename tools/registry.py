@@ -23,6 +23,10 @@ from tools.shell import run_command
 WRITE_POLICY: dict[str, bool] = {"require_confirmation": True}
 
 
+class ToolStopRequested(RuntimeError):
+    """Raised at a tool boundary after cooperative cancellation."""
+
+
 class ToolRegistry:
     """Bind model-visible tool calls to local workspace-scoped functions."""
 
@@ -33,11 +37,13 @@ class ToolRegistry:
         write_policy: Mapping[str, bool] | None = None,
         max_same_call: int = 3,
         confirm_write: Callable[[str], bool] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.workspace = workspace.resolve(strict=True)
         self.write_policy = dict(WRITE_POLICY if write_policy is None else write_policy)
         self.max_same_call = max_same_call
         self.confirm_write = confirm_write
+        self.should_stop = should_stop
         self.schemas = get_tool_schemas()
 
     def _confirm_write(self, path: str) -> bool:
@@ -51,6 +57,7 @@ class ToolRegistry:
     def execute_one_call(self, call: ToolCall, state: AgentState) -> str:
         """Validate, deduplicate, confirm, and execute one local tool call."""
 
+        self._raise_if_stopped()
         if call.id in state.tool_result_cache:
             return state.tool_result_cache[call.id]
 
@@ -74,6 +81,7 @@ class ToolRegistry:
             return self._cache_result(call.id, result, state)
 
         confirmed_by_user: bool | None = None
+        self._raise_if_stopped()
         if call.name == "write_file" and self.write_policy.get("require_confirmation", True):
             confirmed_by_user = self._confirm_write(str(arguments["path"]))
             if not confirmed_by_user:
@@ -90,7 +98,11 @@ class ToolRegistry:
             elif call.name == "write_file":
                 result = write_file(self.workspace, **arguments)
             elif call.name == "run_command":
-                result = run_command(self.workspace, **arguments)
+                result = run_command(
+                    self.workspace,
+                    **arguments,
+                    should_stop=self.should_stop,
+                )
             else:
                 result = tool_error("unknown_tool", f"unknown tool: {call.name}")
         except Exception as exc:
@@ -107,7 +119,14 @@ class ToolRegistry:
                 if isinstance(diff_text, str):
                     state.changed_files[file_path] = diff_text
 
+        self._raise_if_stopped()
         return self._cache_result(call.id, result, state)
+
+    def _raise_if_stopped(self) -> None:
+        """Abort immediately when the owning Agent requested cancellation."""
+
+        if self.should_stop is not None and self.should_stop():
+            raise ToolStopRequested("user requested stop")
 
     def _cache_result(
         self,

@@ -19,6 +19,7 @@ class Conversation:
     messages: list[dict[str, Any]] = field(default_factory=list)
     logs: list[dict[str, Any]] = field(default_factory=list)
     process: list[dict[str, Any]] = field(default_factory=list)
+    reasoning: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -36,6 +37,7 @@ class Conversation:
         messages = value.get("messages", [])
         logs = value.get("logs", [])
         process = value.get("process", [])
+        reasoning = value.get("reasoning", "")
         if not isinstance(identifier, str) or not identifier:
             return None
         if not isinstance(title, str) or not title:
@@ -44,6 +46,7 @@ class Conversation:
             not isinstance(messages, list)
             or not isinstance(logs, list)
             or not isinstance(process, list)
+            or not isinstance(reasoning, str)
         ):
             return None
         clean_messages = [dict(item) for item in messages if isinstance(item, dict)]
@@ -59,7 +62,14 @@ class Conversation:
                     clean_process.append(
                         {"level": max(0, min(level, 3)), "text": text}
                     )
-        return cls(identifier, title, clean_messages, clean_logs, clean_process)
+        return cls(
+            id=identifier,
+            title=title,
+            messages=clean_messages,
+            logs=clean_logs,
+            process=clean_process,
+            reasoning=reasoning,
+        )
 
 
 class ConversationStore:
@@ -280,4 +290,20 @@ class ConversationStore:
         conversation.process.append(
             {"level": max(0, min(level, 3)), "text": summary.strip()}
         )
+        self.save()
+
+    def append_reasoning(
+        self,
+        text: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Append provider-native reasoning as one continuous narrative."""
+
+        conversation = self.get(conversation_id or self.active_id)
+        clean_text = text.strip()
+        if conversation is None or not clean_text:
+            return
+        separator = "\n\n" if conversation.reasoning else ""
+        conversation.reasoning += separator + clean_text
         self.save()
