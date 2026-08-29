@@ -3,22 +3,359 @@
 from __future__ import annotations
 
 import math
+import re
+from html import escape
 from typing import Any
 
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QResizeEvent
+from PySide6.QtCore import QPoint, QRectF, QTimer, Qt, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QHideEvent,
+    QResizeEvent,
+    QShowEvent,
+)
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QScrollArea,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
+
+
+class _CerebroOverlay(QWidget):
+    """Mouse-transparent foreground used to keep the watermark visible."""
+
+    def __init__(self, owner: CerebroBackground) -> None:
+        """Bind the overlay to its central background owner."""
+
+        super().__init__(owner)
+        self._owner = owner
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def paintEvent(self, event: object) -> None:
+        """Delegate vector painting without taking input focus."""
+
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._owner._paint_overlay(painter)
+
+
+class CerebroBackground(QWidget):
+    """Lightweight animated neural watermark and active energy scan."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create the central canvas with one shared 20 FPS timer."""
+
+        super().__init__(parent)
+        self.setObjectName("cerebroBackground")
+        self._dark = True
+        self._active = False
+        self._angle = 0.0
+        self._scan_offset = -0.35
+        self._animation_timer = QTimer(self)
+        self._animation_timer.setInterval(50)
+        self._animation_timer.timeout.connect(self._advance_animation)
+        self._overlay = _CerebroOverlay(self)
+
+    def set_theme(self, theme_name: str) -> None:
+        """Select the low-opacity watermark palette and repaint."""
+
+        self._dark = theme_name != "light"
+        self._overlay.update()
+
+    def set_active(self, active: bool) -> None:
+        """Enable or pause the brighter task-only energy sweep."""
+
+        self._active = active
+        if not active:
+            self._scan_offset = -0.35
+        self._overlay.update()
+
+    def stop_animation(self) -> None:
+        """Stop repaint scheduling when the owning main window closes."""
+
+        self._active = False
+        self._animation_timer.stop()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Animate only while the canvas is actually visible."""
+
+        super().showEvent(event)
+        self._overlay.setGeometry(self.rect())
+        self._overlay.raise_()
+        self._animation_timer.start()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        """Release the 20 FPS timer whenever the window is hidden."""
+
+        self._animation_timer.stop()
+        super().hideEvent(event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        """Keep the mouse-transparent visual layer over every central panel."""
+
+        super().resizeEvent(event)
+        self._overlay.setGeometry(self.rect())
+        self._overlay.raise_()
+
+    def _advance_animation(self) -> None:
+        """Rotate the network slowly and advance the active gradient."""
+
+        self._angle = (self._angle + 0.1) % 360.0
+        if self._active:
+            self._scan_offset += 0.018
+            if self._scan_offset > 1.35:
+                self._scan_offset = -0.35
+        self._overlay.update()
+
+    def _paint_overlay(self, painter: QPainter) -> None:
+        """Paint a sparse deterministic neural mesh over opaque child panels."""
+
+        width = max(1, self.width())
+        height = max(1, self.height())
+        network_color = QColor("#64FFDA" if self._dark else "#c0c8d8")
+        network_color.setAlphaF(0.065 if self._dark else 0.08)
+        painter.save()
+        painter.translate(width / 2, height / 2)
+        painter.rotate(self._angle)
+        painter.translate(-width / 2, -height / 2)
+        painter.setPen(QPen(network_color, 1.0))
+        nodes = [
+            (0.08, 0.24), (0.18, 0.72), (0.31, 0.38), (0.43, 0.81),
+            (0.56, 0.18), (0.65, 0.62), (0.79, 0.32), (0.91, 0.74),
+        ]
+        for index, (x_ratio, y_ratio) in enumerate(nodes):
+            x = x_ratio * width
+            y = y_ratio * height
+            painter.drawEllipse(QRectF(x - 2, y - 2, 4, 4))
+            for neighbor in (index + 1, index + 3):
+                if neighbor >= len(nodes):
+                    continue
+                nx, ny = nodes[neighbor]
+                path = QPainterPath()
+                path.moveTo(x, y)
+                path.cubicTo(
+                    (x + nx * width) / 2,
+                    y - height * 0.06,
+                    (x + nx * width) / 2,
+                    ny * height + height * 0.06,
+                    nx * width,
+                    ny * height,
+                )
+                painter.drawPath(path)
+        painter.restore()
+
+        if self._active:
+            gradient = QLinearGradient(0, 0, width, height)
+            center = min(1.0, max(0.0, self._scan_offset))
+            transparent = QColor("#64FFDA")
+            transparent.setAlpha(0)
+            glow = QColor("#64FFDA")
+            glow.setAlpha(48)
+            gradient.setColorAt(max(0.0, center - 0.08), transparent)
+            gradient.setColorAt(center, glow)
+            gradient.setColorAt(min(1.0, center + 0.08), transparent)
+            painter.fillRect(self.rect(), QBrush(gradient))
+
+
+class PulseIndicator(QWidget):
+    """Small status dot with a timer-driven opacity pulse."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create a compact indicator whose color follows semantic state."""
+
+        super().__init__(parent)
+        self.setObjectName("pulseIndicator")
+        self.setFixedSize(14, 14)
+        self._color = QColor("#4ADE80")
+        self._direction = -0.08
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._timer = QTimer(self)
+        self._timer.setInterval(70)
+        self._timer.timeout.connect(self._pulse)
+
+    def set_state(self, state: str) -> None:
+        """Update color and animate only while Agent work is active."""
+
+        colors = {"ready": "#4ADE80", "running": "#FFD700", "error": "#FF6B6B"}
+        self._color = QColor(colors.get(state, colors["error"]))
+        if state == "running":
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._effect.setOpacity(1.0)
+        self.update()
+
+    def _pulse(self) -> None:
+        """Oscillate opacity between readable limits."""
+
+        opacity = self._effect.opacity() + self._direction
+        if opacity <= 0.38 or opacity >= 1.0:
+            self._direction *= -1
+            opacity = min(1.0, max(0.38, opacity))
+        self._effect.setOpacity(opacity)
+
+    def paintEvent(self, event: object) -> None:
+        """Paint a soft outer glow and solid energy dot."""
+
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        glow = QColor(self._color)
+        glow.setAlpha(70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(glow)
+        painter.drawEllipse(QRectF(0, 0, 14, 14))
+        painter.setBrush(self._color)
+        painter.drawEllipse(QRectF(3, 3, 8, 8))
+
+
+class BrainWaveIndicator(QWidget):
+    """Compact alpha-wave display animated only during Agent activity."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create an idle waveform with an inexpensive timer."""
+
+        super().__init__(parent)
+        self.setObjectName("alphaWaveIndicator")
+        self.setFixedSize(118, 28)
+        self._active = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(90)
+        self._timer.timeout.connect(self._advance)
+
+    def set_active(self, active: bool) -> None:
+        """Start an 8-12 Hz-inspired visual pulse or return to idle."""
+
+        self._active = active
+        if active:
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._phase = 0.0
+        self.update()
+
+    def _advance(self) -> None:
+        """Move the wave phase without performing work in the main slots."""
+
+        self._phase = (self._phase + 0.72) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, event: object) -> None:
+        """Draw the alpha label and a smooth electroencephalogram line."""
+
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor("#64FFDA" if self._active else "#8892B0")
+        painter.setPen(QPen(color, 1.4))
+        painter.drawText(QRectF(0, 0, 28, 28), Qt.AlignmentFlag.AlignCenter, "α")
+        path = QPainterPath()
+        baseline = 14.0
+        path.moveTo(28, baseline)
+        for x in range(29, 116, 2):
+            amplitude = 6.0 if self._active else 2.0
+            y = baseline + math.sin((x - 28) * 0.20 + self._phase) * amplitude
+            path.lineTo(x, y)
+        painter.drawPath(path)
+
+
+def basic_markdown_to_html(markdown_text: str) -> str:
+    """Render a small, escaped Markdown subset suitable for Agent answers."""
+
+    lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    output: list[str] = []
+    list_items: list[str] = []
+    code_lines: list[str] = []
+    in_code = False
+
+    def render_inline(value: str) -> str:
+        """Escape untrusted text, then render inline code and strong spans."""
+
+        safe = escape(value)
+        safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+        return re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", safe)
+
+    def flush_list() -> None:
+        """Append a pending unordered list as one semantic block."""
+
+        if not list_items:
+            return
+        output.append(
+            "<ul style='margin:4px 0 6px 18px'>"
+            + "".join(f"<li>{item}</li>" for item in list_items)
+            + "</ul>"
+        )
+        list_items.clear()
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            flush_list()
+            if in_code:
+                output.append(
+                    "<pre style='background-color:rgba(127,127,127,0.14);"
+                    "padding:8px;border-radius:6px'><code>"
+                    + "\n".join(code_lines)
+                    + "</code></pre>"
+                )
+                code_lines.clear()
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(escape(line))
+            continue
+
+        heading = re.match(r"^\s*#{1,4}\s+(.+)$", line)
+        item = re.match(r"^\s*-\s+(.+)$", line)
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if item is not None:
+            list_items.append(render_inline(item.group(1)))
+            continue
+        flush_list()
+        if heading is not None:
+            level = min(4, max(1, len(line) - len(line.lstrip("#"))))
+            output.append(f"<h{level}>{render_inline(heading.group(1))}</h{level}>")
+        elif quote is not None:
+            output.append(
+                "<blockquote style='background-color:rgba(127,127,127,0.14);"
+                "border-left:3px solid #6c7086;padding:6px 10px;margin:4px 0'>"
+                f"{render_inline(quote.group(1))}</blockquote>"
+            )
+        elif line.strip():
+            output.append(f"<p>{render_inline(line.strip())}</p>")
+        else:
+            output.append("<br>")
+    flush_list()
+    if in_code:
+        output.append(
+            "<pre style='background-color:rgba(127,127,127,0.14);padding:8px'>"
+            "<code>" + "\n".join(code_lines) + "</code></pre>"
+        )
+    return "".join(output)
 
 
 class MessageBubble(QWidget):
@@ -63,7 +400,7 @@ class MessageBubble(QWidget):
 
         header = QHBoxLayout()
         title = QLabel(
-            "你" if role == "user" else "Agent" if role == "assistant" else "系统",
+            "你" if role == "user" else "🧠 Cerebro" if role == "assistant" else "系统",
             self.bubble_frame,
         )
         title.setObjectName("messageRoleLabel")
@@ -83,13 +420,25 @@ class MessageBubble(QWidget):
             header.addWidget(delete_button)
         bubble_layout.addLayout(header)
 
-        self.content_label = QLabel(content, self.bubble_frame)
+        if role == "assistant":
+            content_widget = QTextBrowser(self.bubble_frame)
+            content_widget.setFrameShape(QFrame.Shape.NoFrame)
+            content_widget.setOpenExternalLinks(False)
+            content_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            content_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            content_widget.setSizeAdjustPolicy(
+                QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents
+            )
+            content_widget.setHtml(basic_markdown_to_html(content))
+        else:
+            content_widget = QLabel(content, self.bubble_frame)
+            content_widget.setWordWrap(True)
+            content_widget.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+        self.content_label = content_widget
         self.content_label.setObjectName("messageContent")
-        self.content_label.setWordWrap(True)
-        self.content_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
         bubble_layout.addWidget(self.content_label)
 
         if role == "user":
@@ -108,9 +457,21 @@ class MessageBubble(QWidget):
             minimum = max(minimum, math.ceil(safe_width * (0.80 / 0.85)))
         self.bubble_frame.setMinimumWidth(min(minimum, safe_width))
         self.bubble_frame.setMaximumWidth(safe_width)
-        if self._uses_wide_layout:
+        if isinstance(self.content_label, QTextBrowser):
+            content_width = max(
+                40,
+                safe_width - 26 if self._uses_wide_layout else min(520, safe_width - 26),
+            )
+            self.content_label.setFixedWidth(content_width)
+            document = self.content_label.document()
+            document.setTextWidth(max(40, content_width - 16))
+            self.content_label.setFixedHeight(
+                max(34, math.ceil(document.size().height()) + 8)
+            )
+        elif self._uses_wide_layout:
             self.content_label.setFixedWidth(max(40, safe_width - 26))
             self.content_label.adjustSize()
+        if self._uses_wide_layout or isinstance(self.content_label, QTextBrowser):
             self.bubble_frame.layout().activate()
             self.bubble_frame.adjustSize()
 
@@ -120,6 +481,7 @@ class ConversationScrollArea(QScrollArea):
 
     delete_requested = Signal(str, int)
     BUBBLE_WIDTH_RATIO = 0.85
+    MAX_RENDERED_MESSAGES = 200
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """Create the scroll container and its vertically stacked bubble host."""
@@ -145,24 +507,31 @@ class ConversationScrollArea(QScrollArea):
     ) -> None:
         """Replace visible bubbles while preserving only trusted text fields."""
 
-        self._clear_bubbles()
-        self._plain_messages = []
-        for index, message in enumerate(messages):
-            role = str(message.get("role", "system"))
-            content = str(message.get("content", ""))
-            bubble = MessageBubble(
-                conversation_id,
-                index,
-                role,
-                content,
-                deletable=role in {"user", "assistant"},
-                parent=self._content,
-            )
-            bubble.delete_requested.connect(self.delete_requested)
-            bubble.set_width_constraints(self._bubble_width_limit())
-            self._layout.insertWidget(self._layout.count() - 1, bubble)
-            self.bubbles.append(bubble)
-            self._plain_messages.append(content)
+        self.setUpdatesEnabled(False)
+        try:
+            self._clear_bubbles()
+            self._plain_messages = []
+            start_index = max(0, len(messages) - self.MAX_RENDERED_MESSAGES)
+            for index in range(start_index, len(messages)):
+                message = messages[index]
+                role = str(message.get("role", "system"))
+                content = str(message.get("content", ""))
+                bubble = MessageBubble(
+                    conversation_id,
+                    index,
+                    role,
+                    content,
+                    deletable=role in {"user", "assistant"},
+                    parent=self._content,
+                )
+                bubble.delete_requested.connect(self.delete_requested)
+                bubble.set_width_constraints(self._bubble_width_limit())
+                self._layout.insertWidget(self._layout.count() - 1, bubble)
+                self.bubbles.append(bubble)
+                self._plain_messages.append(content)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.viewport().update()
         scrollbar = self.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -194,7 +563,7 @@ class ConversationScrollArea(QScrollArea):
         self.bubbles.clear()
 
 
-class FileMentionPopup(QFrame):
+class FileMentionPopup(QMenu):
     """Popup list used to insert fuzzy-matched workspace file mentions."""
 
     mention_selected = Signal(str)
@@ -203,14 +572,19 @@ class FileMentionPopup(QFrame):
         """Create an initially hidden, keyboard-friendly file list."""
 
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Popup)
         self.setObjectName("fileMentionPopup")
-        layout = QVBoxLayout(self)
+        self._host = QWidget(self)
+        layout = QVBoxLayout(self._host)
         layout.setContentsMargins(4, 4, 4, 4)
-        self.list_widget = QListWidget(self)
+        self.list_widget = QListWidget(self._host)
         self.list_widget.setObjectName("fileMentionList")
         self.list_widget.itemClicked.connect(self._select_item)
         self.list_widget.itemActivated.connect(self._select_item)
         layout.addWidget(self.list_widget)
+        self._widget_action = QWidgetAction(self)
+        self._widget_action.setDefaultWidget(self._host)
+        self.addAction(self._widget_action)
         self._all_paths: list[str] = []
         self.hide()
 
@@ -220,7 +594,7 @@ class FileMentionPopup(QFrame):
         self._all_paths = sorted(dict.fromkeys(paths), key=str.casefold)
 
     def show_matches(self, anchor: QLineEdit, query: str) -> None:
-        """Filter paths fuzzily and show the popup below the input control."""
+        """Filter paths fuzzily and show above the input, falling back below."""
 
         normalized = query.casefold()
         matches = [
@@ -243,16 +617,21 @@ class FileMentionPopup(QFrame):
         self.list_widget.setCurrentRow(0)
         width = max(320, anchor.width())
         height = min(280, max(72, self.list_widget.count() * 28 + 12))
-        self.resize(width, height)
-        parent = self.parentWidget()
-        position = (
-            anchor.mapTo(parent, QPoint(0, anchor.height() + 2))
-            if parent is not None
-            else QPoint(0, anchor.height() + 2)
-        )
-        self.move(position)
-        self.show()
-        self.raise_()
+        self._host.setFixedSize(width, height)
+        self.adjustSize()
+        popup_height = max(height, self.sizeHint().height())
+        screen = anchor.screen().availableGeometry()
+        anchor_top = anchor.mapToGlobal(QPoint(0, 0))
+        above_y = anchor_top.y() - popup_height - 4
+        below_y = anchor_top.y() + anchor.height() + 4
+        y = above_y if above_y >= screen.top() else below_y
+        x = min(max(screen.left(), anchor_top.x()), screen.right() - width + 1)
+        self.popup(QPoint(x, y))
+
+    def dispose(self) -> None:
+        """Close the native popup handle before its owning window is hidden."""
+
+        self.close()
 
     def choose_current(self) -> bool:
         """Emit the current selection, returning whether an item existed."""

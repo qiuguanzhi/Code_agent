@@ -1,54 +1,58 @@
-"""ChatGPT-inspired persistable light and dark QSS themes."""
+"""Cerebro Cyber Cortex persistable light and dark QSS themes."""
 
 from __future__ import annotations
 
 
 LIGHT_COLORS: dict[str, str] = {
-    "background": "#f7f7f8",
+    "background": "#f0f4f8",
     "code_background": "#ffffff",
     "panel": "#ffffff",
-    "text": "#202123",
-    "muted": "#6e6e80",
-    "success": "#10a37f",
-    "error": "#d00e17",
-    "accent": "#10a37f",
-    "purple": "#7c3aed",
-    "warning": "#b26a00",
-    "border": "#d9d9e3",
-    "hover": "#ececf1",
-    "pressed": "#d2d2d9",
+    "text": "#0A192F",
+    "muted": "#8892B0",
+    "success": "#4ADE80",
+    "error": "#FF6B6B",
+    "accent": "#64FFDA",
+    "purple": "#5271ff",
+    "warning": "#FFD700",
+    "border": "#c0c8d8",
+    "hover": "#e3ebf2",
+    "pressed": "#d5e0ea",
     "button_text": "#ffffff",
-    "user_bubble": "#e9f6f1",
-    "user_bubble_text": "#163d34",
-    "assistant_bubble": "#f1f1f4",
-    "system_bubble": "#fff7e8",
-    "thinking_background": "#f0f0f0",
-    "toolbar_card": "#eef1f4",
-    "stop_hover": "#b50c14",
+    "user_bubble": "#dff8f2",
+    "user_bubble_text": "#0A192F",
+    "assistant_bubble": "#ffffff",
+    "system_bubble": "#fff9d9",
+    "thinking_background": "#e7edf3",
+    "toolbar_card": "#e7edf3",
+    "stop_background": "#e8e8e8",
+    "stop_icon": "#4a4a4a",
+    "stop_hover": "#d6d6d6",
 }
 
 DARK_COLORS: dict[str, str] = {
-    "background": "#343541",
-    "code_background": "#202123",
-    "panel": "#2d2d3a",
-    "text": "#ececf1",
-    "muted": "#acacbe",
-    "success": "#19c37d",
-    "error": "#ff6b6b",
-    "accent": "#19c37d",
-    "purple": "#c4b5fd",
-    "warning": "#f5c26b",
-    "border": "#565869",
-    "hover": "#40414f",
-    "pressed": "#4d4d5c",
+    "background": "#0A192F",
+    "code_background": "#071426",
+    "panel": "#112240",
+    "text": "#E6F1FF",
+    "muted": "#8892B0",
+    "success": "#4ADE80",
+    "error": "#FF6B6B",
+    "accent": "#64FFDA",
+    "purple": "#a78bfa",
+    "warning": "#FFD700",
+    "border": "#233554",
+    "hover": "#17345b",
+    "pressed": "#1d426f",
     "button_text": "#ffffff",
-    "user_bubble": "#244c43",
-    "user_bubble_text": "#e7fff7",
-    "assistant_bubble": "#2b2c38",
-    "system_bubble": "#443a29",
-    "thinking_background": "#40414f",
-    "toolbar_card": "#242632",
-    "stop_hover": "#d64f5f",
+    "user_bubble": "#123f4a",
+    "user_bubble_text": "#E6F1FF",
+    "assistant_bubble": "#112240",
+    "system_bubble": "#3c3520",
+    "thinking_background": "#0d203b",
+    "toolbar_card": "#0d203b",
+    "stop_background": "#3d3d3d",
+    "stop_icon": "#c8c8c8",
+    "stop_hover": "#505050",
 }
 
 
@@ -59,10 +63,18 @@ def _build_theme(colors: dict[str, str]) -> str:
 QWidget {{
     background-color: {colors['background']};
     color: {colors['text']};
-    font-family: "Segoe UI", "Inter", "San Francisco", sans-serif;
+    font-family: "JetBrains Mono", "Consolas", "Courier New", "Microsoft YaHei UI", "Noto Sans CJK SC", monospace;
     font-size: 14px;
 }}
 QMainWindow, QDialog {{ background-color: {colors['background']}; }}
+QWidget#cerebroBackground {{ background-color: {colors['background']}; }}
+QWidget#workspacePanel, QWidget#conversationPanel, QWidget#codePanel {{
+    background: transparent;
+}}
+QWidget#pulseIndicator, QWidget#alphaWaveIndicator {{
+    background: transparent;
+    border: 0;
+}}
 QMenuBar, QToolBar, QStatusBar {{
     background-color: {colors['panel']};
     border-color: {colors['border']};
@@ -108,13 +120,19 @@ QPushButton:disabled, QToolButton:disabled {{
     border-color: {colors['border']};
 }}
 QPushButton#sendButton {{
-    background-color: {colors['accent']};
-    color: {colors['button_text']};
+    background-color: #1a7f5c;
+    color: #ffffff;
     border: 0;
     font-weight: 600;
 }}
+QPushButton#sendButton:hover {{ background-color: #156a4d; }}
+QPushButton#sendButton:pressed {{ background-color: #238e69; }}
+QPushButton#sendButton:disabled {{
+    background-color: #888888;
+    color: #eeeeee;
+}}
 QPushButton#sendButton[stopMode="true"] {{
-    background-color: {colors['error']};
+    background-color: {colors['stop_background']};
     border-radius: 18px;
     min-width: 36px;
     max-width: 36px;
@@ -125,6 +143,16 @@ QPushButton#sendButton[stopMode="true"] {{
 QPushButton#sendButton[stopMode="true"]:hover {{
     background-color: {colors['stop_hover']};
     border: 0;
+}}
+QToolButton#thinkingFoldButton, QToolButton#logFoldButton {{
+    background: transparent;
+    border: 0;
+    color: {colors['accent']};
+    padding: 2px 5px;
+    font-size: 13px;
+}}
+QToolButton#thinkingFoldButton:hover, QToolButton#logFoldButton:hover {{
+    background-color: {colors['hover']};
 }}
 QPushButton#manualSaveButton {{
     background: transparent;
@@ -199,14 +227,23 @@ QFrame#systemBubble {{
     border-color: {colors['warning']};
 }}
 QFrame#userBubble QLabel {{ color: {colors['user_bubble_text']}; }}
-QFrame#assistantBubble QLabel, QFrame#systemBubble QLabel {{ color: {colors['text']}; }}
+QFrame#assistantBubble QLabel, QFrame#assistantBubble QTextBrowser,
+QFrame#systemBubble QLabel {{ color: {colors['text']}; }}
 QFrame#userBubble QLabel, QFrame#assistantBubble QLabel,
-QFrame#systemBubble QLabel {{ background: transparent; border: 0; }}
+QFrame#assistantBubble QTextBrowser, QFrame#systemBubble QLabel {{
+    background: transparent;
+    border: 0;
+}}
 QLabel#messageRoleLabel {{
     font-size: 11px;
     font-weight: 700;
 }}
-QLabel#messageContent {{ font-size: 14px; }}
+QLabel#messageContent, QTextBrowser#messageContent {{
+    font-size: 14px;
+    background: transparent;
+    border: 0;
+    padding: 0;
+}}
 QToolButton#messageDeleteButton {{
     background: transparent;
     border: 0;
@@ -219,7 +256,7 @@ QToolButton#messageDeleteButton:hover {{
     background-color: {colors['hover']};
     color: {colors['error']};
 }}
-QFrame#fileMentionPopup {{
+QMenu#fileMentionPopup {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
     border-radius: 8px;
@@ -239,6 +276,13 @@ QWidget#logPanel {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
     border-radius: 10px;
+}}
+QLabel#panelTitle, QLabel#thinkingTitle {{
+    color: {colors['muted']};
+    background: transparent;
+    border: 0;
+    font-size: 12px;
+    font-weight: 700;
 }}
 QWidget#thinkingContainer {{
     background-color: {colors['thinking_background']};

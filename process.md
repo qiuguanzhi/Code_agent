@@ -383,3 +383,115 @@ $env:QT_QPA_PLATFORM='offscreen'
 ```
 
 唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。所有本轮测试均使用 FakeProvider、临时工作区和本地子进程，不访问真实模型 API。
+
+---
+
+## [2026-08-29 16:52] 第5轮 任务 #1 - 快速模式简要思考状态
+
+- **修改内容**：快速模式不再隐藏全部过程信息。Worker 将 Agent 生命周期事件映射为“正在分析问题”“正在执行工具”“正在检查结果”等单行中文状态，并通过既有 `progress_signal` 推送；主窗口在快速模式下直接展示最新状态，深度模式仍显示默认折叠的完整推理叙述。
+- **涉及文件**：`gui/worker.py`、`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。FakeProvider 快速任务产生中文状态序列，`thinkingView` 非空且不持久化模型私有 reasoning；深度模式原有折叠与完整内容测试继续通过。
+- **遗留问题**：快速状态是可信生命周期摘要，不等同于模型内部思维链；这是刻意的安全与可读性边界。
+
+## [2026-08-29 16:52] 第5轮 任务 #2 - 工具状态实时动画
+
+- **修改内容**：工具进入执行阶段即显示 `🔧 正在执行 <tool>...`，使用 320ms `QTimer` 循环改变省略号；成功、失败和取消分别显示 `✅`、`❌`、`↩`，保持 2 秒后自动恢复空闲状态。失败详情仍可点击查看，长时间命令期间动画持续运行。
+- **涉及文件**：`gui/main_window.py`、`gui/worker.py`、`agent/loop.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证多工具 running/terminal 信号顺序、动画文本变化、terminal 状态定时器及空闲恢复。
+- **遗留问题**：动画使用轻量文本变化而非 GIF/QMovie，避免额外资源文件和解码开销。
+
+## [2026-08-29 16:52] 第5轮 任务 #3 - @ 引用弹窗向上展开
+
+- **修改内容**：文件引用窗改为 Qt 原生 `QMenu` Popup，内部嵌入 `QListWidget`；按输入框全局坐标优先向上定位，顶部空间不足才回退下方，点击外部自动关闭。采用 QMenu 管理原生 Popup 生命周期，避免自定义顶层 QFrame 在 QApplication 退出时残留句柄。
+- **涉及文件**：`gui/widgets.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证 `Qt.Popup` flags、向上几何位置、文件筛选/插入/@workplace 功能；GUI 与全项目测试进程均以退出码 0 结束。
+- **遗留问题**：极窄屏幕会受 320px 最小宽度约束，常规桌面分辨率下完整可见。
+
+## [2026-08-29 16:52] 第5轮 任务 #4 - 放大停止按钮图标
+
+- **修改内容**：运行态按钮固定为 36×36，系统停止图标显式设置为 24×24；恢复发送态时解除固定最大尺寸并恢复 16×16 图标尺寸，避免后续布局仍被圆形按钮宽度锁定。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证运行态按钮和图标的精确尺寸，以及恢复发送态后的正常几何约束。
+- **遗留问题**：系统主题可决定 `SP_MediaStop` 的具体笔画，但图标占位尺寸固定为 24×24。
+
+## [2026-08-29 16:52] 第5轮 任务 #5 - 中文提示与 Markdown 回答
+
+- **修改内容**：系统提示词明确要求最终回答、工具说明和可见摘要使用自然中文。助手气泡改用只读 `QTextBrowser`，以内置、先转义后渲染的 Markdown 子集支持 1～4 级标题、无序列表、引用、行内代码、粗体和围栏代码块；不新增第三方依赖，原始 HTML 不会被直接执行。
+- **涉及文件**：`prompts/system.md`、`gui/widgets.py`、`gui/theme.py`、`tests/test_agent_loop.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证系统消息包含中文约束，标题/列表/引用/代码转换为富文本，`<unsafe>` 被转义，气泡仍满足响应式宽度要求。
+- **遗留问题**：这是有意限制的基础 Markdown 渲染器，不覆盖表格、脚注、数学公式等完整 CommonMark 扩展。
+
+## [2026-08-29 16:52] 第5轮 任务 #6 - 主线程卡顿优化与耗时度量
+
+- **修改内容**：日志先进入内存缓冲区，每 100ms 使用单次 `QTextCursor.insertHtml()` 批量写入，切换会话时使用一次 `setHtml()` 重建；高频日志、过程摘要和 reasoning 不再逐条 `QSettings.sync()`，改为内存更新并在 250ms 后防抖持久化。模型请求、工具调用、日志刷新、代码/Diff 刷新、会话渲染与持久化均使用 `time.perf_counter()` 记录耗时；CLI verbose 模式可打印模型与工具耗时。网络、Agent 文件工具和 Shell 仍全部位于 Worker 线程。
+- **涉及文件**：`agent/loop.py`、`gui/main_window.py`、`gui/session.py`、`tests/test_agent_loop.py`、`tests/test_gui.py`
+- **测试结果**：通过。30 条快速日志合并为一次刷新，防抖持久化与性能指标可观测；全套 GUI 测试中窗口、输入、工具动画和会话切换保持响应。
+- **遗留问题**：用户主动打开超大文本文件仍会一次性载入编辑器；Agent 的 `read_file` 已有分页/截断且在后台线程，不影响主线程。
+
+## [2026-08-29 16:52] 第5轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 42 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 104 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。所有新增测试使用 FakeProvider 与临时工作区，不访问真实模型 API；项目依赖未新增 Markdown 库。
+
+---
+
+## [2026-08-29 19:54] 第6轮 任务 #1 - 思考框双模式折叠
+
+- **修改内容**：思考区改为独立标题栏和右侧 `QToolButton`，快速/深度模式统一使用 `▼`/`▶` 控制正文显隐；折叠状态保存到 `ui/thinking_folded`，模式切换和应用重启后保持。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证快速与深度模式均可折叠/展开，QSettings 值正确写入，新窗口恢复上次状态。
+- **遗留问题**：思考区没有内容且 Agent 未运行时会整体隐藏，避免保留无意义空标题。
+
+## [2026-08-29 19:54] 第6轮 任务 #2 - DeepSeek 风格发送与停止按钮
+
+- **修改内容**：发送按钮在亮暗主题统一使用 `#1a7f5c`，悬停 `#156a4d`、按下 `#238e69`、禁用 `#888888`。停止按钮保持 36×36，改为自绘精确 18×18 方形：暗色使用 `#3d3d3d/#c8c8c8`，亮色使用 `#e8e8e8/#4a4a4a`，不再受系统 `SP_MediaStop` 图标差异影响。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证两个主题 QSS 色值、按钮几何、图标尺寸及图标中心像素颜色。
+- **遗留问题**：无。
+
+## [2026-08-29 19:54] 第6轮 任务 #3 - 事件记录区折叠
+
+- **修改内容**：日志面板新增标题栏和折叠按钮，使用 160ms `QVariantAnimation` 平滑修改 `conversationLogSplitter` 尺寸；折叠后正文隐藏并仅保留约 38px 标题，状态保存到 `ui/log_folded`，展开恢复此前高度。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。日志折叠后 Splitter 下栏不超过 45px、对话区自动扩展，重新创建窗口后保持折叠并可再次展开。
+- **遗留问题**：实际标题高度会受操作系统字体缩放影响，目标值为约 38px 而非强制裁切文字。
+
+## [2026-08-29 19:54] 第6轮 任务 #4 - Cerebro 赛博脑域视觉系统
+
+- **修改内容**：亮暗色板重塑为 `#0A192F/#112240/#64FFDA/#FFD700` 等 Cerebro 语义色；字体优先 JetBrains Mono 并回退 Consolas/Courier New，中文再回退 Microsoft YaHei UI/Noto Sans CJK SC。中央背景新增鼠标穿透的低透明脑神经网络与任务期能量扫描，工具栏新增发光脉冲状态点，代码区新增任务期 α 波指示器；Agent 头像改为 `🧠 Cerebro`，日志前缀改为 `🧠 [Cerebro::Thread-NN]`。所有动画仅在控件可见或 Agent 活动时运行，窗口关闭即停止。
+- **涉及文件**：`gui/theme.py`、`gui/widgets.py`、`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证完整亮暗色值、主题切换、中央动画状态、脉冲计时器、α 波状态、品牌头像和日志前缀；offscreen 窗口视觉烟雾测试退出码为 0。
+- **遗留问题**：脑波头像当前使用 Unicode `🧠`，符合本轮允许的临时方案；后续可替换为 SVG 而不影响消息数据结构。
+
+## [2026-08-29 19:54] 第6轮 任务 #5 - Cerebro 开机序列
+
+- **修改内容**：新增无边框半透明 `SplashScreen`，用 QPainter 绘制三阶段脑轮廓/神经生长、中文终端进度和 CEREBRO/Slogan 打字动画；2.25 秒开始淡出，约 2.5 秒完成后主窗口淡入。任意点击可跳过，异常路径直接完成，`CEREBRO_SKIP_SPLASH=1` 可用于无动画启动；完成后对象真正关闭销毁，避免原生句柄残留。
+- **涉及文件**：`gui/splash_screen.py`、`gui/__init__.py`、`main.py`、`tests/test_gui.py`
+- **测试结果**：通过。三个时间点均可完成矢量渲染，跳过信号只发射一次；实际 offscreen 时序测得 `SPLASH_MS=2535`，符合约 2.5 秒要求。
+- **遗留问题**：未加入音频文件，“嗡鸣”以 1% 视觉脉冲微抖表达，避免新增媒体资源及播放依赖。
+
+## [2026-08-29 19:54] 第6轮 任务 #6 - 具体性能优化落地
+
+- **修改内容**：延续上一轮 100ms 日志批量刷新与 250ms 会话持久化防抖，并新增 50ms 思考过程渲染合并；对话只创建最近 200 个气泡且批量禁用重绘；不可见代码标签只标记 `render_pending`，切换到该标签时才更新文档；工作区 `QFileSystemModel` 保持异步，@ 文件索引用 `os.walk` 每事件循环最多处理 256 个文件。中央动画在隐藏/关闭时自动停机。`_submit_task`、日志入队、代码/Diff、会话与模型/工具耗时均可通过 `CEREBRO_PERF_LOG=1` 或 CLI verbose 查看。
+- **涉及文件**：`gui/main_window.py`、`gui/session.py`、`gui/widgets.py`、`agent/loop.py`、`tests/test_gui.py`、`tests/test_agent_loop.py`
+- **测试结果**：通过。验证 20 条过程事件合并、300 文件分片索引、220 消息仅渲染 200 个气泡、隐藏标签延迟更新；GUI 全量 49 项和项目全量 111 项均通过且退出码为 0。
+- **遗留问题**：首次手动打开单个超大 UTF-8 文件仍需构建一次 QTextDocument；Agent 读取路径已有分页/截断保护。
+
+## [2026-08-29 19:54] 第6轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 49 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 111 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试均使用 offscreen Qt、FakeProvider、临时工作区和本地矢量绘制，不访问真实 API。Cerebro 启动动画实测约 2535ms，主窗口动画状态烟雾测试退出码为 0。

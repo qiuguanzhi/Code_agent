@@ -21,13 +21,17 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
+    QTextBrowser,
 )
 
 import main as main_module
 from agent.state import AssistantTurn, ToolCall
 from gui.main_window import MainWindow
 from gui.session import ConversationStore
+from gui.splash_screen import SplashScreen
 from gui.theme import DARK_COLORS, DARK_THEME, LIGHT_COLORS, LIGHT_THEME
+from gui.widgets import BrainWaveIndicator, CerebroBackground, PulseIndicator
+from gui.widgets import basic_markdown_to_html
 from gui.worker import AgentWorker
 from providers.base import ModelProvider
 from tools.filesystem import sha256_file_streaming
@@ -220,6 +224,20 @@ def qt_app() -> Generator[QApplication, None, None]:
     existing = QApplication.instance()
     app = existing if existing is not None else QApplication([])
     yield app
+    # Qt close() may intentionally be rejected by dirty-file confirmation
+    # tests.  Force-delete any test-only hidden top-levels after assertions so
+    # native animation timers and popup handles cannot leak into interpreter
+    # shutdown.
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, MainWindow):
+            if widget.worker is not None and widget.worker.isRunning():
+                widget.worker.stop()
+                widget.worker.wait(2_000)
+            central = widget.centralWidget()
+            if isinstance(central, CerebroBackground):
+                central.stop_animation()
+        widget.hide()
+        widget.deleteLater()
     app.processEvents()
 
 
@@ -248,24 +266,32 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def test_themes_cover_dark_and_light_palettes() -> None:
-    """Provide complete ChatGPT-inspired global QSS in both themes."""
+    """Provide the complete Cerebro Cyber Cortex semantic palette."""
 
     for color in (
-        "#343541",
-        "#202123",
-        "#2d2d3a",
-        "#ececf1",
-        "#40414f",
+        "#0A192F",
+        "#112240",
+        "#64FFDA",
+        "#FFD700",
+        "#8892B0",
+        "#E6F1FF",
+        "#4ADE80",
+        "#FF6B6B",
     ):
         assert color in DARK_THEME
-    for color in ("#f7f7f8", "#ffffff", "#202123", "#10a37f", "#ececf1"):
+    for color in ("#f0f4f8", "#ffffff", "#64FFDA", "#FFD700", "#8892B0"):
         assert color in LIGHT_THEME
     for stylesheet in (DARK_THEME, LIGHT_THEME):
-        assert 'font-family: "Segoe UI"' in stylesheet
+        assert 'font-family: "JetBrains Mono"' in stylesheet
         assert "border-radius: 12px" in stylesheet or "border-radius: 10px" in stylesheet
         assert "width: 6px" in stylesheet
-    assert DARK_COLORS["user_bubble"] == "#244c43"
-    assert LIGHT_COLORS["user_bubble"] == "#e9f6f1"
+        assert "background-color: #1a7f5c" in stylesheet
+    assert DARK_COLORS["background"] == "#0A192F"
+    assert DARK_COLORS["panel"] == "#112240"
+    assert LIGHT_COLORS["background"] == "#f0f4f8"
+    assert LIGHT_COLORS["panel"] == "#ffffff"
+    assert DARK_COLORS["stop_background"] == "#3d3d3d"
+    assert LIGHT_COLORS["stop_background"] == "#e8e8e8"
     assert "QFrame#userBubble" in DARK_THEME
     assert "QFrame#assistantBubble" in DARK_THEME
     assert "border-radius: 12px" in DARK_THEME
@@ -490,11 +516,11 @@ def test_two_tools_produce_exactly_two_log_rows(
     ]
 
 
-def test_deep_mode_emits_safe_process_summaries_and_quick_mode_does_not(
+def test_deep_mode_emits_narrative_and_quick_mode_emits_short_status(
     qt_app: QApplication,
     workspace: Path,
 ) -> None:
-    """Expose lifecycle summaries only in deep mode, never private reasoning."""
+    """Expose detailed lifecycle in deep mode and concise Chinese quick status."""
 
     deep_worker = AgentWorker(provider=_read_provider(), mode="goal")
     deep_spy = QSignalSpy(deep_worker.progress_signal)
@@ -514,7 +540,13 @@ def test_deep_mode_emits_safe_process_summaries_and_quick_mode_does_not(
     quick_worker.start_agent("读取文件", workspace, max_steps=4, interactive=False)
     assert quick_worker.wait(2_000) is True
     qt_app.processEvents()
-    assert quick_spy.count() == 0
+    quick_summaries = [
+        str(quick_spy.at(index)[1]) for index in range(quick_spy.count())
+    ]
+    assert quick_summaries
+    assert any("正在" in summary for summary in quick_summaries)
+    assert any("read_file" in summary for summary in quick_summaries)
+    assert all("reasoning_content" not in summary for summary in quick_summaries)
 
 
 def test_worker_emits_diff_counts_for_real_interactive_write(
@@ -617,8 +649,11 @@ def test_tool_status_is_one_line_and_error_opens_full_detail(
     try:
         assert window.tool_status_button.height() == 30
         window.update_tool_status("running", "read_file", "")
-        assert window.tool_status_button.text() == "🔧 read_file"
+        assert window.tool_status_button.text().startswith("🔧 正在执行 read_file")
         assert window.tool_status_button.isEnabled() is False
+        first_animation_text = window.tool_status_button.text()
+        window._animate_tool_status()
+        assert window.tool_status_button.text() != first_animation_text
         window.update_tool_status("success", "read_file", "")
         assert window.tool_status_button.text() == "✅ read_file"
         window.update_tool_status(
@@ -753,7 +788,10 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
         assert resolved_text in window.conversation_view.toPlainText()
         assert window.waiting_indicator.isVisible() is False
         if confirmed:
-            assert "[1] 📝 modified calc.py (+1 -1)" in window.log_view.toPlainText()
+            assert (
+                "🧠 [Cerebro::Thread-01] 📝 modified calc.py (+1 -1)"
+                in window.log_view.toPlainText()
+            )
         else:
             assert "modified calc.py" not in window.log_view.toPlainText()
         expected_icon = "✅" if confirmed else "↩"
@@ -1328,18 +1366,10 @@ def test_message_bubbles_use_at_least_80_percent_of_conversation_width(
         expected_wide = int(window.conversation_view.viewport().width() * 0.85)
         assert bubble.maximumWidth() == expected_wide
         assert bubble.width() >= int(window.conversation_view.viewport().width() * 0.80)
-        content_label = bubble.findChild(QLabel, "messageContent")
-        assert content_label is not None
-        line_height = max(1, content_label.fontMetrics().lineSpacing())
-        wrapped_rect = content_label.fontMetrics().boundingRect(
-            0,
-            0,
-            content_label.width(),
-            10_000,
-            int(Qt.TextFlag.TextWordWrap),
-            content_label.text(),
-        )
-        assert wrapped_rect.height() / line_height <= 3.5
+        content_view = bubble.findChild(QTextBrowser, "messageContent")
+        assert content_view is not None
+        line_height = max(1, content_view.fontMetrics().lineSpacing())
+        assert content_view.document().size().height() / line_height <= 3.5
     finally:
         window.close()
         qt_app.processEvents()
@@ -1592,5 +1622,378 @@ def test_file_mentions_filter_insert_and_expand_workplace(
         assert "bytes" in text
     finally:
         window.file_mention_popup.hide()
+        window.close()
+        qt_app.processEvents()
+
+
+def test_quick_mode_renders_a_concise_thinking_status(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Keep the quick-mode thinking area informative without native reasoning."""
+
+    provider = _read_provider()
+
+    class QuickWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode="auto")
+
+    window = QuickWindow(workspace, settings=gui_settings)
+    try:
+        window.task_input.setText("快速读取")
+        window.send_button.click()
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+
+        text = window.thinking_view.toPlainText()
+        assert text
+        assert "正在" in text or "完成" in text
+        assert window.thinking_container.isHidden() is False
+        assert window.thinking_toggle.isHidden() is False
+        assert window.session_store.active.reasoning == ""
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_tool_status_animates_then_returns_to_idle(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Show running feedback continuously and reset terminal state afterward."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.update_tool_status("running", "run_command", "")
+        first = window.tool_status_button.text()
+        window._animate_tool_status()
+        assert window.tool_animation_timer.isActive() is True
+        assert window.tool_status_button.text() != first
+        window.update_tool_status("success", "run_command", "")
+        assert window.tool_animation_timer.isActive() is False
+        assert window.tool_reset_timer.isActive() is True
+        assert window.tool_status_button.text() == "✅ run_command"
+        window._reset_tool_status()
+        assert window.tool_status_button.text() == "🔧 暂无工具调用"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_file_mention_popup_uses_popup_flags_and_opens_upward(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Keep the mention list visible above a bottom-anchored task input."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.task_input.setText("检查 @cal")
+        qt_app.processEvents()
+        popup = window.file_mention_popup
+        assert popup.windowFlags() & Qt.WindowType.Popup
+        assert popup.isVisible() is True
+        input_top = window.task_input.mapToGlobal(window.task_input.rect().topLeft()).y()
+        assert popup.geometry().bottom() < input_top
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_stop_button_uses_large_icon_and_restores_send_geometry(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Make the stop target and its central glyph visibly large."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window._set_send_button_mode(True)
+        assert window.send_button.size().width() == 36
+        assert window.send_button.size().height() == 36
+        assert window.send_button.iconSize().width() == 18
+        assert window.send_button.iconSize().height() == 18
+        dark_icon = window.send_button.icon().pixmap(18, 18).toImage()
+        assert dark_icon.pixelColor(9, 9).name() == "#c8c8c8"
+        window._toggle_theme()
+        light_icon = window.send_button.icon().pixmap(18, 18).toImage()
+        assert light_icon.pixelColor(9, 9).name() == "#4a4a4a"
+        window._set_send_button_mode(False)
+        assert window.send_button.maximumWidth() > 36
+        assert window.send_button.text() == "发送"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_assistant_markdown_is_escaped_and_rendered_as_rich_text(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Render headings, lists, quotes, and code without accepting raw HTML."""
+
+    source = "#### 标题\n- 第一项\n- 第二项\n> 引用\n```python\nprint('<unsafe>')\n```"
+    html = basic_markdown_to_html(source)
+    assert "<h4>标题</h4>" in html
+    assert "<ul" in html and "<li>第一项</li>" in html
+    assert "<blockquote" in html
+    assert "<pre" in html
+    assert "&lt;unsafe&gt;" in html
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.session_store.add_message("assistant", source)
+        window._render_active_session()
+        content_view = window.conversation_view.bubbles[0].findChild(
+            QTextBrowser,
+            "messageContent",
+        )
+        assert content_view is not None
+        assert "####" not in content_view.toPlainText()
+        assert "标题" in content_view.toPlainText()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_log_updates_are_coalesced_into_one_flush(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Buffer rapid GUI logs and repaint the text document once per batch."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        for index in range(30):
+            window.update_log(0, "•", f"event-{index}", "accent", "")
+        assert len(window._pending_log_html) == 30
+        assert window.log_flush_timer.isActive() is True
+        assert window.session_save_timer.isActive() is True
+        window._flush_log_buffer()
+        window._flush_session_save()
+        assert not window._pending_log_html
+        assert "event-0" in window.log_view.toPlainText()
+        assert "event-29" in window.log_view.toPlainText()
+        assert window.performance_metrics["log_flush_ms"] >= 0
+        assert window.performance_metrics["session_save_ms"] >= 0
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_thinking_fold_state_persists_in_quick_and_deep_modes(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Persist one fold control that works identically in both thinking modes."""
+
+    gui_settings.setValue("ui/thinking_folded", False)
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window._append_process_update(0, "正在分析问题…")
+        window._flush_process_render()
+        assert window.thinking_view.isHidden() is False
+        window.thinking_toggle.click()
+        assert window.thinking_view.isHidden() is True
+        assert gui_settings.value("ui/thinking_folded", type=bool) is True
+
+        deep_index = window.thinking_mode_combo.findData("deep")
+        window.thinking_mode_combo.setCurrentIndex(deep_index)
+        window.thinking_toggle.click()
+        assert window.thinking_view.isHidden() is False
+        assert gui_settings.value("ui/thinking_folded", type=bool) is False
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+    restored = MainWindow(workspace, settings=gui_settings)
+    try:
+        assert restored.thinking_toggle.isChecked() is True
+        assert restored.thinking_folded is False
+    finally:
+        restored.close()
+        qt_app.processEvents()
+
+
+def test_log_panel_folds_to_header_and_restores_persisted_state(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Animate the log panel to header height and restore that choice."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert window.log_view.isVisible() is True
+        window.log_fold_button.click()
+        assert _wait_until(
+            qt_app,
+            lambda: window.log_view.isHidden()
+            and window.conversation_log_splitter.sizes()[1] <= 45,
+        )
+        assert window.conversation_log_splitter.sizes()[1] <= 45
+        assert gui_settings.value("ui/log_folded", type=bool) is True
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+    restored = MainWindow(workspace, settings=gui_settings)
+    try:
+        restored.show()
+        qt_app.processEvents()
+        assert restored.log_folded is True
+        assert restored.log_view.isHidden() is True
+        restored.log_fold_button.click()
+        assert _wait_until(qt_app, lambda: restored.log_view.isVisible())
+    finally:
+        restored.close()
+        qt_app.processEvents()
+
+
+def test_cerebro_visual_components_follow_agent_and_theme_state(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Activate the neural canvas, pulse dot, and alpha wave as one system."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert isinstance(window.centralWidget(), CerebroBackground)
+        assert isinstance(window.pulse_indicator, PulseIndicator)
+        assert isinstance(window.brain_wave_indicator, BrainWaveIndicator)
+        window.update_status("running", "思考中")
+        assert window.centralWidget()._active is True
+        assert window.brain_wave_indicator._active is True
+        assert window.pulse_indicator._timer.isActive() is True
+        initial_angle = window.centralWidget()._angle
+        assert _wait_until(qt_app, lambda: window.centralWidget()._angle > initial_angle)
+        window.update_status("ready", "就绪")
+        assert window.centralWidget()._active is False
+        assert window.brain_wave_indicator._active is False
+        window._toggle_theme()
+        assert window.theme_name == "light"
+        assert window.centralWidget()._dark is False
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_cerebro_log_prefix_and_agent_avatar(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Use the branded thread prefix and brain-wave Agent identity."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        html = window._format_log_html(
+            {"step": 7, "icon": "🔧", "label": "read_file", "color": "accent"}
+        )
+        assert "Cerebro::Thread-07" in html
+        window.session_store.add_message("assistant", "完成。")
+        window._render_active_session()
+        role_labels = window.conversation_view.bubbles[0].findChildren(QLabel)
+        assert any("🧠 Cerebro" in label.text() for label in role_labels)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_splash_stages_render_and_click_skip_emits_finished(
+    qt_app: QApplication,
+) -> None:
+    """Render all startup stages and guarantee a safe immediate bypass."""
+
+    splash = SplashScreen()
+    spy = QSignalSpy(splash.finished)
+    try:
+        splash.show()
+        for elapsed in (400, 1_200, 2_100):
+            splash._elapsed_ms = elapsed
+            splash.update()
+            qt_app.processEvents()
+            assert splash.grab().isNull() is False
+        splash.skip()
+        assert spy.count() == 1
+        assert splash.isHidden() is True
+        qt_app.processEvents()
+    finally:
+        qt_app.processEvents()
+
+
+def test_conversation_virtualization_and_inactive_editor_deferred_render(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Cap message widgets and defer hidden-tab document replacement."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        conversation = window.session_store.active
+        conversation.messages = [
+            {"role": "assistant", "content": f"message-{index}"}
+            for index in range(220)
+        ]
+        window._render_active_session()
+        assert len(window.conversation_view.bubbles) == 200
+        assert window.conversation_view.bubbles[0].message_index == 20
+
+        window.update_code("calc.py", "first\n")
+        extra = workspace / "extra.py"
+        extra.write_text("extra\n", encoding="utf-8")
+        window.update_code("extra.py", "extra\n")
+        calc_editor = window._tab_editors["calc.py"]
+        window._tab_previews["calc.py"]["code"] = "deferred\n"
+        window._render_code_tab("calc.py")
+        assert calc_editor.toPlainText() == "first\n"
+        assert window._tab_previews["calc.py"]["render_pending"] is True
+        window.code_tabs.setCurrentWidget(calc_editor)
+        qt_app.processEvents()
+        assert calc_editor.toPlainText() == "deferred\n"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_process_updates_are_throttled_and_workspace_scan_is_chunked(
+    qt_app: QApplication,
+    tmp_path: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Merge process repaints and finish a large mention index over event turns."""
+
+    workspace = tmp_path / "large-workspace"
+    workspace.mkdir()
+    for index in range(300):
+        (workspace / f"file_{index:03d}.py").write_text("VALUE = 1\n", encoding="utf-8")
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        assert 0 < len(window.workspace_files) <= 256
+        assert window.workspace_scan_timer.isActive() is True
+        assert _wait_until(qt_app, lambda: len(window.workspace_files) == 300)
+
+        for index in range(20):
+            window._append_process_update(0, f"状态 {index}")
+        assert window.process_render_timer.isActive() is True
+        window._flush_process_render()
+        assert window.thinking_view.toPlainText() == "状态 19"
+    finally:
         window.close()
         qt_app.processEvents()

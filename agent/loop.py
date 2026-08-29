@@ -245,6 +245,7 @@ def run_agent(
             return _stopped("failed", "context_budget_error", answer, state)
 
         _emit(on_update, "model_request", step, "正在请求模型", messages=len(request_messages))
+        model_started = time.perf_counter()
         try:
             turn = call_model_with_retry(
                 cfg,
@@ -263,6 +264,10 @@ def run_agent(
         if cfg.should_stop is not None and cfg.should_stop():
             return _user_stopped(state, on_update)
 
+        model_duration_ms = (time.perf_counter() - model_started) * 1_000
+        if cfg.verbose:
+            print(f"[perf] model step={step} duration_ms={model_duration_ms:.1f}")
+
         state.messages.append(turn.protocol_message)
         reasoning = turn.protocol_message.get("reasoning_content")
         if cfg.mode == "goal" and isinstance(reasoning, str) and reasoning.strip():
@@ -275,6 +280,7 @@ def run_agent(
             "模型响应已接收",
             tool_call_count=len(turn.tool_calls),
             reasoning=reasoning if isinstance(reasoning, str) else None,
+            duration_ms=model_duration_ms,
         )
 
         if not turn.tool_calls:
@@ -297,6 +303,7 @@ def run_agent(
                 tool_call_id=call.id,
                 arguments_json=call.arguments_json,
             )
+            tool_started = time.perf_counter()
             try:
                 encoded_result = registry.execute_one_call(call, state)
             except ToolStopRequested:
@@ -305,6 +312,12 @@ def run_agent(
                 {"role": "tool", "tool_call_id": call.id, "content": encoded_result}
             )
             result = _decode_result(encoded_result)
+            tool_duration_ms = (time.perf_counter() - tool_started) * 1_000
+            if cfg.verbose:
+                print(
+                    f"[perf] tool={call.name} step={step} "
+                    f"duration_ms={tool_duration_ms:.1f}"
+                )
             if call.name == "run_command":
                 state.last_test_result = encoded_result
             _emit(
@@ -316,6 +329,7 @@ def run_agent(
                 tool_call_id=call.id,
                 ok=result.get("ok"),
                 result=result,
+                duration_ms=tool_duration_ms,
             )
 
             if cfg.should_stop is not None and cfg.should_stop():

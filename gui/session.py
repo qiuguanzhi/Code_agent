@@ -266,6 +266,7 @@ class ConversationStore:
         log: dict[str, Any],
         *,
         conversation_id: str | None = None,
+        persist: bool = True,
     ) -> None:
         """Append one compact log record without resetting earlier records."""
 
@@ -273,7 +274,8 @@ class ConversationStore:
         if conversation is None:
             return
         conversation.logs.append(dict(log))
-        self.save()
+        if persist:
+            self.save()
 
     def add_process(
         self,
@@ -281,6 +283,7 @@ class ConversationStore:
         summary: str,
         *,
         conversation_id: str | None = None,
+        persist: bool = True,
     ) -> None:
         """Append one safe high-level work-process summary."""
 
@@ -290,13 +293,15 @@ class ConversationStore:
         conversation.process.append(
             {"level": max(0, min(level, 3)), "text": summary.strip()}
         )
-        self.save()
+        if persist:
+            self.save()
 
     def append_reasoning(
         self,
         text: str,
         *,
         conversation_id: str | None = None,
+        persist: bool = True,
     ) -> None:
         """Append provider-native reasoning as one continuous narrative."""
 
@@ -306,4 +311,5 @@ class ConversationStore:
             return
         separator = "\n\n" if conversation.reasoning else ""
         conversation.reasoning += separator + clean_text
-        self.save()
+        if persist:
+            self.save()

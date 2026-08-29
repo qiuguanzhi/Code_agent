@@ -20,6 +20,7 @@ class FakeProvider(ModelProvider):
     def __init__(self, actions: Sequence[AssistantTurn | Exception]) -> None:
         self.actions = list(actions)
         self.calls = 0
+        self.requests: list[list[dict[str, Any]]] = []
 
     def complete(
         self,
@@ -28,7 +29,8 @@ class FakeProvider(ModelProvider):
     ) -> AssistantTurn:
         """Consume the next action without network access."""
 
-        _ = (messages, tools)
+        _ = tools
+        self.requests.append([dict(message) for message in messages])
         self.calls += 1
         action = self.actions.pop(0)
         if isinstance(action, Exception):
@@ -161,6 +163,13 @@ def test_run_agent_completes_read_write_run_finish_loop(tmp_path: Path) -> None:
     first_tool_call = next(event for event in events if event["event"] == "tool_call")
     assert first_tool_call["data"]["tool_call_id"] == "read-1"
     assert '"path": "calc.py"' in first_tool_call["data"]["arguments_json"]
+    model_response = next(
+        event for event in events if event["event"] == "model_response"
+    )
+    tool_result = next(event for event in events if event["event"] == "tool_result")
+    assert model_response["data"]["duration_ms"] >= 0
+    assert tool_result["data"]["duration_ms"] >= 0
+    assert "请始终使用中文" in str(provider.requests[0][0]["content"])
 
 
 def test_run_agent_retries_transient_model_errors(tmp_path: Path) -> None:

@@ -4,6 +4,9 @@ Use only the locally implemented tools supplied by the host program. Treat tool
 errors as observations, never claim that an operation succeeded without a
 successful tool result, and keep file changes focused on the user's task.
 
+请始终使用中文与用户沟通。最终回答、工具操作说明以及可见的思考摘要均应使用
+自然、清晰的中文；代码、文件名、命令和必要的技术标识符可保留原文。
+
 <!-- GOAL_MODE_PROMPT_START
 Dynamic extension point for AgentState.mode == "goal":
 

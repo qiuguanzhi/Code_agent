@@ -64,9 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
 def run_gui(workspace_root: Path | None = None) -> int:
     """Launch the desktop application through lazy GUI imports."""
 
+    from PySide6.QtCore import QEasingCurve, QPropertyAnimation
     from PySide6.QtWidgets import QApplication
 
     from gui.main_window import MainWindow
+    from gui.splash_screen import SplashScreen
     from gui.theme import DARK_THEME
 
     existing_app = QApplication.instance()
@@ -74,7 +76,36 @@ def run_gui(workspace_root: Path | None = None) -> int:
     app.setApplicationName("Mini Coding Agent")
     app.setStyleSheet(DARK_THEME)
     window = MainWindow(workspace_root=workspace_root)
-    window.show()
+    splash = SplashScreen()
+
+    def reveal_window() -> None:
+        """Reveal the main window with a short non-blocking opacity transition."""
+
+        try:
+            app._cerebro_splash = None
+            window.setWindowOpacity(0.0)
+            window.show()
+            fade = QPropertyAnimation(window, b"windowOpacity", window)
+            fade.setDuration(260)
+            fade.setStartValue(0.0)
+            fade.setEndValue(1.0)
+            fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+            window._cerebro_fade_animation = fade
+            fade.start()
+        except Exception:
+            window.setWindowOpacity(1.0)
+            window.show()
+
+    app._cerebro_window = window
+    app._cerebro_splash = splash
+    if os.getenv("CEREBRO_SKIP_SPLASH") == "1":
+        reveal_window()
+    else:
+        splash.finished.connect(reveal_window)
+        try:
+            splash.start()
+        except Exception:
+            reveal_window()
     return int(app.exec())
 
 

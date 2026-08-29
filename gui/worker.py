@@ -199,6 +199,8 @@ class AgentWorker(QThread):
         event_data = data if isinstance(data, Mapping) else {}
         if self.mode == "goal":
             self._emit_safe_progress(event, step, event_data)
+        else:
+            self._emit_quick_progress(event, step, event_data)
 
         if event == "model_request":
             self.status_signal.emit("running", f"第 {step} 步：模型思考中")
@@ -273,6 +275,47 @@ class AgentWorker(QThread):
             level = 1
         elif event == "step_completed":
             summary = f"第 {step} 轮：本轮操作和结果检查已完成。"
+        if summary:
+            self.progress_signal.emit(level, summary)
+
+    def _emit_quick_progress(
+        self,
+        event: str,
+        step: int,
+        event_data: Mapping[str, Any],
+    ) -> None:
+        """Expose only a concise current-stage sentence in quick mode."""
+
+        summary = ""
+        level = 0
+        if event == "run_started":
+            summary = "正在分析问题…"
+        elif event == "model_request":
+            summary = "正在判断下一步操作…"
+        elif event == "model_response":
+            tool_count = event_data.get("tool_call_count", 0)
+            summary = (
+                "正在准备工具调用…"
+                if isinstance(tool_count, int) and tool_count > 0
+                else "正在整理回答…"
+            )
+        elif event == "tool_call":
+            tool_name = str(event_data.get("tool", "工具"))
+            summary = f"正在执行 {tool_name}…"
+            level = 1
+        elif event == "tool_result":
+            tool_name = str(event_data.get("tool", "工具"))
+            result = event_data.get("result")
+            succeeded = isinstance(result, Mapping) and result.get("ok") is True
+            summary = f"{tool_name} {'执行完成' if succeeded else '执行失败'}，正在检查结果…"
+            level = 2
+        elif event == "api_retry":
+            summary = "模型服务暂时繁忙，正在重试…"
+            level = 1
+        elif event == "step_completed":
+            summary = "本轮处理完成，正在继续分析…"
+        elif event == "run_completed":
+            summary = "任务已完成，正在生成结果…"
         if summary:
             self.progress_signal.emit(level, summary)
 
