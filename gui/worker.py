@@ -30,7 +30,7 @@ class AgentWorker(QThread):
     diff_signal = Signal(str, str, int, int)
     status_signal = Signal(str, str)
     progress_signal = Signal(int, str)
-    reasoning_signal = Signal(str)
+    reasoning_signal = Signal(str, str)
     tool_status_signal = Signal(str, str, str)
     batch_confirmation_signal = Signal(object)
     snapshot_signal = Signal(object, str)
@@ -61,7 +61,12 @@ class AgentWorker(QThread):
         self._stop_event = threading.Event()
         self.current_step = 0
         self._active_provider: ModelProvider | None = None
-        self._reasoning_emitted = False
+        self._reasoning_output_started = False
+        self._reasoning_interruption_marked = False
+        self._current_reasoning_text = ""
+        self._reasoning_pending = ""
+        self._last_reasoning_emit = 0.0
+        self._reasoning_wait_timer: threading.Timer | None = None
         self._session_id = ""
         self._stream_pending = ""
         self._last_stream_emit = 0.0
@@ -103,7 +108,12 @@ class AgentWorker(QThread):
         self._confirmation_result = False
         self._stop_event = threading.Event()
         self.current_step = 0
-        self._reasoning_emitted = False
+        self._reasoning_output_started = False
+        self._reasoning_interruption_marked = False
+        self._current_reasoning_text = ""
+        self._reasoning_pending = ""
+        self._last_reasoning_emit = 0.0
+        self._cancel_reasoning_wait_hint()
         self._session_id = session_id
         self._stream_pending = ""
         self._last_stream_emit = 0.0
@@ -173,6 +183,9 @@ class AgentWorker(QThread):
                 confirm_write=None,
                 should_stop=self.is_stop_requested,
                 on_token=self._handle_stream_token,
+                on_reasoning_token=(
+                    self._handle_reasoning_token if self.mode == "goal" else None
+                ),
             )
             self._end_diagnostic_stage("阶段2: 构建配置")
             snapshot_timestamp = datetime.now().astimezone().strftime(
@@ -182,6 +195,8 @@ class AgentWorker(QThread):
         except Exception as exc:
             self._end_diagnostic_stage()
             self._flush_stream_tokens()
+            self._mark_reasoning_interrupted()
+            self._flush_reasoning_tokens()
             self._finish_with_error(f"{type(exc).__name__}: {exc}")
             return
 
@@ -224,11 +239,15 @@ class AgentWorker(QThread):
             stopped_by_user = result.reason == "user_stopped"
         elif stopped_by_user:
             result.state.pending_writes.clear()
-        if self.mode == "goal" and result.state.reasoning and not self._reasoning_emitted:
-            self.reasoning_signal.emit(result.state.reasoning)
-            self._reasoning_emitted = True
+        if (
+            self.mode == "goal"
+            and result.state.reasoning
+            and not self._reasoning_output_started
+        ):
+            self._handle_reasoning_token(result.state.reasoning)
         summary = self._format_summary(result)
         self._flush_stream_tokens()
+        self._flush_reasoning_tokens()
         self.snapshot_signal.emit(result.state.initial_snapshot, snapshot_timestamp)
         rejected_by_user = result.reason == "user_rejected_batch"
         self.status_signal.emit(
@@ -241,6 +260,7 @@ class AgentWorker(QThread):
         )
         self.finished_signal.emit(success, summary)
         self._active_provider = None
+        self._cancel_reasoning_wait_hint()
         self._end_diagnostic_stage()
 
     def _await_batch_confirmation(
@@ -315,6 +335,21 @@ class AgentWorker(QThread):
         if now - self._last_stream_emit >= 0.04 or len(self._stream_pending) >= 256:
             self._flush_stream_tokens(now)
 
+    def _handle_reasoning_token(self, delta: str) -> None:
+        """Coalesce one provider-native reasoning delta for the owning session."""
+
+        if self.mode != "goal" or not delta or self.is_stop_requested():
+            return
+        self._cancel_reasoning_wait_hint()
+        if not self._current_reasoning_text and self._reasoning_output_started:
+            self._reasoning_pending += "\n\n"
+        self._current_reasoning_text += delta
+        self._reasoning_pending += delta
+        self._reasoning_output_started = True
+        now = time.perf_counter()
+        if now - self._last_reasoning_emit >= 0.04 or len(self._reasoning_pending) >= 256:
+            self._flush_reasoning_tokens(now)
+
     def _flush_stream_tokens(self, now: float | None = None) -> None:
         """Emit all buffered text as one GUI update."""
 
@@ -324,6 +359,79 @@ class AgentWorker(QThread):
         self._stream_pending = ""
         self._last_stream_emit = now if now is not None else time.perf_counter()
         self.stream_signal.emit(self._session_id, delta)
+
+    def _flush_reasoning_tokens(self, now: float | None = None) -> None:
+        """Emit buffered reasoning at most about 25 times per second."""
+
+        if not self._reasoning_pending:
+            return
+        delta = self._reasoning_pending
+        self._reasoning_pending = ""
+        self._last_reasoning_emit = now if now is not None else time.perf_counter()
+        self.reasoning_signal.emit(self._session_id, delta)
+
+    def _deliver_final_reasoning(self, reasoning: str) -> None:
+        """Deliver only text not already seen through native streaming."""
+
+        if self.mode != "goal" or not reasoning:
+            return
+        if not self._current_reasoning_text:
+            self._handle_reasoning_token(reasoning)
+            return
+        if reasoning.startswith(self._current_reasoning_text):
+            missing = reasoning[len(self._current_reasoning_text) :]
+            if missing:
+                self._handle_reasoning_token(missing)
+
+    def _mark_reasoning_interrupted(self, *, retrying: bool = False) -> None:
+        """Keep partial reasoning visible and append one explicit interruption marker."""
+
+        if (
+            self.mode != "goal"
+            or not self._current_reasoning_text
+            or self._reasoning_interruption_marked
+        ):
+            return
+        marker = (
+            "\n\n[推理流中断，正在重试…]\n\n"
+            if retrying
+            else "\n\n[推理流中断，已保留以上内容。]"
+        )
+        self._reasoning_pending += marker
+        self._reasoning_interruption_marked = True
+        self._flush_reasoning_tokens()
+
+    def _start_reasoning_wait_hint(self) -> None:
+        """Warn gently when a gateway has not produced native reasoning chunks."""
+
+        self._cancel_reasoning_wait_hint()
+        if self.mode != "goal":
+            return
+        try:
+            delay = float(os.getenv("CEREBRO_REASONING_HINT_SECONDS", "2"))
+        except ValueError:
+            delay = 2.0
+        delay = max(0.05, delay)
+
+        def show_hint() -> None:
+            if self._current_reasoning_text or self.is_stop_requested():
+                return
+            self.progress_signal.emit(
+                0,
+                "思考中，模型暂未提供推理片段，正在等待完整推理…",
+            )
+
+        self._reasoning_wait_timer = threading.Timer(delay, show_hint)
+        self._reasoning_wait_timer.daemon = True
+        self._reasoning_wait_timer.start()
+
+    def _cancel_reasoning_wait_hint(self) -> None:
+        """Cancel the no-stream hint after a chunk or terminal event arrives."""
+
+        timer = self._reasoning_wait_timer
+        self._reasoning_wait_timer = None
+        if timer is not None:
+            timer.cancel()
 
     def _report_slow_stage(self, stage: str, duration_ms: float) -> None:
         """Surface initialization bottlenecks that exceed the UX threshold."""
@@ -441,15 +549,28 @@ class AgentWorker(QThread):
             if isinstance(duration, (int, float)):
                 self._report_slow_stage("上下文构建", float(duration))
         elif event == "model_request":
+            self._flush_reasoning_tokens()
+            self._current_reasoning_text = ""
+            self._reasoning_interruption_marked = False
             self._begin_diagnostic_stage("阶段5: 调用模型")
             self.status_signal.emit("running", "阶段 5/5：🧠 模型思考中...")
+            if self.mode == "goal":
+                self.progress_signal.emit(0, "思考中，等待模型返回实时推理…")
+                self._start_reasoning_wait_hint()
         elif event == "model_response":
+            self._cancel_reasoning_wait_hint()
             self._end_diagnostic_stage("阶段5: 调用模型")
             self._flush_stream_tokens()
             reasoning = event_data.get("reasoning")
             if self.mode == "goal" and isinstance(reasoning, str) and reasoning.strip():
-                self.reasoning_signal.emit(reasoning.strip())
-                self._reasoning_emitted = True
+                self._deliver_final_reasoning(reasoning)
+                self._flush_reasoning_tokens()
+        elif event == "api_retry":
+            self._mark_reasoning_interrupted(retrying=True)
+        elif event == "run_failed":
+            self._cancel_reasoning_wait_hint()
+            self._end_diagnostic_stage("阶段5: 调用模型")
+            self._mark_reasoning_interrupted()
         elif event == "tool_call":
             self._end_diagnostic_stage("阶段5: 调用模型")
             tool_name = str(event_data.get("tool", "工具"))
@@ -691,6 +812,7 @@ class AgentWorker(QThread):
     def _finish_with_error(self, message: str) -> None:
         """Emit a stable terminal error without leaking an exception from QThread."""
 
+        self._cancel_reasoning_wait_hint()
         self._end_diagnostic_stage()
         self.status_signal.emit("error", message)
         self.finished_signal.emit(False, message)

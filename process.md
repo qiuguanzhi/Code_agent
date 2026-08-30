@@ -608,3 +608,21 @@ $env:QT_QPA_PLATFORM='offscreen'
 ```
 
 唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试均使用 FakeProvider、offscreen Qt、临时工作区与本地子进程，不访问真实 API。当前项目工作区快照烟雾测试为 50 个文件、约 151ms；`git diff --check` 未发现空白错误，仅有 Windows 的 LF→CRLF 常规提示。
+
+---
+
+## [2026-08-30 15:52] 第10轮 任务 #1 - 实现推理过程流式显示
+
+- **修改内容**：将 Provider 的流式接口拆分为 `on_content_chunk` 与 `on_reasoning_chunk` 两条独立回调，实时解析 DeepSeek 的 `delta.reasoning_content`、`delta.reasoning`，并兼容跨 chunk 的 `<think>...</think>` 内容格式；最终仍累积完整 `AssistantTurn`，不影响 Tool Calls。AgentConfig 新增 GUI 无关的 `on_reasoning_token` 扩展点。深度模式 Worker 以约 40ms/256 字符为阈值合并片段，通过 `reasoning_signal(session_id, delta)` 按会话发送；最终响应只补齐未流式到达的后缀，避免重复。UI 首个片段到达后立即展开思考区，使用 `QTextCursor` 在末尾追加并滚动到底部，同时把原始 delta 无损写入对应会话。快速模式不注册 reasoning 回调。若 2 秒内没有推理片段，会显示“等待完整推理”提示；连接重试或中断时保留已收到内容并追加明确标记。
+- **涉及文件**：`providers/base.py`、`providers/openai_compatible.py`、`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`gui/session.py`、`tests/test_providers.py`、`tests/test_agent_loop.py`、`tests/test_gui.py`
+- **测试结果**：通过。自动化测试证明第一段推理显示时 Worker 仍处于运行状态；覆盖 `reasoning_content`/`reasoning`/拆分 `<think>` 三种协议、普通回答与推理分流、最终状态完整性、一次性降级、无流式提示、断流保留、会话 ID 路由、快速模式不显示推理。全量回归为 139 passed、1 skipped。
+- **遗留问题**：真实 DeepSeek-V4-Flash 的首个 reasoning chunk 到达时间仍取决于服务端排队、网络和模型首 Token 延迟；本轮未使用真实 API Key 发起公网请求。若网关完全不提供 reasoning chunk，只能按协议能力一次性显示最终推理，但等待期间已有明确状态提示。
+
+## [2026-08-30 15:52] 第10轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 139 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试全部使用 SDK 形状的流式假数据、FakeProvider、offscreen Qt 和临时工作区，不访问真实 API。`git diff --check` 未发现空白错误，仅有 Windows 的 LF→CRLF 常规提示。

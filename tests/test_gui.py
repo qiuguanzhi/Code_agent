@@ -1811,12 +1811,12 @@ def test_toolbar_status_cards_use_a_distinct_surface() -> None:
         assert f"QLabel#{selector}" in DARK_THEME
 
 
-def test_deep_mode_shows_native_reasoning_as_collapsed_narrative(
+def test_deep_mode_shows_native_reasoning_and_auto_expands_narrative(
     qt_app: QApplication,
     workspace: Path,
     gui_settings: QSettings,
 ) -> None:
-    """Render provider reasoning continuously in deep mode and keep it collapsed."""
+    """Render one-shot fallback reasoning and expand it when content arrives."""
 
     reasoning = "先检查目标文件。\n然后验证修改不会破坏现有行为。"
     turn = AssistantTurn(
@@ -1848,13 +1848,149 @@ def test_deep_mode_shows_native_reasoning_as_collapsed_narrative(
 
         assert window.session_store.active.reasoning == reasoning
         assert window.thinking_container.isHidden() is False
-        assert window.thinking_view.isHidden() is True
-        window.thinking_toggle.click()
+        assert window.thinking_view.isHidden() is False
         assert window.thinking_view.toPlainText() == reasoning
         assert "1." not in window.thinking_view.toPlainText()
     finally:
         window.close()
         qt_app.processEvents()
+
+
+def test_deep_reasoning_is_visible_before_model_response_finishes(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Prove the first reasoning delta reaches thinkingView while QThread is running."""
+
+    class LiveReasoningProvider(ModelProvider):
+        def __init__(self) -> None:
+            self.first_chunk_sent = threading.Event()
+            self.release = threading.Event()
+
+        def complete(
+            self,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+        ) -> AssistantTurn:
+            _ = (messages, tools)
+            raise AssertionError("streaming path expected")
+
+        def complete_stream(
+            self,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            on_content_chunk: Callable[[str], None],
+            on_reasoning_chunk: Callable[[str], None] | None = None,
+        ) -> AssistantTurn:
+            _ = (messages, tools)
+            assert on_reasoning_chunk is not None
+            on_reasoning_chunk("第一段推理")
+            self.first_chunk_sent.set()
+            self.release.wait(timeout=2.0)
+            on_reasoning_chunk("，第二段推理")
+            on_content_chunk("分析完成。")
+            return AssistantTurn(
+                content="分析完成。",
+                tool_calls=[],
+                protocol_message={
+                    "role": "assistant",
+                    "content": "分析完成。",
+                    "reasoning_content": "第一段推理，第二段推理",
+                },
+                finish_reason="stop",
+            )
+
+    provider = LiveReasoningProvider()
+
+    class LiveReasoningWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = LiveReasoningWindow(workspace, settings=gui_settings)
+    try:
+        deep_index = window.thinking_mode_combo.findData("deep")
+        window.thinking_mode_combo.setCurrentIndex(deep_index)
+        window.task_input.setText("写一个 2048 游戏")
+        window.send_button.click()
+        assert window.worker is not None
+        assert provider.first_chunk_sent.wait(timeout=1.0)
+        assert _wait_until(
+            qt_app,
+            lambda: "第一段推理" in window.thinking_view.toPlainText(),
+        )
+        assert window.worker.isRunning() is True
+        assert window.thinking_view.isHidden() is False
+        assert "实时" in window.thinking_title.text()
+
+        provider.release.set()
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+        assert window.session_store.active.reasoning == "第一段推理，第二段推理"
+        assert window.thinking_view.toPlainText() == "第一段推理，第二段推理"
+    finally:
+        provider.release.set()
+        if window.worker is not None and window.worker.isRunning():
+            window.worker.stop()
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
+def test_reasoning_interruption_keeps_partial_text_and_marks_it(
+    qt_app: QApplication,
+) -> None:
+    """Retain already received reasoning when a streamed request is retried."""
+
+    worker = AgentWorker(mode="goal")
+    worker._session_id = "session-interrupted"
+    spy = QSignalSpy(worker.reasoning_signal)
+    worker._handle_update(
+        {"event": "model_request", "step": 1, "message": "", "data": {}}
+    )
+    worker._handle_reasoning_token("已收到的部分")
+    worker._handle_update(
+        {"event": "api_retry", "step": 1, "message": "", "data": {}}
+    )
+    qt_app.processEvents()
+
+    emitted = "".join(str(spy.at(index)[1]) for index in range(spy.count()))
+    assert spy.count() >= 2
+    assert all(spy.at(index)[0] == "session-interrupted" for index in range(spy.count()))
+    assert "已收到的部分" in emitted
+    assert "推理流中断" in emitted
+    worker._end_diagnostic_stage()
+
+
+def test_deep_mode_reports_when_gateway_has_no_reasoning_chunks(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replace a blank thinking panel with an explicit one-shot fallback hint."""
+
+    monkeypatch.setenv("CEREBRO_REASONING_HINT_SECONDS", "0.05")
+    worker = AgentWorker(mode="goal")
+    progress_spy = QSignalSpy(worker.progress_signal)
+    worker._handle_update(
+        {"event": "model_request", "step": 1, "message": "", "data": {}}
+    )
+
+    assert _wait_until(
+        qt_app,
+        lambda: any(
+            "暂未提供推理片段" in str(progress_spy.at(index)[1])
+            for index in range(progress_spy.count())
+        ),
+    )
+    worker._handle_update(
+        {
+            "event": "run_failed",
+            "step": 1,
+            "message": "",
+            "data": {"reason": "model_api_error"},
+        }
+    )
 
 
 def test_file_mentions_filter_insert_and_expand_workplace(

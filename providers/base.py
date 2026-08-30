@@ -26,11 +26,19 @@ class ModelProvider(ABC):
         self,
         messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]],
-        on_token: Callable[[str], None],
+        on_content_chunk: Callable[[str], None],
+        on_reasoning_chunk: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
-        """Fallback streaming API for providers without native chunk support."""
+        """Fallback to one-shot delivery when native streaming is unavailable."""
 
         turn = self.complete(messages, tools)
         if turn.content:
-            on_token(turn.content)
+            on_content_chunk(turn.content)
+        reasoning = turn.protocol_message.get("reasoning_content")
+        if (
+            on_reasoning_chunk is not None
+            and isinstance(reasoning, str)
+            and reasoning
+        ):
+            on_reasoning_chunk(reasoning)
         return turn

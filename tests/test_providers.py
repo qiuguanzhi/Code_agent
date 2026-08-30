@@ -178,6 +178,97 @@ def test_provider_streams_text_deltas_and_returns_complete_turn() -> None:
     assert request is not None and request["stream"] is True
 
 
+def test_provider_streams_reasoning_deltas_separately_from_answer() -> None:
+    """Forward both DeepSeek reasoning field variants before the final response."""
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content="先分析",
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content=None,
+                        reasoning="再验证",
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="完成", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    provider = OpenAICompatibleProvider(FakeClient(chunks), "fake-model")
+    content_deltas: list[str] = []
+    reasoning_deltas: list[str] = []
+
+    turn = provider.complete_stream(
+        [],
+        get_tool_schemas(),
+        content_deltas.append,
+        reasoning_deltas.append,
+    )
+
+    assert reasoning_deltas == ["先分析", "再验证"]
+    assert content_deltas == ["完成"]
+    assert turn.content == "完成"
+    assert turn.protocol_message["reasoning_content"] == "先分析再验证"
+
+
+def test_provider_demultiplexes_split_think_tags_from_content() -> None:
+    """Support gateways that embed reasoning in chunk-split <think> tags."""
+
+    parts = ["<thi", "nk>规划", "步骤</think>", "最终回答"]
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=part, tool_calls=None),
+                    finish_reason="stop" if index == len(parts) - 1 else None,
+                )
+            ],
+            usage=None,
+        )
+        for index, part in enumerate(parts)
+    ]
+    provider = OpenAICompatibleProvider(FakeClient(chunks), "fake-model")
+    content_deltas: list[str] = []
+    reasoning_deltas: list[str] = []
+
+    turn = provider.complete_stream(
+        [],
+        get_tool_schemas(),
+        content_deltas.append,
+        reasoning_deltas.append,
+    )
+
+    assert "".join(reasoning_deltas) == "规划步骤"
+    assert "".join(content_deltas) == "最终回答"
+    assert turn.content == "最终回答"
+    assert turn.protocol_message["reasoning_content"] == "规划步骤"
+
+
 def test_stream_timeout_does_not_issue_hidden_nonstream_request() -> None:
     """A transport timeout must be retried by the outer loop exactly once per attempt."""
 

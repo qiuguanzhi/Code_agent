@@ -67,6 +67,78 @@ def _can_fallback_from_stream(exc: Exception) -> bool:
     )
 
 
+class _TaggedReasoningDemultiplexer:
+    """Split compatible ``<think>`` content streams across arbitrary chunks."""
+
+    OPEN_TAG = "<think>"
+    CLOSE_TAG = "</think>"
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside_reasoning = False
+
+    def feed(self, text: str) -> tuple[str, str]:
+        """Return newly complete ``(content, reasoning)`` text."""
+
+        self._buffer += text
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        while self._buffer:
+            marker = self.CLOSE_TAG if self._inside_reasoning else self.OPEN_TAG
+            marker_index = self._buffer.find(marker)
+            if marker_index >= 0:
+                self._append(
+                    self._buffer[:marker_index],
+                    content_parts,
+                    reasoning_parts,
+                )
+                self._buffer = self._buffer[marker_index + len(marker) :]
+                self._inside_reasoning = not self._inside_reasoning
+                continue
+
+            retained = self._possible_marker_suffix(self._buffer, marker)
+            safe_length = len(self._buffer) - retained
+            if safe_length:
+                self._append(
+                    self._buffer[:safe_length],
+                    content_parts,
+                    reasoning_parts,
+                )
+                self._buffer = self._buffer[safe_length:]
+            break
+        return "".join(content_parts), "".join(reasoning_parts)
+
+    def finish(self) -> tuple[str, str]:
+        """Flush text retained only because it resembled a split tag."""
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        self._append(self._buffer, content_parts, reasoning_parts)
+        self._buffer = ""
+        return "".join(content_parts), "".join(reasoning_parts)
+
+    def _append(
+        self,
+        text: str,
+        content_parts: list[str],
+        reasoning_parts: list[str],
+    ) -> None:
+        if not text:
+            return
+        target = reasoning_parts if self._inside_reasoning else content_parts
+        target.append(text)
+
+    @staticmethod
+    def _possible_marker_suffix(text: str, marker: str) -> int:
+        """Return the longest suffix that may be the start of ``marker``."""
+
+        maximum = min(len(text), len(marker) - 1)
+        for length in range(maximum, 0, -1):
+            if marker.startswith(text[-length:]):
+                return length
+        return 0
+
+
 class OpenAICompatibleProvider(ModelProvider):
     """Normalize OpenAI-compatible native tool calls into ``AssistantTurn``."""
 
@@ -114,7 +186,8 @@ class OpenAICompatibleProvider(ModelProvider):
         self,
         messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]],
-        on_token: Callable[[str], None],
+        on_content_chunk: Callable[[str], None],
+        on_reasoning_chunk: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Stream text deltas and safely accumulate native tool-call fragments."""
 
@@ -126,6 +199,7 @@ class OpenAICompatibleProvider(ModelProvider):
         tool_parts: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
         usage: dict[str, int] = {}
+        tagged_reasoning = _TaggedReasoningDemultiplexer()
         started_at = time.perf_counter()
         print(f"[Cerebro::Provider] request model={self.model} stream=true")
         try:
@@ -140,16 +214,24 @@ class OpenAICompatibleProvider(ModelProvider):
                     choice = choices[0]
                     delta = _field(choice, "delta")
                     if delta is not None:
-                        text_delta = _field(delta, "content")
-                        if isinstance(text_delta, str) and text_delta:
-                            content_parts.append(text_delta)
-                            emitted_content += text_delta
-                            on_token(text_delta)
                         reasoning_delta = _field(delta, "reasoning_content")
                         if reasoning_delta is None:
                             reasoning_delta = _field(delta, "reasoning")
                         if isinstance(reasoning_delta, str) and reasoning_delta:
                             reasoning_parts.append(reasoning_delta)
+                            if on_reasoning_chunk is not None:
+                                on_reasoning_chunk(reasoning_delta)
+                        text_delta = _field(delta, "content")
+                        if isinstance(text_delta, str) and text_delta:
+                            content_delta, tagged_delta = tagged_reasoning.feed(text_delta)
+                            if content_delta:
+                                content_parts.append(content_delta)
+                                emitted_content += content_delta
+                                on_content_chunk(content_delta)
+                            if tagged_delta:
+                                reasoning_parts.append(tagged_delta)
+                                if on_reasoning_chunk is not None:
+                                    on_reasoning_chunk(tagged_delta)
                         self._accumulate_tool_deltas(
                             tool_parts,
                             _field(delta, "tool_calls", []) or [],
@@ -176,8 +258,25 @@ class OpenAICompatibleProvider(ModelProvider):
                 raise
             fallback = self.complete(messages, tools)
             if not emitted_content and fallback.content:
-                on_token(fallback.content)
+                on_content_chunk(fallback.content)
+            fallback_reasoning = fallback.protocol_message.get("reasoning_content")
+            if on_reasoning_chunk is not None and isinstance(fallback_reasoning, str):
+                streamed_reasoning = "".join(reasoning_parts)
+                if fallback_reasoning.startswith(streamed_reasoning):
+                    missing_reasoning = fallback_reasoning[len(streamed_reasoning) :]
+                    if missing_reasoning:
+                        on_reasoning_chunk(missing_reasoning)
             return fallback
+
+        trailing_content, trailing_reasoning = tagged_reasoning.finish()
+        if trailing_content:
+            content_parts.append(trailing_content)
+            emitted_content += trailing_content
+            on_content_chunk(trailing_content)
+        if trailing_reasoning:
+            reasoning_parts.append(trailing_reasoning)
+            if on_reasoning_chunk is not None:
+                on_reasoning_chunk(trailing_reasoning)
 
         normalized_calls: list[ToolCall] = []
         protocol_calls: list[dict[str, Any]] = []

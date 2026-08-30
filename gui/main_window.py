@@ -1075,22 +1075,40 @@ class MainWindow(QMainWindow):
             self._pending_process_session_id = session_id
             self.process_render_timer.start()
 
-    @Slot(str)
-    def _append_reasoning(self, reasoning: str) -> None:
-        """Persist native deep-mode reasoning for the session that owns the run."""
+    @Slot(str, str)
+    def _append_reasoning(self, session_id: str, reasoning_delta: str) -> None:
+        """Append one reasoning delta immediately to its owning conversation."""
 
-        if self.thinking_mode != "deep":
+        if not session_id or not reasoning_delta:
             return
-        session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.append_reasoning(
-            reasoning,
+        conversation = self.session_store.get(session_id)
+        if conversation is None:
+            return
+        had_reasoning = bool(conversation.reasoning)
+        self.session_store.append_reasoning_delta(
+            reasoning_delta,
             conversation_id=session_id,
             persist=False,
         )
         self._schedule_session_save()
         if session_id == self.session_store.active_id:
-            self._pending_process_session_id = session_id
-            self.process_render_timer.start()
+            self.thinking_container.setVisible(True)
+            self.thinking_toggle.setVisible(True)
+            if not had_reasoning:
+                self.thinking_view.clear()
+                previous = self.thinking_toggle.blockSignals(True)
+                self.thinking_toggle.setChecked(True)
+                self.thinking_toggle.blockSignals(previous)
+                self.thinking_toggle.setText("▼")
+            self.thinking_view.setVisible(self.thinking_toggle.isChecked())
+            self.thinking_title.setText("💭 Cerebro 深度思考 · 实时")
+            cursor = self.thinking_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(reasoning_delta)
+            self.thinking_view.setTextCursor(cursor)
+            self.thinking_view.ensureCursorVisible()
+            scrollbar = self.thinking_view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     @Slot()
     def _flush_process_render(self) -> None:
@@ -1111,8 +1129,8 @@ class MainWindow(QMainWindow):
             and self._running_session_id == conversation.id
         )
         if self.thinking_mode == "deep":
-            narrative = conversation.reasoning.strip()
-            if not narrative:
+            narrative = conversation.reasoning
+            if not narrative.strip():
                 narrative = "\n\n".join(
                     str(item.get("text", "")).strip()
                     for item in conversation.process

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -364,3 +364,58 @@ def test_goal_mode_preserves_complete_reasoning_in_agent_state(tmp_path: Path) -
 
     assert result.status == "completed"
     assert result.state.reasoning == reasoning
+
+
+def test_agent_loop_forwards_reasoning_chunks_while_retaining_final_state(
+    tmp_path: Path,
+) -> None:
+    """Keep the core GUI-agnostic while exposing native reasoning deltas."""
+
+    class StreamingProvider(ModelProvider):
+        def complete(
+            self,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+        ) -> AssistantTurn:
+            _ = (messages, tools)
+            raise AssertionError("streaming path expected")
+
+        def complete_stream(
+            self,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            on_content_chunk: Callable[[str], None],
+            on_reasoning_chunk: Callable[[str], None] | None = None,
+        ) -> AssistantTurn:
+            _ = (messages, tools)
+            assert on_reasoning_chunk is not None
+            on_reasoning_chunk("先规划")
+            on_reasoning_chunk("，再验证")
+            on_content_chunk("完成。")
+            return AssistantTurn(
+                content="完成。",
+                tool_calls=[],
+                protocol_message={
+                    "role": "assistant",
+                    "content": "完成。",
+                    "reasoning_content": "先规划，再验证",
+                },
+                finish_reason="stop",
+            )
+
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    reasoning_deltas: list[str] = []
+    content_deltas: list[str] = []
+    cfg = AgentConfig(
+        workspace=workspace,
+        provider=StreamingProvider(),
+        mode="goal",
+        on_token=content_deltas.append,
+        on_reasoning_token=reasoning_deltas.append,
+    )
+
+    result = run_agent("深入分析", cfg)
+
+    assert reasoning_deltas == ["先规划", "，再验证"]
+    assert content_deltas == ["完成。"]
+    assert result.state.reasoning == "先规划，再验证"

@@ -22,6 +22,7 @@ ConfirmWriteCallback = Callable[[str], bool]
 SleepCallback = Callable[[float], None]
 StopCallback = Callable[[], bool]
 TokenCallback = Callable[[str], None]
+ReasoningTokenCallback = Callable[[str], None]
 
 
 class ModelRetryExhausted(RuntimeError):
@@ -52,6 +53,7 @@ class AgentConfig:
     sleep_fn: SleepCallback = field(default=time.sleep, repr=False)
     should_stop: StopCallback | None = field(default=None, repr=False)
     on_token: TokenCallback | None = field(default=None, repr=False)
+    on_reasoning_token: ReasoningTokenCallback | None = field(default=None, repr=False)
     system_prompt_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -132,8 +134,14 @@ def call_model_with_retry(
         if cfg.should_stop is not None and cfg.should_stop():
             raise AgentStopRequested("user requested stop")
         try:
-            if cfg.on_token is not None:
-                return cfg.provider.complete_stream(messages, tools, cfg.on_token)
+            if cfg.on_token is not None or cfg.on_reasoning_token is not None:
+                content_callback = cfg.on_token or (lambda _delta: None)
+                return cfg.provider.complete_stream(
+                    messages,
+                    tools,
+                    content_callback,
+                    cfg.on_reasoning_token,
+                )
             return cfg.provider.complete(messages, tools)
         except Exception as exc:
             if cfg.should_stop is not None and cfg.should_stop():

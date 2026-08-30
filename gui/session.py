@@ -331,3 +331,19 @@ class ConversationStore:
         conversation.reasoning += separator + clean_text
         if persist:
             self.save()
+
+    def append_reasoning_delta(
+        self,
+        text: str,
+        *,
+        conversation_id: str | None = None,
+        persist: bool = True,
+    ) -> None:
+        """Append one raw streaming delta without trimming or adding separators."""
+
+        conversation = self.get(conversation_id or self.active_id)
+        if conversation is None or not text:
+            return
+        conversation.reasoning += text
+        if persist:
+            self.save()
