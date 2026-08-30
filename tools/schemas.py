@@ -10,6 +10,8 @@ READ_FILE_SCHEMA: dict[str, Any] = {
         "name": "read_file",
         "description": (
             "Read a UTF-8 text file inside the configured workspace. "
+            "Use it only when reading that file directly advances the user's "
+            "stated task or plan; never inspect unrelated files speculatively. "
             "Use next_line from the result to continue reading a truncated file."
         ),
         "parameters": {
@@ -78,6 +80,33 @@ WRITE_FILE_SCHEMA: dict[str, Any] = {
 }
 
 
+DELETE_FILE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "delete_file",
+        "description": (
+            "Delete one regular file inside the workspace after verifying the "
+            "SHA-256 returned by read_file. Directories cannot be deleted."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root.",
+                },
+                "expected_sha256": {
+                    "type": "string",
+                    "description": "Current file SHA-256 returned by read_file.",
+                },
+            },
+            "required": ["path", "expected_sha256"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 RUN_COMMAND_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -124,6 +153,7 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     READ_FILE_SCHEMA,
     WRITE_FILE_SCHEMA,
+    DELETE_FILE_SCHEMA,
     RUN_COMMAND_SCHEMA,
 ]
 
@@ -132,4 +162,3 @@ def get_tool_schemas() -> list[dict[str, Any]]:
     """Return an isolated copy so callers cannot mutate global schemas."""
 
     return deepcopy(TOOL_SCHEMAS)
-

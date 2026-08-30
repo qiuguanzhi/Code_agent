@@ -54,6 +54,51 @@ def test_workspace_snapshot_records_hash_and_modification_time(tmp_path: Path) -
     assert isinstance(metadata["mtime_ns"], int)
 
 
+def test_snapshot_reports_bounded_file_copy_progress(tmp_path: Path) -> None:
+    """Expose deterministic progress without changing the snapshot contract."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(3):
+        (workspace / f"file-{index}.txt").write_text(str(index), encoding="utf-8")
+    updates: list[tuple[int, int, str]] = []
+
+    snapshot = save_workspace_snapshot(
+        workspace,
+        lambda completed, total, path: updates.append((completed, total, path)),
+    )
+
+    assert len(snapshot) == 4
+    assert updates[0] == (0, 3, "")
+    assert updates[-1] == (3, 3, "file-2.txt")
+
+
+def test_snapshot_skips_dependencies_and_rollback_preserves_them(tmp_path: Path) -> None:
+    """Avoid copying or deleting heavyweight environment/cache directories."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "main.py"
+    source.write_text("original\n", encoding="utf-8")
+    dependency = workspace / ".venv" / "Lib" / "package.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("dependency\n", encoding="utf-8")
+    transient = workspace / ".pytest-run-123" / "captured.txt"
+    transient.parent.mkdir()
+    transient.write_text("temporary\n", encoding="utf-8")
+
+    snapshot = save_workspace_snapshot(workspace)
+
+    assert "main.py" in snapshot
+    assert ".venv/Lib/package.py" not in snapshot
+    assert ".pytest-run-123/captured.txt" not in snapshot
+    source.write_text("changed\n", encoding="utf-8")
+    dependency.write_text("still-here\n", encoding="utf-8")
+    assert rollback_to_snapshot(snapshot) is True
+    assert source.read_text(encoding="utf-8") == "original\n"
+    assert dependency.read_text(encoding="utf-8") == "still-here\n"
+
+
 def test_rollback_restores_original_files_and_removes_new_files(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -108,6 +153,47 @@ def test_default_write_confirmation_hook_and_diff_metadata(tmp_path: Path) -> No
     assert state.changed_files["main.py"] == result["meta"]["diff"]
     assert state.changed_file_hashes["main.py"] == result["meta"]["sha256"]
     assert registry.execute_one_call(call, state) == encoded
+
+
+def test_deferred_registry_reads_staged_content_without_writing_disk(tmp_path: Path) -> None:
+    """Let later model steps inspect a staged version before batch approval."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "main.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    state = AgentState()
+    registry = ToolRegistry(
+        workspace,
+        write_policy={"require_confirmation": False},
+        defer_writes=True,
+    )
+    write_call = _write_call(
+        "main.py",
+        "value = 2\n",
+        sha256_file_streaming(target),
+    )
+    read_call = ToolCall(
+        id="read-staged",
+        name="read_file",
+        arguments_json=json.dumps(
+            {
+                "path": "main.py",
+                "start_line": 1,
+                "max_lines": 20,
+                "max_chars": 2_000,
+            }
+        ),
+    )
+
+    write_result = json.loads(registry.execute_one_call(write_call, state))
+    read_result = json.loads(registry.execute_one_call(read_call, state))
+
+    assert write_result["meta"]["staged"] is True
+    assert read_result["meta"]["staged"] is True
+    assert read_result["data"] == "value = 2\n"
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert len(state.pending_writes) == 1
 
 
 def test_rejected_write_does_not_touch_disk(tmp_path: Path) -> None:

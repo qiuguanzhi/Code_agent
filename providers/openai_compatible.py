@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -46,6 +48,25 @@ def _usage_dict(usage: Any) -> dict[str, int]:
     return {str(key): value for key, value in raw.items() if isinstance(value, int)}
 
 
+def _can_fallback_from_stream(exc: Exception) -> bool:
+    """Return true only when a gateway explicitly rejects streaming syntax.
+
+    Transport timeouts and connection failures must escape to the bounded retry
+    layer. Falling back after those errors silently doubled every timeout and
+    could make a 10-second network stall look like a 40-60 second GUI freeze.
+    """
+
+    if isinstance(exc, (TypeError, NotImplementedError)):
+        return True
+    message = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+    return (
+        isinstance(status_code, int)
+        and status_code in {400, 404, 405, 415, 422}
+        and "stream" in message
+    )
+
+
 class OpenAICompatibleProvider(ModelProvider):
     """Normalize OpenAI-compatible native tool calls into ``AssistantTurn``."""
 
@@ -77,20 +98,183 @@ class OpenAICompatibleProvider(ModelProvider):
 
         if self.should_stop is not None and self.should_stop():
             raise ProviderStopRequested("user requested stop before model request")
+        started_at = time.perf_counter()
+        print(f"[Cerebro::Provider] request model={self.model} stream=false")
+        request = self._request_payload(messages, tools, stream=False)
+        response = self.client.chat.completions.create(**request)
+        turn = self._normalize_response(response)
+        duration_ms = (time.perf_counter() - started_at) * 1_000
+        print(
+            "[Cerebro::Provider] "
+            f"response model={self.model} stream=false duration_ms={duration_ms:.1f}"
+        )
+        return turn
+
+    def complete_stream(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        on_token: Callable[[str], None],
+    ) -> AssistantTurn:
+        """Stream text deltas and safely accumulate native tool-call fragments."""
+
+        if self.should_stop is not None and self.should_stop():
+            raise ProviderStopRequested("user requested stop before model request")
+        emitted_content = ""
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_parts: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        usage: dict[str, int] = {}
+        started_at = time.perf_counter()
+        print(f"[Cerebro::Provider] request model={self.model} stream=true")
+        try:
+            stream = self.client.chat.completions.create(
+                **self._request_payload(messages, tools, stream=True)
+            )
+            for chunk in stream:
+                if self.should_stop is not None and self.should_stop():
+                    raise ProviderStopRequested("user requested stop during model request")
+                choices = _field(chunk, "choices", []) or []
+                if choices:
+                    choice = choices[0]
+                    delta = _field(choice, "delta")
+                    if delta is not None:
+                        text_delta = _field(delta, "content")
+                        if isinstance(text_delta, str) and text_delta:
+                            content_parts.append(text_delta)
+                            emitted_content += text_delta
+                            on_token(text_delta)
+                        reasoning_delta = _field(delta, "reasoning_content")
+                        if reasoning_delta is None:
+                            reasoning_delta = _field(delta, "reasoning")
+                        if isinstance(reasoning_delta, str) and reasoning_delta:
+                            reasoning_parts.append(reasoning_delta)
+                        self._accumulate_tool_deltas(
+                            tool_parts,
+                            _field(delta, "tool_calls", []) or [],
+                        )
+                    raw_finish = _field(choice, "finish_reason")
+                    if raw_finish is not None:
+                        finish_reason = str(raw_finish)
+                chunk_usage = _usage_dict(_field(chunk, "usage"))
+                if chunk_usage:
+                    usage = chunk_usage
+        except ProviderStopRequested:
+            raise
+        except Exception as exc:
+            # Some OpenAI-compatible gateways reject stream=True or stream
+            # tool calls. Only explicit protocol incompatibility falls back;
+            # network/timeout failures are handled once by the retry layer.
+            duration_ms = (time.perf_counter() - started_at) * 1_000
+            print(
+                "[Cerebro::Provider] "
+                f"stream_error type={type(exc).__name__} duration_ms={duration_ms:.1f} "
+                f"fallback={_can_fallback_from_stream(exc)}"
+            )
+            if not _can_fallback_from_stream(exc):
+                raise
+            fallback = self.complete(messages, tools)
+            if not emitted_content and fallback.content:
+                on_token(fallback.content)
+            return fallback
+
+        normalized_calls: list[ToolCall] = []
+        protocol_calls: list[dict[str, Any]] = []
+        for index in sorted(tool_parts):
+            item = tool_parts[index]
+            call_id = item["id"] or f"call_{uuid.uuid4().hex}"
+            name = item["name"]
+            arguments = item["arguments"]
+            if not name or not arguments:
+                raise ProviderResponseError(
+                    "streamed tool call name and arguments must be non-empty"
+                )
+            normalized_calls.append(ToolCall(call_id, name, arguments))
+            protocol_calls.append(
+                {
+                    "id": call_id,
+                    "type": item["type"] or "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
+
+        content = "".join(content_parts) or None
+        protocol_message: dict[str, Any] = {"role": "assistant", "content": content}
+        if protocol_calls:
+            protocol_message["tool_calls"] = protocol_calls
+        reasoning = "".join(reasoning_parts)
+        if reasoning:
+            protocol_message["reasoning_content"] = reasoning
+        turn = AssistantTurn(
+            content=content,
+            tool_calls=normalized_calls,
+            protocol_message=protocol_message,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+        duration_ms = (time.perf_counter() - started_at) * 1_000
+        print(
+            "[Cerebro::Provider] "
+            f"response model={self.model} stream=true duration_ms={duration_ms:.1f}"
+        )
+        return turn
+
+    def _request_payload(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        """Build one transport request without mutating caller-owned values."""
+
         request: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
             "tools": list(tools),
             "tool_choice": "auto",
             "temperature": self.temperature,
-            "stream": False,
+            "stream": stream,
             "extra_body": self.extra_body,
         }
         if self.reasoning_effort is not None:
             request["reasoning_effort"] = self.reasoning_effort
-        response = self.client.chat.completions.create(
-            **request,
-        )
+        return request
+
+    @staticmethod
+    def _accumulate_tool_deltas(
+        target: dict[int, dict[str, str]],
+        raw_calls: Any,
+    ) -> None:
+        """Merge streamed call fragments by protocol index."""
+
+        if not isinstance(raw_calls, Sequence):
+            return
+        for fallback_index, raw_call in enumerate(raw_calls):
+            raw_index = _field(raw_call, "index", fallback_index)
+            index = raw_index if isinstance(raw_index, int) else fallback_index
+            item = target.setdefault(
+                index,
+                {"id": "", "type": "function", "name": "", "arguments": ""},
+            )
+            call_id = _field(raw_call, "id")
+            call_type = _field(raw_call, "type")
+            function = _field(raw_call, "function")
+            name = _field(function, "name")
+            arguments = _field(function, "arguments")
+            if isinstance(call_id, str) and call_id:
+                item["id"] = call_id
+            if isinstance(call_type, str) and call_type:
+                item["type"] = call_type
+            if isinstance(name, str):
+                item["name"] += name
+            if isinstance(arguments, str):
+                item["arguments"] += arguments
+
+    def _normalize_response(self, response: Any) -> AssistantTurn:
+        """Normalize one complete SDK response into the core protocol."""
+
         choices = _field(response, "choices", [])
         if not isinstance(choices, Sequence) or not choices:
             raise ProviderResponseError("provider response contains no choices")
@@ -184,12 +368,25 @@ def create_provider_from_env(
     if not resolved_model:
         raise ProviderConfigurationError("AGENT_MODEL is required")
 
+    timeout_text = os.getenv("AGENT_API_TIMEOUT", "10")
+    try:
+        api_timeout = float(timeout_text)
+    except ValueError as exc:
+        raise ProviderConfigurationError("AGENT_API_TIMEOUT must be numeric") from exc
+    if not 1.0 <= api_timeout <= 300.0:
+        raise ProviderConfigurationError("AGENT_API_TIMEOUT must be between 1 and 300")
+
     if normalized == "deepseek":
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise ProviderConfigurationError("DEEPSEEK_API_KEY is required")
         base_url = os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
-        client = client_factory(api_key=api_key, base_url=base_url, max_retries=0)
+        client = client_factory(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            timeout=api_timeout,
+        )
         thinking_body: dict[str, Any]
         if mode == "goal":
             thinking_body = {"thinking": {"type": "enabled"}}
@@ -209,7 +406,12 @@ def create_provider_from_env(
             raise ProviderConfigurationError("DASHSCOPE_API_KEY is required")
         if not base_url:
             raise ProviderConfigurationError("DASHSCOPE_BASE_URL is required")
-        client = client_factory(api_key=api_key, base_url=base_url, max_retries=0)
+        client = client_factory(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            timeout=api_timeout,
+        )
         return OpenAICompatibleProvider(
             client,
             resolved_model,

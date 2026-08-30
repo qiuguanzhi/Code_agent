@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +16,10 @@ from PySide6.QtCore import QThread, Signal
 from agent.loop import AgentConfig, AgentRunResult, run_agent
 from providers.base import ModelProvider
 from providers.openai_compatible import create_provider_from_env
-from tools.filesystem import resolve_in_workspace
-from utils.diff import generate_unified_diff, truncate_diff
+from tools.filesystem import apply_staged_writes
 
 
-ConfirmationCallback = Callable[[str], bool]
+ConfirmationCallback = Callable[[list[dict[str, Any]]], bool]
 
 
 class AgentWorker(QThread):
@@ -32,8 +32,9 @@ class AgentWorker(QThread):
     progress_signal = Signal(int, str)
     reasoning_signal = Signal(str)
     tool_status_signal = Signal(str, str, str)
-    confirmation_signal = Signal(str)
+    batch_confirmation_signal = Signal(object)
     snapshot_signal = Signal(object, str)
+    stream_signal = Signal(str, str)
     finished_signal = Signal(bool, str)
 
     def __init__(
@@ -57,11 +58,17 @@ class AgentWorker(QThread):
         self._interactive = False
         self._confirmation_event = threading.Event()
         self._confirmation_result = False
-        self._prepared_confirmation_path: str | None = None
         self._stop_event = threading.Event()
         self.current_step = 0
         self._active_provider: ModelProvider | None = None
         self._reasoning_emitted = False
+        self._session_id = ""
+        self._stream_pending = ""
+        self._last_stream_emit = 0.0
+        self._diagnostic_stage = ""
+        self._diagnostic_started_at = 0.0
+        self._diagnostic_generation = 0
+        self._diagnostic_timer: threading.Timer | None = None
 
     def start_agent(
         self,
@@ -69,6 +76,7 @@ class AgentWorker(QThread):
         workspace: Path | str,
         max_steps: int,
         interactive: bool,
+        session_id: str = "",
     ) -> None:
         """Validate and start one configured Agent run in this QThread."""
 
@@ -89,11 +97,22 @@ class AgentWorker(QThread):
         self._workspace = resolved_workspace
         self._max_steps = max_steps
         self._interactive = interactive
-        self._confirmation_event.clear()
+        # Events are deliberately replaced, not merely cleared. A previous run
+        # may still own a waiter reference while its queued Qt signals drain.
+        self._confirmation_event = threading.Event()
         self._confirmation_result = False
-        self._stop_event.clear()
+        self._stop_event = threading.Event()
         self.current_step = 0
         self._reasoning_emitted = False
+        self._session_id = session_id
+        self._stream_pending = ""
+        self._last_stream_emit = 0.0
+        self._end_diagnostic_stage()
+        self._diagnostic(
+            "阶段0: 重置Worker状态",
+            workspace=str(resolved_workspace),
+            conversation_id=session_id or "<cli>",
+        )
         self.start()
 
     def stop(self) -> None:
@@ -128,65 +147,259 @@ class AgentWorker(QThread):
             self._finish_with_error("Agent Worker 尚未配置工作区。")
             return
 
-        self.status_signal.emit("running", "Agent 正在运行")
+        self.status_signal.emit("running", "阶段 1/5：⏳ 初始化模型连接...")
         try:
+            self._begin_diagnostic_stage("阶段1: 创建 Provider")
+            provider_started = time.perf_counter()
             provider = self.provider or create_provider_from_env(
                 self.provider_name,
                 mode=self.mode,
             )
+            provider_duration_ms = (time.perf_counter() - provider_started) * 1_000
+            self._report_slow_stage("Provider 初始化", provider_duration_ms)
+            self._end_diagnostic_stage("阶段1: 创建 Provider")
             self._active_provider = provider
             set_stop_callback = getattr(provider, "set_stop_callback", None)
             if callable(set_stop_callback):
                 set_stop_callback(self.is_stop_requested)
+            self._begin_diagnostic_stage("阶段2: 构建配置")
             cfg = AgentConfig(
                 workspace=self._workspace,
                 provider=provider,
                 max_steps=self._max_steps,
                 mode=self.mode,
                 interactive=self._interactive,
-                confirm_write=self._confirm_write if self._interactive else None,
+                batch_writes=self._interactive,
+                confirm_write=None,
                 should_stop=self.is_stop_requested,
+                on_token=self._handle_stream_token,
             )
+            self._end_diagnostic_stage("阶段2: 构建配置")
             snapshot_timestamp = datetime.now().astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
             result = run_agent(self._task, cfg, self._handle_update)
         except Exception as exc:
+            self._end_diagnostic_stage()
+            self._flush_stream_tokens()
             self._finish_with_error(f"{type(exc).__name__}: {exc}")
             return
 
         success = result.status == "completed"
         stopped_by_user = result.reason == "user_stopped"
+        if self._interactive and result.state.pending_writes and not stopped_by_user:
+            approved = self._await_batch_confirmation(result.state.pending_writes)
+            if approved and not self.is_stop_requested():
+                batch_result = apply_staged_writes(
+                    self._workspace,
+                    result.state.pending_writes,
+                )
+                if batch_result.get("ok") is True:
+                    self._emit_applied_batch(result, batch_result)
+                    self.tool_status_signal.emit("success", "批量修改", "")
+                    result.answer = f"{result.answer}\n\n已批量应用 {len(result.state.pending_writes)} 个文件。"
+                else:
+                    result.status = "failed"
+                    result.reason = "batch_apply_failed"
+                    error = batch_result.get("error")
+                    detail = error.get("message") if isinstance(error, Mapping) else "批量写入失败"
+                    result.answer = str(detail)
+            else:
+                result.status = "stopped"
+                result.reason = (
+                    "user_stopped" if self.is_stop_requested() else "user_rejected_batch"
+                )
+                result.answer = (
+                    "Agent 已按用户请求停止，暂存修改已丢弃。"
+                    if self.is_stop_requested()
+                    else "用户已拒绝全部暂存修改，工作区未改变。"
+                )
+                self.tool_status_signal.emit(
+                    "cancelled",
+                    "批量修改",
+                    "用户已拒绝全部修改",
+                )
+            result.state.pending_writes.clear()
+            success = result.status == "completed"
+            stopped_by_user = result.reason == "user_stopped"
+        elif stopped_by_user:
+            result.state.pending_writes.clear()
         if self.mode == "goal" and result.state.reasoning and not self._reasoning_emitted:
             self.reasoning_signal.emit(result.state.reasoning)
             self._reasoning_emitted = True
         summary = self._format_summary(result)
+        self._flush_stream_tokens()
         self.snapshot_signal.emit(result.state.initial_snapshot, snapshot_timestamp)
+        rejected_by_user = result.reason == "user_rejected_batch"
         self.status_signal.emit(
-            "ready" if success or stopped_by_user else "error",
-            "已停止" if stopped_by_user else result.answer,
+            "ready" if success or stopped_by_user or rejected_by_user else "error",
+            "已停止"
+            if stopped_by_user
+            else "已拒绝全部修改"
+            if rejected_by_user
+            else result.answer,
         )
         self.finished_signal.emit(success, summary)
         self._active_provider = None
+        self._end_diagnostic_stage()
 
-    def _confirm_write(self, path: str) -> bool:
-        """Obtain a write decision from an injected callback or the GUI thread."""
+    def _await_batch_confirmation(
+        self,
+        pending_writes: list[dict[str, Any]],
+    ) -> bool:
+        """Publish one complete Diff batch and block for exactly one decision."""
 
-        if self._prepared_confirmation_path == path:
-            confirmed = self._confirmation_result
-            self._prepared_confirmation_path = None
-            return confirmed
-
-        if self.confirmation_callback is not None:
-            return bool(self.confirmation_callback(path))
-
+        payload = [dict(item) for item in pending_writes]
         self._confirmation_result = False
         self._confirmation_event.clear()
-        self.confirmation_signal.emit(path)
+        self.batch_confirmation_signal.emit(payload)
+        self.status_signal.emit(
+            "running",
+            f"等待批量审批：{len(payload)} 个文件",
+        )
+        if self.confirmation_callback is not None:
+            return bool(self.confirmation_callback(payload))
         while not self._confirmation_event.wait(timeout=0.1):
-            if self.isInterruptionRequested():
+            if self.is_stop_requested():
                 return False
         return self._confirmation_result
+
+    def _emit_applied_batch(
+        self,
+        result: AgentRunResult,
+        batch_result: Mapping[str, Any],
+    ) -> None:
+        """Reflect committed staged files in core state and GUI signals."""
+
+        raw_results = batch_result.get("data")
+        applied_results = raw_results if isinstance(raw_results, list) else []
+        for index, entry in enumerate(result.state.pending_writes):
+            path = str(entry.get("path", ""))
+            content = str(entry.get("content", ""))
+            diff_text = str(entry.get("diff", ""))
+            applied = applied_results[index] if index < len(applied_results) else {}
+            meta_value = applied.get("meta") if isinstance(applied, Mapping) else {}
+            meta = meta_value if isinstance(meta_value, Mapping) else {}
+            new_hash = meta.get("sha256")
+            if isinstance(new_hash, str):
+                result.state.changed_file_hashes[path] = new_hash
+            result.state.changed_files[path] = diff_text
+            self.code_signal.emit(path, content)
+            additions, deletions = self._count_diff_changes(diff_text)
+            raw_step = entry.get("step", result.state.step)
+            step = raw_step if isinstance(raw_step, int) else result.state.step
+            if bool(entry.get("created", False)):
+                self.log_signal.emit(
+                    step,
+                    "📄",
+                    "filesystem_create",
+                    "success",
+                    path,
+                )
+            else:
+                self.log_signal.emit(
+                    step,
+                    "📝",
+                    f"modified {Path(path).name} (+{additions} -{deletions})",
+                    "success",
+                    "",
+                )
+
+    def _handle_stream_token(self, delta: str) -> None:
+        """Coalesce very small transport chunks before crossing Qt threads."""
+
+        if not delta or self.is_stop_requested():
+            return
+        self._stream_pending += delta
+        now = time.perf_counter()
+        if now - self._last_stream_emit >= 0.04 or len(self._stream_pending) >= 256:
+            self._flush_stream_tokens(now)
+
+    def _flush_stream_tokens(self, now: float | None = None) -> None:
+        """Emit all buffered text as one GUI update."""
+
+        if not self._stream_pending:
+            return
+        delta = self._stream_pending
+        self._stream_pending = ""
+        self._last_stream_emit = now if now is not None else time.perf_counter()
+        self.stream_signal.emit(self._session_id, delta)
+
+    def _report_slow_stage(self, stage: str, duration_ms: float) -> None:
+        """Surface initialization bottlenecks that exceed the UX threshold."""
+
+        if duration_ms <= 500:
+            return
+        message = f"{stage}耗时 {duration_ms / 1_000:.2f}s"
+        self.log_signal.emit(0, "⏱", "性能", "warning", message)
+        print(f"[Cerebro::Perf] {stage} duration_ms={duration_ms:.1f}")
+
+    def _diagnostic(self, stage: str, **details: object) -> None:
+        """Print one timestamped, secret-free lifecycle diagnostic line."""
+
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        session_id = self._session_id or "<cli>"
+        rendered = " ".join(f"{key}={value}" for key, value in details.items())
+        suffix = f" {rendered}" if rendered else ""
+        print(
+            f"[{timestamp}] [Cerebro::Worker] session={session_id} "
+            f"{stage}{suffix}"
+        )
+
+    def _begin_diagnostic_stage(self, stage: str) -> None:
+        """Start one measured stage and warn if it remains blocked too long."""
+
+        if self._diagnostic_stage == stage:
+            return
+        self._end_diagnostic_stage()
+        self._diagnostic_generation += 1
+        generation = self._diagnostic_generation
+        self._diagnostic_stage = stage
+        self._diagnostic_started_at = time.perf_counter()
+        self._diagnostic(stage, event="started")
+        try:
+            warning_seconds = float(os.getenv("CEREBRO_STAGE_WARN_SECONDS", "10"))
+        except ValueError:
+            warning_seconds = 10.0
+        warning_seconds = max(1.0, warning_seconds)
+
+        def warn_if_current() -> None:
+            if (
+                generation != self._diagnostic_generation
+                or self._diagnostic_stage != stage
+            ):
+                return
+            self._diagnostic(stage, event="slow", seconds=f"{warning_seconds:.1f}")
+            self.log_signal.emit(
+                self.current_step,
+                "⚠",
+                "诊断",
+                "warning",
+                f"{stage} 已耗时超过 {warning_seconds:.0f} 秒，仍在等待；可检查工作区规模或网络连接。",
+            )
+
+        self._diagnostic_timer = threading.Timer(warning_seconds, warn_if_current)
+        self._diagnostic_timer.daemon = True
+        self._diagnostic_timer.start()
+
+    def _end_diagnostic_stage(self, expected_stage: str | None = None) -> None:
+        """Finish the current measured stage and cancel its watchdog."""
+
+        if expected_stage is not None and self._diagnostic_stage != expected_stage:
+            return
+        timer = self._diagnostic_timer
+        self._diagnostic_timer = None
+        if timer is not None:
+            timer.cancel()
+        if self._diagnostic_stage:
+            duration_ms = (time.perf_counter() - self._diagnostic_started_at) * 1_000
+            self._diagnostic(
+                self._diagnostic_stage,
+                event="finished",
+                duration_ms=f"{duration_ms:.1f}",
+            )
+        self._diagnostic_stage = ""
+        self._diagnostic_started_at = 0.0
 
     def _handle_update(self, update: dict[str, Any]) -> None:
         """Translate a core lifecycle dictionary into strongly shaped Qt signals."""
@@ -202,19 +415,46 @@ class AgentWorker(QThread):
         else:
             self._emit_quick_progress(event, step, event_data)
 
-        if event == "model_request":
-            self.status_signal.emit("running", f"第 {step} 步：模型思考中")
+        if event in {"run_preparing", "snapshot_started"}:
+            self._begin_diagnostic_stage("阶段3: 保存快照")
+            self.status_signal.emit("running", "阶段 2/5：⏳ 保存工作区快照...")
+        elif event == "snapshot_progress":
+            completed = event_data.get("completed", 0)
+            total = event_data.get("total", 0)
+            if isinstance(completed, int) and isinstance(total, int) and total > 0:
+                self.status_signal.emit(
+                    "running",
+                    f"阶段 2/5：⏳ 保存工作区快照... {completed}/{total}",
+                )
+        elif event == "snapshot_completed":
+            self._end_diagnostic_stage("阶段3: 保存快照")
+            duration = event_data.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                self._report_slow_stage("工作区快照", float(duration))
+        elif event == "context_building":
+            self._begin_diagnostic_stage("阶段4: 构建上下文")
+            self.status_signal.emit("running", "阶段 3/5：⏳ 构建上下文...")
+        elif event == "context_ready":
+            self._end_diagnostic_stage("阶段4: 构建上下文")
+            self.status_signal.emit("running", "阶段 4/5：⏳ 连接模型服务...")
+            duration = event_data.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                self._report_slow_stage("上下文构建", float(duration))
+        elif event == "model_request":
+            self._begin_diagnostic_stage("阶段5: 调用模型")
+            self.status_signal.emit("running", "阶段 5/5：🧠 模型思考中...")
         elif event == "model_response":
+            self._end_diagnostic_stage("阶段5: 调用模型")
+            self._flush_stream_tokens()
             reasoning = event_data.get("reasoning")
             if self.mode == "goal" and isinstance(reasoning, str) and reasoning.strip():
                 self.reasoning_signal.emit(reasoning.strip())
                 self._reasoning_emitted = True
         elif event == "tool_call":
+            self._end_diagnostic_stage("阶段5: 调用模型")
             tool_name = str(event_data.get("tool", "工具"))
             self.status_signal.emit("running", f"第 {step} 步：执行 {tool_name}")
             self.tool_status_signal.emit("running", tool_name, "")
-            if tool_name == "write_file" and self._interactive:
-                self._prepare_interactive_write(event_data)
         elif event == "tool_result":
             self._emit_tool_preview(event_data)
             self._emit_compact_tool_log(step, event_data)
@@ -341,6 +581,29 @@ class AgentWorker(QThread):
             )
             return
         if isinstance(result, Mapping) and result.get("ok") is True:
+            meta_value = result.get("meta")
+            meta = meta_value if isinstance(meta_value, Mapping) else {}
+            if meta.get("staged") is True:
+                return
+            file_path = str(meta.get("path", ""))
+            if tool_name == "write_file" and meta.get("created") is True:
+                self.log_signal.emit(
+                    step,
+                    "📄",
+                    "filesystem_create",
+                    "success",
+                    file_path,
+                )
+                return
+            if tool_name == "delete_file":
+                self.log_signal.emit(
+                    step,
+                    "🗑️",
+                    "filesystem_delete",
+                    "warning",
+                    file_path,
+                )
+                return
             self.log_signal.emit(step, "🔧", tool_name, "tool_success", "")
             return
 
@@ -354,61 +617,6 @@ class AgentWorker(QThread):
         if len(reason) > 120:
             reason = reason[:117] + "..."
         self.log_signal.emit(step, "❌", tool_name, "error", reason)
-
-    def _prepare_interactive_write(
-        self,
-        event_data: Mapping[str, Any],
-    ) -> None:
-        """Generate a pre-write Diff and block until the user decides."""
-
-        if self._workspace is None:
-            return
-        raw_arguments = event_data.get("arguments_json")
-        if not isinstance(raw_arguments, str):
-            return
-        try:
-            arguments = json.loads(raw_arguments)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(arguments, dict):
-            return
-        path = arguments.get("path")
-        new_content = arguments.get("content")
-        if not isinstance(path, str) or not isinstance(new_content, str):
-            return
-
-        try:
-            target = resolve_in_workspace(self._workspace, path, must_exist=False)
-            original_content = (
-                target.read_text(encoding="utf-8") if target.exists() else ""
-            )
-            diff_text = truncate_diff(
-                generate_unified_diff(original_content, new_content, path)
-            )
-        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
-            self.status_signal.emit(
-                "error",
-                f"无法生成写入预览，已拒绝修改：{exc}",
-            )
-            self._confirmation_result = False
-            self._prepared_confirmation_path = path
-            return
-
-        additions, deletions = self._count_diff_changes(diff_text)
-        self._confirmation_result = False
-        self._confirmation_event.clear()
-        self.diff_signal.emit(path, diff_text, additions, deletions)
-        self.confirmation_signal.emit(path)
-        self.status_signal.emit("running", f"等待确认修改：{path}")
-
-        if self.confirmation_callback is not None:
-            self._confirmation_result = bool(self.confirmation_callback(path))
-        else:
-            while not self._confirmation_event.wait(timeout=0.1):
-                if self.isInterruptionRequested():
-                    self._confirmation_result = False
-                    break
-        self._prepared_confirmation_path = path
 
     def _emit_tool_preview(self, event_data: Mapping[str, Any]) -> None:
         """Emit code or Diff previews from one successful tool-result payload."""
@@ -428,17 +636,6 @@ class AgentWorker(QThread):
 
         if tool_name == "write_file":
             if self._interactive:
-                if self._workspace is not None and file_path:
-                    try:
-                        target = resolve_in_workspace(
-                            self._workspace,
-                            file_path,
-                            must_exist=True,
-                        )
-                        content = target.read_text(encoding="utf-8")
-                    except (OSError, RuntimeError, UnicodeError, ValueError):
-                        return
-                    self.code_signal.emit(file_path, content)
                 return
             diff_text = meta.get("diff")
             if file_path and isinstance(diff_text, str):
@@ -494,6 +691,7 @@ class AgentWorker(QThread):
     def _finish_with_error(self, message: str) -> None:
         """Emit a stable terminal error without leaking an exception from QThread."""
 
+        self._end_diagnostic_stage()
         self.status_signal.emit("error", message)
         self.finished_signal.emit(False, message)
         self._active_provider = None

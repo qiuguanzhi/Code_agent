@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -191,10 +192,19 @@ def fit_context(
 ) -> list[dict[str, Any]]:
     """Fit history into a budget without splitting assistant/tool protocol units."""
 
+    started_at = time.perf_counter()
     if input_budget <= 0:
         raise ValueError("input_budget must be positive")
     copied = [dict(message) for message in messages]
-    if _context_cost(copied, tool_schemas) <= input_budget:
+    input_tokens = _context_cost(copied, tool_schemas)
+    if input_tokens <= input_budget:
+        duration_ms = (time.perf_counter() - started_at) * 1_000
+        print(
+            "[Cerebro::Context] "
+            f"messages={len(copied)} estimated_tokens={input_tokens} "
+            f"budget={input_budget} output_messages={len(copied)} "
+            f"duration_ms={duration_ms:.1f} fast_path=true"
+        )
         return copied
 
     units = group_protocol_units(copied)
@@ -221,5 +231,13 @@ def fit_context(
     while _context_cost(result, tool_schemas) > input_budget:
         if not _shrink_longest_content(result):
             raise ContextBudgetError("mandatory context and tool schemas exceed input_budget")
+    duration_ms = (time.perf_counter() - started_at) * 1_000
+    output_tokens = _context_cost(result, tool_schemas)
+    print(
+        "[Cerebro::Context] "
+        f"messages={len(copied)} estimated_tokens={input_tokens} "
+        f"budget={input_budget} output_messages={len(result)} "
+        f"output_tokens={output_tokens} duration_ms={duration_ms:.1f} "
+        "fast_path=false"
+    )
     return result
-

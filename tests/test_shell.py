@@ -1,5 +1,6 @@
 """Tests for bounded, timeout-aware command execution."""
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,35 @@ def test_sanitized_environment_removes_likely_secrets() -> None:
     assert result["NORMAL_SETTING"] == "visible"
     assert "DEEPSEEK_API_KEY" not in result
     assert "CUSTOM_TOKEN" not in result
+
+
+def test_sanitized_environment_override_keeps_process_path() -> None:
+    result = build_sanitized_env({"NORMAL_SETTING": "override"})
+
+    assert result.get("PATH") or result.get("Path")
+    assert result["NORMAL_SETTING"] == "override"
+
+
+def test_first_ls_call_lists_workspace_without_shell(tmp_path: Path) -> None:
+    """The first listing must work on Windows even though ls is not an executable."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "alpha.txt").write_text("a", encoding="utf-8")
+    (workspace / "folder").mkdir()
+
+    result = run_command(
+        workspace,
+        ["ls"],
+        timeout_seconds=5,
+        max_output_chars=1_000,
+    )
+
+    assert result["ok"] is True
+    assert "alpha.txt" in result["data"]
+    assert "folder" in result["data"]
+    if os.name == "nt":
+        assert result["meta"]["portable_alias"] is True
 
 
 def test_run_command_captures_successful_output(tmp_path: Path) -> None:

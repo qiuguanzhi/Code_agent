@@ -122,7 +122,8 @@ class CerebroBackground(QWidget):
 
         self._angle = (self._angle + 0.1) % 360.0
         if self._active:
-            self._scan_offset += 0.018
+            # 1.70 normalized widths at 20 FPS: one sweep takes about 9.4 s.
+            self._scan_offset += 0.009
             if self._scan_offset > 1.35:
                 self._scan_offset = -0.35
         self._overlay.update()
@@ -170,10 +171,10 @@ class CerebroBackground(QWidget):
             transparent = QColor("#64FFDA")
             transparent.setAlpha(0)
             glow = QColor("#64FFDA")
-            glow.setAlpha(48)
-            gradient.setColorAt(max(0.0, center - 0.08), transparent)
+            glow.setAlpha(31)
+            gradient.setColorAt(max(0.0, center - 0.04), transparent)
             gradient.setColorAt(center, glow)
-            gradient.setColorAt(min(1.0, center + 0.08), transparent)
+            gradient.setColorAt(min(1.0, center + 0.04), transparent)
             painter.fillRect(self.rect(), QBrush(gradient))
 
 
@@ -448,6 +449,17 @@ class MessageBubble(QWidget):
             outer.addWidget(self.bubble_frame, 0, Qt.AlignmentFlag.AlignLeft)
             outer.addStretch(1)
 
+    def set_content(self, content: str) -> None:
+        """Update one bubble in place so streaming never rebuilds the feed."""
+
+        self._uses_wide_layout = len(content) >= 120
+        if isinstance(self.content_label, QTextBrowser):
+            self.content_label.setHtml(basic_markdown_to_html(content))
+        else:
+            self.content_label.setText(content)
+        parent_width = self.parentWidget().width() if self.parentWidget() else 600
+        self.set_width_constraints(max(80, int(parent_width * 0.85)))
+
     def set_width_constraints(self, width: int) -> None:
         """Apply a responsive 85%-parent cap with a readable normal minimum."""
 
@@ -499,6 +511,8 @@ class ConversationScrollArea(QScrollArea):
         self.setWidget(self._content)
         self._plain_messages: list[str] = []
         self.bubbles: list[MessageBubble] = []
+        self._conversation_id = ""
+        self._render_start_index = 0
 
     def set_messages(
         self,
@@ -512,6 +526,8 @@ class ConversationScrollArea(QScrollArea):
             self._clear_bubbles()
             self._plain_messages = []
             start_index = max(0, len(messages) - self.MAX_RENDERED_MESSAGES)
+            self._conversation_id = conversation_id
+            self._render_start_index = start_index
             for index in range(start_index, len(messages)):
                 message = messages[index]
                 role = str(message.get("role", "system"))
@@ -534,6 +550,26 @@ class ConversationScrollArea(QScrollArea):
             self.viewport().update()
         scrollbar = self.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def update_message_content(
+        self,
+        conversation_id: str,
+        message_index: int,
+        content: str,
+    ) -> bool:
+        """Update a rendered message directly and keep its plain mirror aligned."""
+
+        if conversation_id != self._conversation_id:
+            return False
+        visible_index = message_index - self._render_start_index
+        if not 0 <= visible_index < len(self.bubbles):
+            return False
+        self.bubbles[visible_index].set_content(content)
+        if visible_index < len(self._plain_messages):
+            self._plain_messages[visible_index] = content
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        return True
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         """Keep bubbles readable while using available conversation width."""
@@ -561,6 +597,76 @@ class ConversationScrollArea(QScrollArea):
             self._layout.removeWidget(bubble)
             bubble.deleteLater()
         self.bubbles.clear()
+
+
+class BatchDiffWidget(QFrame):
+    """Compact selector for one batch of staged file modifications."""
+
+    file_selected = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create a summary label and a clickable per-file Diff list."""
+
+        super().__init__(parent)
+        self.setObjectName("batchDiffPanel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        self.summary_label = QLabel("待审批修改", self)
+        self.summary_label.setObjectName("batchDiffSummary")
+        layout.addWidget(self.summary_label)
+        self.file_list = QListWidget(self)
+        self.file_list.setObjectName("batchDiffList")
+        self.file_list.setMaximumHeight(150)
+        self.file_list.itemClicked.connect(self._emit_selected)
+        self.file_list.itemActivated.connect(self._emit_selected)
+        layout.addWidget(self.file_list)
+        self.setVisible(False)
+
+    def set_pending_writes(self, pending_writes: list[dict[str, Any]]) -> None:
+        """Replace the batch summary with paths and line-change statistics."""
+
+        self.file_list.clear()
+        for entry in pending_writes:
+            path = str(entry.get("path", ""))
+            diff_text = str(entry.get("diff", ""))
+            additions, deletions = self._count_diff(diff_text)
+            item = QListWidgetItem(f"{path}  (+{additions} -{deletions})")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.file_list.addItem(item)
+        count = self.file_list.count()
+        self.summary_label.setText(f"待审批修改 · {count} 个文件（点击查看 Diff）")
+        if count:
+            self.file_list.setCurrentRow(0)
+        self.setVisible(count > 0)
+
+    def clear_batch(self) -> None:
+        """Clear all staged-file rows and hide the panel."""
+
+        self.file_list.clear()
+        self.setVisible(False)
+
+    def _emit_selected(self, item: QListWidgetItem) -> None:
+        """Publish the trusted path stored on one list item."""
+
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(path, str) and path:
+            self.file_selected.emit(path)
+
+    @staticmethod
+    def _count_diff(diff_text: str) -> tuple[int, int]:
+        """Count changed content lines while excluding Unified Diff headers."""
+
+        additions = 0
+        deletions = 0
+        for line in diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                additions += 1
+            elif line.startswith("-"):
+                deletions += 1
+        return additions, deletions
 
 
 class FileMentionPopup(QMenu):

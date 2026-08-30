@@ -495,3 +495,116 @@ $env:QT_QPA_PLATFORM='offscreen'
 ```
 
 唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试均使用 offscreen Qt、FakeProvider、临时工作区和本地矢量绘制，不访问真实 API。Cerebro 启动动画实测约 2535ms，主窗口动画状态烟雾测试退出码为 0。
+
+---
+
+## [2026-08-29 20:35] 第7轮 任务 #1 - 验证文件创建与删除事件
+
+- **修改内容**：为本地工具层新增带 `expected_sha256` 乐观锁、路径边界和符号链接防护的 `delete_file`；`write_file` 的 `meta.created` 被 Worker 转换为 `📄 [Cerebro::Filesystem] 创建验证文件`，删除成功转换为 `🗑️ [Cerebro::Filesystem] 删除验证文件`。两类事件进入普通 `logView`，并触发工作区文件索引刷新；既有文件仍沿用 Diff 批准后的 `modified <path> (+X -Y)` 记录。
+- **涉及文件**：`tools/filesystem.py`、`tools/schemas.py`、`tools/registry.py`、`gui/worker.py`、`gui/main_window.py`、`tests/test_filesystem_tools.py`、`tests/test_gui.py`
+- **测试结果**：通过。覆盖删除哈希冲突、路径逃逸、成功删除以及 Cerebro 创建/删除日志精确格式。
+- **遗留问题**：目录删除仍被明确禁止；Agent 必须先用 `read_file` 获取当前哈希后才能删除普通文件。
+
+## [2026-08-29 20:35] 第7轮 任务 #2 - 启动空窗拆分与阶段计时
+
+- **修改内容**：Worker 启动后立即呈现 1/5 Provider 初始化，核心循环依次呈现 2/5 快照、3/5 上下文、4/5 模型连接、5/5 模型思考；状态区原生进度条同步阶段值。快照、Provider、系统提示、工具注册表、上下文、模型与工具均使用 `time.perf_counter()` 计时，超过 0.5 秒时写入性能日志或控制台。
+- **涉及文件**：`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。FakeProvider 端到端验证 1/5～5/5 全部状态均在模型返回前后按序发射。
+- **遗留问题**：真实公网 API 的 DNS、代理和服务端排队时间取决于本机网络；现在这段等待会明确显示为“连接模型服务/模型思考中”，并受传输超时约束。
+
+## [2026-08-29 20:35] 第7轮 任务 #3 - 低干扰能量光晕
+
+- **修改内容**：扫描步长从 `0.018` 降至 `0.009`，按 20 FPS 和完整扫描范围计算约 9.4 秒一次；峰值 Alpha 调整为 31/255（约 12%），渐变半宽从 0.08 减为 0.04。空闲态复位并停止扫描位移，仅 Agent 运行态绘制光晕。
+- **涉及文件**：`gui/widgets.py`、`tests/test_gui.py`
+- **测试结果**：通过。验证运行态单帧位移为 0.009，恢复空闲后扫描位置不再推进。
+- **遗留问题**：低透明神经网络水印仍按第 6 轮设计缓慢旋转；停止的是本任务指定的高亮扫描光晕。
+
+## [2026-08-29 20:35] 第7轮 任务 #4 - 快照按钮图标
+
+- **修改内容**：工具栏快照按钮改为 `📸 创建快照`，不依赖外部图标资源，亮暗主题下继承按钮前景色并保持清晰。
+- **涉及文件**：`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。GUI 组件测试验证快照按钮使用相机语义图标。
+- **遗留问题**：Unicode Emoji 的具体字形由操作系统字体决定，但不影响按钮尺寸和功能。
+
+## [2026-08-29 20:35] 第7轮 任务 #5 - 原生流式回答
+
+- **修改内容**：Provider 抽象新增可降级的 `complete_stream`；OpenAI 兼容适配器使用 `stream=True` 逐块转发文本，按索引累积 tool call 的名称与 JSON 参数，完整响应后才交给 Agent 执行。流式失败自动回退 `complete`。Worker 以 40ms/256 字符阈值合并小块，通过 `stream_signal(session_id, delta)` 路由；GUI 首块创建助手气泡，后续直接更新同一个 `QTextBrowser` 和会话消息，不重建整页，完成时原位写入最终摘要。
+- **涉及文件**：`providers/base.py`、`providers/openai_compatible.py`、`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`gui/session.py`、`gui/widgets.py`、`tests/test_providers.py`、`tests/test_gui.py`
+- **测试结果**：通过。覆盖中文文本分块、会话 ID 路由、流式 tool call JSON 拼接与最终协议消息。
+- **遗留问题**：文本回答已原生流式；多数兼容网关的工具参数是 JSON 分片，为安全起见必须累积完整后才生成和展示 Diff，不能执行半截参数。
+
+## [2026-08-29 20:35] 第7轮 任务 #6 - 空窗根因治理与连接超时
+
+- **修改内容**：确认 Provider 构造不做网络预检，主要不可见等待来自全量快照复制与首次网络请求。快照复制改为“单次读取同时复制并计算 SHA-256”，消除复制后再次读取哈希的额外 I/O，并提供有上限的文件进度事件。OpenAI SDK 新增 `AGENT_API_TIMEOUT`（默认 10 秒，允许 1～300 秒）并保持 SDK 重试关闭，由 Agent 自己的指数退避统一控制；加载标签在连接阶段持续动画。
+- **涉及文件**：`utils/snapshot.py`、`providers/openai_compatible.py`、`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`tests/test_extensions.py`、`tests/test_providers.py`
+- **测试结果**：通过。验证快照 0/N 至 N/N 进度、单遍哈希结果、超时参数注入与非法超时拒绝。
+- **遗留问题**：超大工作区仍需完整备份以保证可靠回退，耗时不会被虚假隐藏；现在具备逐文件进度、慢阶段诊断和更少磁盘读取。可按网络环境通过 `AGENT_API_TIMEOUT` 调整连接/读取超时。
+
+## [2026-08-29 20:35] 第7轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 119 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试使用 FakeProvider、SDK 形状的流式假数据、offscreen Qt 与临时工作区，不访问真实 API。`git diff --check` 无空白错误（仅提示 Windows 后续可能进行 LF→CRLF 转换）。真实 DeepSeek/百炼的逐块到达节奏仍需在用户本机 API Key 与网络环境下验收。
+
+---
+
+## [2026-08-30 10:38] 第8轮 任务 #1 - 批量 Diff 统一审批
+
+- **修改内容**：GUI 交互模式不再逐个阻塞 `write_file`。工具层先完成路径、大小和 SHA-256 校验，再把最终内容、磁盘原文、基础哈希及 Unified Diff 写入 `AgentState.pending_writes`；同一路径的后续写入会合并为最终版本，后续 `read_file` 可读取暂存内容。Agent 结束或达到停止条件后，Worker 仅发射一次 `batch_confirmation_signal` 并阻塞等待。代码区新增 `BatchDiffWidget`，列出每个文件及 `+X/-Y`，点击列表可切换对应 Diff 标签；主操作改为“全部应用/全部拒绝”。全部应用会先预检整批文件哈希，再逐文件原子写入；中途失败执行已写子集回滚。全部拒绝、停止任务、关闭窗口或确认切换工作区时清空整批内容，磁盘不变。
+- **涉及文件**：`agent/state.py`、`agent/loop.py`、`tools/filesystem.py`、`tools/registry.py`、`gui/worker.py`、`gui/widgets.py`、`gui/main_window.py`、`gui/theme.py`、`tests/test_filesystem_tools.py`、`tests/test_extensions.py`、`tests/test_gui.py`
+- **测试结果**：通过。覆盖 3 文件批次一次批准全部落盘、一次拒绝全部不变、批次列表与 Diff 标签、暂存版本可读、批量哈希冲突零写入、标签/窗口关闭保护、停止清理及工作区切换前丢弃。
+- **遗留问题**：为避免产生基于旧磁盘内容的虚假测试结果，存在待审批写入时 `run_command` 和 `delete_file` 会返回 `pending_writes_require_confirmation`，提示模型结束规划并等待审批；批准后可在下一任务中运行测试。单文件独立勾选属于可选能力，本轮按要求提供全局“全部应用/全部拒绝”。
+
+## [2026-08-30 10:38] 第8轮 任务 #2 - 移除审批系统气泡
+
+- **修改内容**：删除审批开始时 `ConversationStore.add_message(role="system")` 以及应用/拒绝时 `update_waiting_message()` 的调用路径。审批结果仅通过状态栏、等待指示器、工具状态和事件日志反馈；会话消息列表不再产生“需要确认”“已允许修改”或“已拒绝修改”的黄色系统气泡。
+- **涉及文件**：`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。单文件与 3 文件批次在应用、拒绝两条路径中均验证会话消息不存在 `role=system` 的审批记录，同时修改日志和拒绝日志仍正常显示。
+- **遗留问题**：工作区未打开等真正的系统错误仍可使用系统消息；本次仅移除冗余的 Diff 审批状态气泡。
+
+## [2026-08-30 10:38] 第8轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q
+# 53 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 125 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试均使用 FakeProvider、offscreen Qt 和临时工作区，不访问真实 API。`git diff --check` 未发现空白错误，仅有 Git 对 Windows 工作区 LF→CRLF 的常规提示。
+
+---
+
+## [2026-08-30 11:39] 第9轮 任务 #1 - 修复新会话模型思考卡顿
+
+- **修改内容**：定位到两处叠加根因：工作区快照会复制 `.venv`、`.git`、pytest 临时目录等大体积非项目文件；流式请求遇到网络超时后还会隐式再发一次非流式请求，外层重试会继续放大等待。快照现仅覆盖项目源文件并保留排除目录，实测当前工作区由 535 文件/约 4.1 秒降至 50 文件/约 0.15 秒；流式适配器仅在网关明确不支持 streaming 时降级，连接/超时异常直接交给有界重试。Worker 每次任务重新创建 stop/confirmation Event，空闲新会话清理审批、流缓冲和等待 UI；各阶段输出带时间戳与 conversation_id 的安全诊断，超过 `CEREBRO_STAGE_WARN_SECONDS`（默认 10 秒）会在日志区报警。
+- **涉及文件**：`gui/worker.py`、`gui/main_window.py`、`agent/context.py`、`providers/openai_compatible.py`、`utils/snapshot.py`、`tests/test_context.py`、`tests/test_extensions.py`、`tests/test_providers.py`、`tests/test_gui.py`
+- **测试结果**：通过。覆盖新建会话后立即发送简单任务、旧审批/Event/流状态清理、上下文消息数与 Token 估算日志、快照排除与回退保留、网络超时不产生隐藏的第二次请求。
+- **遗留问题**：真实 DeepSeek-V4-Flash 的服务端排队和本机 DNS/代理仍属于外部耗时；现在会被精确标记为“阶段5: 调用模型”，10 秒出现警告，并受 `AGENT_API_TIMEOUT` 限制，不再伪装成无反馈卡死。
+
+## [2026-08-30 11:39] 第9轮 任务 #2 - 修复首次 ls/dir 失败
+
+- **修改内容**：确认首次失败来自工具白名单缺少 `ls/dir`，而非 Shell 预热。`run_command` 现显式解析绝对工作目录、继承进程 PATH 后再移除密钥类变量；Windows 下以本地 Python 目录枚举安全实现 `ls`/`dir`，不调用 shell、不允许逃逸工作区，并支持常见列表参数。入口和返回均记录 cwd、argv、PATH 是否存在/条目数、returncode、耗时及失败输出尾部，但不打印 PATH 值或凭据。
+- **涉及文件**：`tools/shell.py`、`tests/test_shell.py`
+- **测试结果**：通过。新工作区第一次调用 `ls` 即返回文件与目录，PATH 继承、敏感变量过滤、超时、取消、路径逃逸和 shell 可执行文件拒绝测试均通过。
+- **遗留问题**：Windows 的便携别名只实现目录查看所需的 `-a/-l/-la/--all` 与 `/a,/b`；复杂 shell 管道和重定向仍按安全设计禁止。
+
+## [2026-08-30 11:39] 第9轮 任务 #3 - 强化用户计划遵循
+
+- **修改内容**：系统提示新增“用户明确计划即执行契约”，要求逐项遵循顺序、目标文件、排除项和停止点，禁止无目的读取/测试无关文件。`read_file` Schema 同步声明不得推测性扫描。对于“不要读取任何现有文件 / do not read existing files”等明确禁令，核心循环会生成确定性的工具禁用策略；即使模型仍发起 `read_file`，注册表也返回 `task_scope_violation`，促使模型按用户计划重新决策，而不会触碰文件。
+- **涉及文件**：`prompts/system.md`、`agent/loop.py`、`tools/registry.py`、`tools/schemas.py`、`tests/test_agent_loop.py`
+- **测试结果**：通过。FakeProvider 故意偏离计划发起读取时被本地策略阻止，随后可继续形成最终回答；常规读取、修改、测试闭环未受影响。
+- **遗留问题**：仅对用户明确写出的禁止读取约束做硬拦截，避免从模糊自然语言过度推断而误伤正常代码诊断；其他计划约束由强化后的系统提示执行。
+
+## [2026-08-30 11:39] 第9轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 133 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试均使用 FakeProvider、offscreen Qt、临时工作区与本地子进程，不访问真实 API。当前项目工作区快照烟雾测试为 50 个文件、约 151ms；`git diff --check` 未发现空白错误，仅有 Windows 的 LF→CRLF 常规提示。

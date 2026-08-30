@@ -242,6 +242,24 @@ class ConversationStore:
                 self.save()
                 return
 
+    def update_message_content(
+        self,
+        conversation_id: str,
+        index: int,
+        content: str,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Replace one message body, used by throttled streaming updates."""
+
+        conversation = self.get(conversation_id)
+        if conversation is None or not 0 <= index < len(conversation.messages):
+            return False
+        conversation.messages[index]["content"] = content
+        if persist:
+            self.save()
+        return True
+
     def delete_message(self, conversation_id: str, index: int) -> bool:
         """Delete one message permanently and recalculate the session title."""
 

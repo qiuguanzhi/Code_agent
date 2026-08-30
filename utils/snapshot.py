@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import shutil
 import stat
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,32 @@ from tools.filesystem import sha256_file_streaming
 
 SNAPSHOT_META_KEY = "::mini-coding-agent-snapshot-v1::"
 _BACKUP_ROOTS: dict[Path, Path] = {}
+SNAPSHOT_EXCLUDED_DIRECTORIES: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".idea",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".vscode",
+        "__pycache__",
+        "node_modules",
+        "venv",
+    }
+)
+
+
+def _is_snapshot_excluded_directory(name: str) -> bool:
+    """Recognize dependency, VCS, IDE, and transient test-output directories."""
+
+    return (
+        name in SNAPSHOT_EXCLUDED_DIRECTORIES
+        or name.startswith(".pytest-run-")
+        or name == ".pytest-local-tmp"
+        or name.endswith(".egg-info")
+    )
 
 
 def _cleanup_backups() -> None:
@@ -42,13 +71,16 @@ def _resolve_workspace(workspace_root: Path | str) -> Path:
 
 
 def _relative_regular_files(root: Path) -> list[tuple[str, Path]]:
-    """List regular files deterministically without following symbolic links."""
+    """List source files without following links or copying dependency caches."""
 
     files: list[tuple[str, Path]] = []
     for current_root, directory_names, file_names in os.walk(root, followlinks=False):
         current_path = Path(current_root)
         directory_names[:] = sorted(
-            name for name in directory_names if not (current_path / name).is_symlink()
+            name
+            for name in directory_names
+            if not _is_snapshot_excluded_directory(name)
+            and not (current_path / name).is_symlink()
         )
         for file_name in sorted(file_names):
             candidate = current_path / file_name
@@ -62,7 +94,28 @@ def _relative_regular_files(root: Path) -> list[tuple[str, Path]]:
     return files
 
 
-def save_workspace_snapshot(workspace_root: Path | str) -> dict[str, str]:
+def _copy_with_sha256(source: Path, destination: Path) -> str:
+    """Copy and hash in one source read, then preserve file metadata."""
+
+    digest = hashlib.sha256()
+    with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+        while True:
+            chunk = input_stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            output_stream.write(chunk)
+    shutil.copystat(source, destination, follow_symlinks=False)
+    return digest.hexdigest()
+
+
+SnapshotProgressCallback = Callable[[int, int, str], None]
+
+
+def save_workspace_snapshot(
+    workspace_root: Path | str,
+    progress_callback: SnapshotProgressCallback | None = None,
+) -> dict[str, str]:
     """Copy workspace files to a private temporary backup and return a manifest.
 
     Values remain JSON strings so the established ``dict[str, str]`` state
@@ -70,6 +123,7 @@ def save_workspace_snapshot(workspace_root: Path | str) -> dict[str, str]:
     model-accessible through workspace tools, and is cleaned at process exit.
     """
 
+    started_at = time.perf_counter()
     root = _resolve_workspace(workspace_root)
     backup_root = Path(tempfile.mkdtemp(prefix="mini-coding-agent-snapshot-"))
     try:
@@ -91,24 +145,42 @@ def save_workspace_snapshot(workspace_root: Path | str) -> dict[str, str]:
         )
     }
     try:
-        for relative_path, candidate in _relative_regular_files(root):
+        scan_started_at = time.perf_counter()
+        files = _relative_regular_files(root)
+        scan_duration_ms = (time.perf_counter() - scan_started_at) * 1_000
+        total = len(files)
+        if progress_callback is not None:
+            progress_callback(0, total, "")
+        for completed, (relative_path, candidate) in enumerate(files, start=1):
             backup_path = backup_root / Path(relative_path)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(candidate, backup_path)
+            source_hash = _copy_with_sha256(candidate, backup_path)
             backup_stat = backup_path.stat()
             snapshot[relative_path] = json.dumps(
                 {
-                    "sha256": sha256_file_streaming(backup_path),
+                    "sha256": source_hash,
                     "mtime_ns": backup_stat.st_mtime_ns,
                     "mode": stat.S_IMODE(backup_stat.st_mode),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            if progress_callback is not None and (
+                total <= 100
+                or completed == total
+                or completed % max(1, total // 100) == 0
+            ):
+                progress_callback(completed, total, relative_path)
     except (OSError, RuntimeError, ValueError):
         shutil.rmtree(backup_root, ignore_errors=True)
         _BACKUP_ROOTS.pop(backup_root, None)
         raise
+    duration_ms = (time.perf_counter() - started_at) * 1_000
+    print(
+        "[Cerebro::Snapshot] "
+        f"workspace={root} files={total} scan_ms={scan_duration_ms:.1f} "
+        f"total_ms={duration_ms:.1f}"
+    )
     return snapshot
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ UpdateCallback = Callable[[dict[str, Any]], None]
 ConfirmWriteCallback = Callable[[str], bool]
 SleepCallback = Callable[[float], None]
 StopCallback = Callable[[], bool]
+TokenCallback = Callable[[str], None]
 
 
 class ModelRetryExhausted(RuntimeError):
@@ -44,10 +46,12 @@ class AgentConfig:
     max_same_call: int = 3
     mode: str = "auto"
     interactive: bool = False
+    batch_writes: bool = False
     verbose: bool = False
     confirm_write: ConfirmWriteCallback | None = None
     sleep_fn: SleepCallback = field(default=time.sleep, repr=False)
     should_stop: StopCallback | None = field(default=None, repr=False)
+    on_token: TokenCallback | None = field(default=None, repr=False)
     system_prompt_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -66,7 +70,7 @@ class AgentConfig:
             raise ValueError("max_api_attempts must be positive")
         if self.retry_base_seconds < 0:
             raise ValueError("retry_base_seconds cannot be negative")
-        if self.interactive and self.confirm_write is None:
+        if self.interactive and not self.batch_writes and self.confirm_write is None:
             raise ValueError("interactive mode requires confirm_write")
 
 
@@ -128,6 +132,8 @@ def call_model_with_retry(
         if cfg.should_stop is not None and cfg.should_stop():
             raise AgentStopRequested("user requested stop")
         try:
+            if cfg.on_token is not None:
+                return cfg.provider.complete_stream(messages, tools, cfg.on_token)
             return cfg.provider.complete(messages, tools)
         except Exception as exc:
             if cfg.should_stop is not None and cfg.should_stop():
@@ -161,6 +167,29 @@ def _load_system_prompt(cfg: AgentConfig) -> str:
     if cfg.mode == "goal":
         return before + goal_block.strip() + after
     return before + after
+
+
+def _forbidden_tools_from_task(task: str) -> set[str]:
+    """Extract only explicit tool prohibitions from the user's own wording.
+
+    This intentionally avoids guessing scope from vague requests. It provides
+    a deterministic backstop when a user explicitly says not to inspect/read
+    existing files, while the system prompt handles broader plan adherence.
+    """
+
+    chinese_no_read = re.compile(
+        r"(?:不要|禁止|无需|不需要|请勿|别)\s*"
+        r"(?:读取|查看|检查|打开|扫描)\s*"
+        r"(?:任何|全部|所有)?\s*(?:现有|已有|工作区(?:中|内)?)?\s*文件"
+    )
+    english_no_read = re.compile(
+        r"\b(?:do\s+not|don't|never)\s+"
+        r"(?:read|inspect|open|scan)\s+(?:any\s+)?(?:existing\s+)?files?\b",
+        re.IGNORECASE,
+    )
+    if chinese_no_read.search(task) or english_no_read.search(task):
+        return {"read_file"}
+    return set()
 
 
 def _decode_result(encoded: str) -> dict[str, Any]:
@@ -203,24 +232,81 @@ def run_agent(
         raise ValueError("task must be a non-empty string")
 
     state = AgentState(mode=cfg.mode)
+    _emit(on_update, "run_preparing", 0, "正在初始化 Agent 环境")
+    _emit(on_update, "snapshot_started", 0, "正在保存工作区快照")
+    snapshot_started = time.perf_counter()
+
+    def report_snapshot_progress(completed: int, total: int, path: str) -> None:
+        """Forward bounded snapshot progress without exposing backup paths."""
+
+        _emit(
+            on_update,
+            "snapshot_progress",
+            0,
+            "正在扫描工作区文件",
+            completed=completed,
+            total=total,
+            path=path,
+        )
+
     try:
-        state.initial_snapshot = save_workspace_snapshot(cfg.workspace)
+        state.initial_snapshot = save_workspace_snapshot(
+            cfg.workspace,
+            progress_callback=report_snapshot_progress,
+        )
     except (OSError, ValueError) as exc:
         answer = str(exc)
         _emit(on_update, "run_failed", 0, answer, reason="snapshot_error")
         return _stopped("failed", "snapshot_error", answer, state)
+    snapshot_duration_ms = (time.perf_counter() - snapshot_started) * 1_000
+    snapshot_file_count = max(0, len(state.initial_snapshot) - 1)
+    _emit(
+        on_update,
+        "snapshot_completed",
+        0,
+        "工作区快照已保存",
+        duration_ms=snapshot_duration_ms,
+        file_count=snapshot_file_count,
+    )
+    if cfg.verbose or snapshot_duration_ms > 500:
+        print(
+            f"[perf] snapshot files={snapshot_file_count} "
+            f"duration_ms={snapshot_duration_ms:.1f}"
+        )
 
+    prompt_started = time.perf_counter()
     state.messages = [
         {"role": "system", "content": _load_system_prompt(cfg)},
         {"role": "user", "content": task},
     ]
+    prompt_duration_ms = (time.perf_counter() - prompt_started) * 1_000
+    registry_started = time.perf_counter()
     registry = ToolRegistry(
         cfg.workspace,
-        write_policy={"require_confirmation": cfg.interactive},
+        write_policy={
+            "require_confirmation": cfg.interactive and not cfg.batch_writes
+        },
         max_same_call=cfg.max_same_call,
         confirm_write=cfg.confirm_write,
         should_stop=cfg.should_stop,
+        defer_writes=cfg.batch_writes,
+        forbidden_tools=_forbidden_tools_from_task(task),
     )
+    registry_duration_ms = (time.perf_counter() - registry_started) * 1_000
+    _emit(
+        on_update,
+        "registry_ready",
+        0,
+        "工具注册表已就绪",
+        duration_ms=registry_duration_ms,
+        tool_count=len(registry.schemas),
+    )
+    for stage_name, duration_ms in (
+        ("system_prompt", prompt_duration_ms),
+        ("tool_registry", registry_duration_ms),
+    ):
+        if cfg.verbose or duration_ms > 500:
+            print(f"[perf] {stage_name} duration_ms={duration_ms:.1f}")
     _emit(on_update, "run_started", 0, "Agent 已启动", mode=cfg.mode)
 
     for step in range(1, cfg.max_steps + 1):
@@ -233,6 +319,14 @@ def run_agent(
             _emit(on_update, "run_stopped", step, answer, reason="wall_time_limit")
             return _stopped("stopped", "wall_time_limit", answer, state)
 
+        _emit(
+            on_update,
+            "context_building",
+            step,
+            "正在构建模型上下文",
+            source_messages=len(state.messages),
+        )
+        context_started = time.perf_counter()
         try:
             request_messages = fit_context(
                 state.messages,
@@ -243,6 +337,21 @@ def run_agent(
             answer = str(exc)
             _emit(on_update, "run_failed", step, answer, reason="context_budget_error")
             return _stopped("failed", "context_budget_error", answer, state)
+
+        context_duration_ms = (time.perf_counter() - context_started) * 1_000
+        _emit(
+            on_update,
+            "context_ready",
+            step,
+            "模型上下文已就绪，准备连接服务",
+            duration_ms=context_duration_ms,
+            messages=len(request_messages),
+        )
+        if cfg.verbose or context_duration_ms > 500:
+            print(
+                f"[perf] context step={step} messages={len(request_messages)} "
+                f"duration_ms={context_duration_ms:.1f}"
+            )
 
         _emit(on_update, "model_request", step, "正在请求模型", messages=len(request_messages))
         model_started = time.perf_counter()
@@ -265,7 +374,7 @@ def run_agent(
             return _user_stopped(state, on_update)
 
         model_duration_ms = (time.perf_counter() - model_started) * 1_000
-        if cfg.verbose:
+        if cfg.verbose or model_duration_ms > 500:
             print(f"[perf] model step={step} duration_ms={model_duration_ms:.1f}")
 
         state.messages.append(turn.protocol_message)
@@ -313,7 +422,7 @@ def run_agent(
             )
             result = _decode_result(encoded_result)
             tool_duration_ms = (time.perf_counter() - tool_started) * 1_000
-            if cfg.verbose:
+            if cfg.verbose or tool_duration_ms > 500:
                 print(
                     f"[perf] tool={call.name} step={step} "
                     f"duration_ms={tool_duration_ms:.1f}"

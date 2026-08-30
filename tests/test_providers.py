@@ -142,6 +142,123 @@ def test_provider_normalizes_final_text_response() -> None:
     assert turn.protocol_message == {"role": "assistant", "content": "Done"}
 
 
+def test_provider_streams_text_deltas_and_returns_complete_turn() -> None:
+    """Forward native chunks while retaining a normalized final response."""
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="你", tool_calls=None),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="好", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    provider = OpenAICompatibleProvider(FakeClient(chunks), "fake-model")
+    deltas: list[str] = []
+
+    turn = provider.complete_stream([], get_tool_schemas(), deltas.append)
+
+    assert deltas == ["你", "好"]
+    assert turn.content == "你好"
+    assert turn.protocol_message == {"role": "assistant", "content": "你好"}
+    assert turn.finish_reason == "stop"
+    request = provider.client.chat.completions.last_request
+    assert request is not None and request["stream"] is True
+
+
+def test_stream_timeout_does_not_issue_hidden_nonstream_request() -> None:
+    """A transport timeout must be retried by the outer loop exactly once per attempt."""
+
+    class TimeoutCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **kwargs: Any) -> Any:
+            _ = kwargs
+            self.calls += 1
+            raise TimeoutError("network timeout")
+
+    completions = TimeoutCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    provider = OpenAICompatibleProvider(client, "fake-model")
+
+    with pytest.raises(TimeoutError, match="network timeout"):
+        provider.complete_stream([], get_tool_schemas(), lambda _delta: None)
+
+    assert completions.calls == 1
+
+
+def test_provider_accumulates_streamed_tool_call_json() -> None:
+    """Never expose or execute a streamed tool until its JSON is complete."""
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call-stream",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="read_file",
+                                    arguments='{"path":"main.py",',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type=None,
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments='"start_line":1,"max_lines":20,"max_chars":2000}',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+        ),
+    ]
+    provider = OpenAICompatibleProvider(FakeClient(chunks), "fake-model")
+
+    turn = provider.complete_stream([], get_tool_schemas(), lambda _delta: None)
+
+    assert len(turn.tool_calls) == 1
+    assert turn.tool_calls[0].id == "call-stream"
+    assert turn.tool_calls[0].name == "read_file"
+    assert '"max_chars":2000' in turn.tool_calls[0].arguments_json
+
+
 def test_provider_accepts_reasoning_alias_and_stores_protocol_field() -> None:
     """Normalize gateways that expose reasoning instead of reasoning_content."""
 
@@ -224,8 +341,22 @@ def test_deepseek_factory_reads_key_and_model_from_environment(
             "api_key": "test-key-from-env",
             "base_url": "https://api.deepseek.com",
             "max_retries": 0,
+            "timeout": 10.0,
         }
     ]
+
+
+def test_factory_validates_explicit_transport_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep DNS/connect stalls bounded by an environment-configurable timeout."""
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("AGENT_MODEL", "test-model")
+    monkeypatch.setenv("AGENT_API_TIMEOUT", "invalid")
+
+    with pytest.raises(ProviderConfigurationError, match="must be numeric"):
+        create_provider_from_env("deepseek", client_factory=RecordingClientFactory())
 
 
 def test_deepseek_goal_mode_enables_native_reasoning(

@@ -170,6 +170,41 @@ def test_run_agent_completes_read_write_run_finish_loop(tmp_path: Path) -> None:
     assert model_response["data"]["duration_ms"] >= 0
     assert tool_result["data"]["duration_ms"] >= 0
     assert "请始终使用中文" in str(provider.requests[0][0]["content"])
+    assert "user's explicit plan is an execution contract" in str(
+        provider.requests[0][0]["content"]
+    )
+
+
+def test_explicit_no_read_constraint_blocks_model_deviation(tmp_path: Path) -> None:
+    """Reject a speculative read when the user's plan explicitly forbids reads."""
+
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    provider = FakeProvider(
+        [
+            _tool_turn(
+                "read-forbidden",
+                "read_file",
+                {
+                    "path": "calc.py",
+                    "start_line": 1,
+                    "max_lines": 20,
+                    "max_chars": 2_000,
+                },
+            ),
+            _final_turn("已遵循用户计划，不读取已有文件。"),
+        ]
+    )
+
+    result = run_agent(
+        "创建一个全新的说明文件，不要读取任何现有文件。",
+        AgentConfig(workspace=workspace, provider=provider),
+    )
+
+    assert result.status == "completed"
+    observed = provider.requests[1][-1]
+    payload = json.loads(observed["content"])
+    assert observed["role"] == "tool"
+    assert payload["error"]["code"] == "task_scope_violation"
 
 
 def test_run_agent_retries_transient_model_errors(tmp_path: Path) -> None:

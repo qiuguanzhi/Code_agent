@@ -148,3 +148,19 @@ def test_fit_context_rejects_impossibly_small_budget() -> None:
     with pytest.raises(ContextBudgetError):
         fit_context(messages, [{"schema": "x" * 500}], input_budget=10)
 
+
+def test_fit_context_reports_safe_size_diagnostics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fitted = fit_context(
+        [{"role": "user", "content": "列出当前目录"}],
+        [],
+        input_budget=1_000,
+    )
+
+    output = capsys.readouterr().out
+    assert fitted == [{"role": "user", "content": "列出当前目录"}]
+    assert "[Cerebro::Context]" in output
+    assert "messages=1" in output
+    assert "estimated_tokens=" in output
+    assert "列出当前目录" not in output

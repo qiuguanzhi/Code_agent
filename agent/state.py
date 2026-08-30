@@ -41,6 +41,7 @@ class AgentState:
     tool_result_cache: dict[str, str] = field(default_factory=dict)
     changed_files: dict[str, str] = field(default_factory=dict)
     changed_file_hashes: dict[str, str] = field(default_factory=dict)
+    pending_writes: list[dict[str, Any]] = field(default_factory=list)
     last_test_result: str | None = None
     initial_snapshot: dict[str, str] = field(default_factory=dict)
     reasoning: str = ""

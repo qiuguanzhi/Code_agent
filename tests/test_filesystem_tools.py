@@ -2,7 +2,15 @@
 
 from pathlib import Path
 
-from tools.filesystem import read_file, sha256_file_streaming, write_file
+from tools.filesystem import (
+    apply_staged_writes,
+    delete_file,
+    read_file,
+    read_staged_file,
+    sha256_file_streaming,
+    stage_write_file,
+    write_file,
+)
 
 
 def test_read_file_returns_next_line_for_pagination(tmp_path: Path) -> None:
@@ -128,3 +136,111 @@ def test_file_tools_reject_parent_directory_escape(tmp_path: Path) -> None:
     assert write_result["ok"] is False
     assert write_result["error"]["code"] == "path_violation"
     assert secret.read_text(encoding="utf-8") == "do not change"
+
+
+def test_delete_file_requires_current_hash_and_reports_deleted_path(tmp_path: Path) -> None:
+    """Delete only the exact file version the Agent previously inspected."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "verify.py"
+    target.write_text("assert True\n", encoding="utf-8")
+    expected_hash = sha256_file_streaming(target)
+
+    conflict = delete_file(workspace, "verify.py", "stale")
+    deleted = delete_file(workspace, "verify.py", expected_hash)
+
+    assert conflict["error"]["code"] == "hash_conflict"
+    assert deleted["ok"] is True
+    assert deleted["meta"]["path"] == "verify.py"
+    assert deleted["meta"]["deleted_sha256"] == expected_hash
+    assert target.exists() is False
+
+
+def test_delete_file_rejects_workspace_escape(tmp_path: Path) -> None:
+    """Deletion applies the same resolved workspace boundary as other tools."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("keep", encoding="utf-8")
+
+    result = delete_file(workspace, "../secret.txt", sha256_file_streaming(secret))
+
+    assert result["error"]["code"] == "path_violation"
+    assert secret.read_text(encoding="utf-8") == "keep"
+
+
+def test_staged_writes_are_readable_but_do_not_touch_disk_until_batch_apply(
+    tmp_path: Path,
+) -> None:
+    """Provide read-your-writes semantics while preserving approval isolation."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "first.py"
+    second = workspace / "second.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    second.write_text("value = 2\n", encoding="utf-8")
+    pending: list[dict[str, object]] = []
+
+    first_result = stage_write_file(
+        workspace,
+        "first.py",
+        "value = 10\n",
+        sha256_file_streaming(first),
+        pending_writes=pending,
+    )
+    second_result = stage_write_file(
+        workspace,
+        "second.py",
+        "value = 20\n",
+        sha256_file_streaming(second),
+        pending_writes=pending,
+    )
+    staged_page = read_staged_file("first.py", str(pending[0]["content"]))
+
+    assert first_result["meta"]["staged"] is True
+    assert second_result["meta"]["pending_count"] == 2
+    assert staged_page["data"] == "value = 10\n"
+    assert first.read_text(encoding="utf-8") == "value = 1\n"
+    assert second.read_text(encoding="utf-8") == "value = 2\n"
+
+    applied = apply_staged_writes(workspace, pending)
+
+    assert applied["ok"] is True
+    assert first.read_text(encoding="utf-8") == "value = 10\n"
+    assert second.read_text(encoding="utf-8") == "value = 20\n"
+
+
+def test_batch_preflight_conflict_prevents_every_write(tmp_path: Path) -> None:
+    """Reject a conflicting batch before applying even its conflict-free files."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "first.py"
+    second = workspace / "second.py"
+    first.write_text("first = 1\n", encoding="utf-8")
+    second.write_text("second = 1\n", encoding="utf-8")
+    pending: list[dict[str, object]] = []
+    stage_write_file(
+        workspace,
+        "first.py",
+        "first = 2\n",
+        sha256_file_streaming(first),
+        pending_writes=pending,
+    )
+    stage_write_file(
+        workspace,
+        "second.py",
+        "second = 2\n",
+        sha256_file_streaming(second),
+        pending_writes=pending,
+    )
+    second.write_text("external = True\n", encoding="utf-8")
+
+    result = apply_staged_writes(workspace, pending)
+
+    assert result["error"]["code"] == "hash_conflict"
+    assert first.read_text(encoding="utf-8") == "first = 1\n"
+    assert second.read_text(encoding="utf-8") == "external = True\n"

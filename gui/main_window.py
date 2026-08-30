@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 from gui.session import Conversation, ConversationStore
 from gui.theme import get_theme
 from gui.widgets import (
+    BatchDiffWidget,
     BrainWaveIndicator,
     CerebroBackground,
     ConversationScrollArea,
@@ -136,6 +137,8 @@ class MainWindow(QMainWindow):
         self._close_pending = False
         self._awaiting_confirmation = False
         self._pending_write_path = ""
+        self._pending_write_paths: list[str] = []
+        self._queued_workspace_switch: Path | None = None
         self._workspace_collapsed = False
         self._workspace_saved_width = 200
         self.workspace_files: set[str] = set()
@@ -156,6 +159,9 @@ class MainWindow(QMainWindow):
         self.performance_metrics: dict[str, float] = {}
         self._mention_span: tuple[int, int] | None = None
         self._updating_mention_text = False
+        self._stream_message_indices: dict[str, int] = {}
+        self._stream_buffers: dict[str, str] = {}
+        self._loading_base_text = "初始化环境"
 
         self.setWindowTitle("Cerebro Coding Agent")
         self.setAcceptDrops(True)
@@ -335,7 +341,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.select_workspace_button)
         toolbar.addSeparator()
 
-        self.save_snapshot_button = QPushButton("💾 保存快照", self)
+        self.save_snapshot_button = QPushButton("📸 创建快照", self)
         self.save_snapshot_button.setObjectName("saveSnapshotButton")
         self.save_snapshot_button.clicked.connect(self._save_snapshot)
         toolbar.addWidget(self.save_snapshot_button)
@@ -630,16 +636,20 @@ class MainWindow(QMainWindow):
         manual_row.addWidget(self.manual_save_button)
         layout.addLayout(manual_row)
 
+        self.batch_diff_widget = BatchDiffWidget(panel)
+        self.batch_diff_widget.file_selected.connect(self._select_batch_diff)
+        layout.addWidget(self.batch_diff_widget)
+
         self.decision_widget = QWidget(panel)
         decisions = QHBoxLayout(self.decision_widget)
         decisions.setContentsMargins(0, 0, 0, 0)
         decisions.addStretch(1)
-        self.apply_button = QPushButton("应用修改", panel)
+        self.apply_button = QPushButton("全部应用", panel)
         self.apply_button.setObjectName("applyButton")
         self.apply_button.setEnabled(False)
         self.apply_button.clicked.connect(self._apply_pending_change)
         decisions.addWidget(self.apply_button)
-        self.reject_button = QPushButton("拒绝", panel)
+        self.reject_button = QPushButton("全部拒绝", panel)
         self.reject_button.setObjectName("rejectButton")
         self.reject_button.setEnabled(False)
         self.reject_button.clicked.connect(self._reject_pending_change)
@@ -704,12 +714,13 @@ class MainWindow(QMainWindow):
         self.worker.code_signal.connect(self.update_code)
         self.worker.diff_signal.connect(self.update_diff)
         self.worker.status_signal.connect(self.update_status)
-        self.worker.confirmation_signal.connect(self._mark_confirmation_pending)
+        self.worker.batch_confirmation_signal.connect(self._mark_confirmation_pending)
         self.worker.snapshot_signal.connect(self._store_agent_snapshot)
         self.worker.finished_signal.connect(self._handle_worker_finished)
         self.worker.progress_signal.connect(self._append_process_update)
         self.worker.reasoning_signal.connect(self._append_reasoning)
         self.worker.tool_status_signal.connect(self.update_tool_status)
+        self.worker.stream_signal.connect(self._append_stream_delta)
         self.confirm_signal.connect(self.worker.resolve_write_confirmation)
         try:
             self.worker.start_agent(
@@ -717,6 +728,7 @@ class MainWindow(QMainWindow):
                 self.workspace_root,
                 self.max_steps,
                 self.interactive_confirmation,
+                conversation.id,
             )
         except (RuntimeError, ValueError) as exc:
             self._disconnect_confirmation()
@@ -877,7 +889,11 @@ class MainWindow(QMainWindow):
             "label": label,
             "color": color,
             "message": message,
-            "visible": step == 0 or label.startswith("modified "),
+            "visible": (
+                step == 0
+                or label.startswith("modified ")
+                or label in {"filesystem_create", "filesystem_delete"}
+            ),
         }
         self.session_store.add_log(
             record,
@@ -889,6 +905,8 @@ class MainWindow(QMainWindow):
             self._pending_log_html.append(self._format_log_html(record))
             if not self.log_flush_timer.isActive():
                 self.log_flush_timer.start()
+        if label in {"filesystem_create", "filesystem_delete"}:
+            self._populate_workspace_files()
         self._record_ui_timing("log_enqueue_ms", started)
 
     @Slot()
@@ -999,6 +1017,16 @@ class MainWindow(QMainWindow):
         if not color.startswith("#"):
             color = self.theme_colors["accent"]
         message = str(record.get("message", "")).strip()
+        if label == "filesystem_create":
+            return (
+                f'<span style="color:{self.theme_colors["success"]}; font-weight:600">'
+                f'📄 [Cerebro::Filesystem] 创建验证文件: {escape(message)}</span>'
+            )
+        if label == "filesystem_delete":
+            return (
+                f'<span style="color:{self.theme_colors["warning"]}; font-weight:600">'
+                f'🗑️ [Cerebro::Filesystem] 删除验证文件: {escape(message)}</span>'
+            )
         suffix = f" - {escape(message)}" if message else ""
         try:
             thread_number = max(0, int(step))
@@ -1190,7 +1218,9 @@ class MainWindow(QMainWindow):
         """Show an immediate native indeterminate progress animation."""
 
         self._loading_tick = 0
-        self.loading_label.setText("思考中")
+        self._loading_base_text = "初始化环境"
+        self.loading_bar.setRange(0, 0)
+        self.loading_label.setText(self._loading_base_text)
         self.loading_container.setVisible(True)
         self.loading_timer.start()
 
@@ -1206,7 +1236,9 @@ class MainWindow(QMainWindow):
         """Animate the thinking label while the native bar is indeterminate."""
 
         self._loading_tick = (self._loading_tick + 1) % 4
-        self.loading_label.setText("思考中" + "." * self._loading_tick)
+        self.loading_label.setText(
+            self._loading_base_text.rstrip(".") + "." * self._loading_tick
+        )
 
     @Slot(str, str)
     def update_code(self, file_path: str, content: str) -> None:
@@ -1559,7 +1591,7 @@ class MainWindow(QMainWindow):
         if key is not None and self._tab_has_pending_diff(key):
             if not self._confirm_discard_pending("tab"):
                 return
-            if self._awaiting_confirmation and self._pending_write_path == key:
+            if self._awaiting_confirmation:
                 self._reject_pending_change()
             else:
                 self._clear_diff_decoration(key, clear_code=False)
@@ -1626,7 +1658,7 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Warning)
         if scope == "window":
             box.setWindowTitle("退出确认")
-            box.setText("仍有未应用的修改，是否放弃并退出？")
+            box.setText("有未处理的修改，是否放弃？")
             discard_text = "放弃并退出"
         elif scope == "workspace":
             box.setWindowTitle("切换工作区")
@@ -1669,25 +1701,79 @@ class MainWindow(QMainWindow):
             "border-radius:8px; padding:5px 9px;"
         )
         self.statusBar().showMessage(message)
+        stage_match = re.search(r"阶段\s*([1-5])/5[：:]?\s*(.*)", message)
+        if normalized == "running" and stage_match is not None:
+            stage = int(stage_match.group(1))
+            stage_text = stage_match.group(2).strip() or f"阶段 {stage}/5"
+            self.loading_bar.setRange(0, 5)
+            self.loading_bar.setValue(stage)
+            self._loading_base_text = f"{stage}/5 {stage_text}"
+            self.loading_label.setText(self._loading_base_text)
+
+    @Slot(str, str)
+    def _append_stream_delta(self, session_id: str, delta: str) -> None:
+        """Append streamed assistant text without rebuilding existing bubbles."""
+
+        target_id = session_id or self._running_session_id
+        if not target_id or not delta:
+            return
+        conversation = self.session_store.get(target_id)
+        if conversation is None:
+            return
+        index = self._stream_message_indices.get(target_id)
+        if index is None:
+            self.session_store.add_message(
+                "assistant",
+                "",
+                conversation_id=target_id,
+            )
+            index = len(conversation.messages) - 1
+            self._stream_message_indices[target_id] = index
+            self._stream_buffers[target_id] = ""
+            if target_id == self.session_store.active_id:
+                self._render_active_session()
+        content = self._stream_buffers.get(target_id, "") + delta
+        self._stream_buffers[target_id] = content
+        self.session_store.update_message_content(
+            target_id,
+            index,
+            content,
+            persist=False,
+        )
+        self._schedule_session_save()
+        if target_id == self.session_store.active_id:
+            self.conversation_view.update_message_content(target_id, index, content)
 
     @Slot(bool, str)
     def _handle_worker_finished(self, success: bool, message: str) -> None:
         """Store the Agent reply and restore controls without adding verbose logs."""
 
         session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.add_message("assistant", message, conversation_id=session_id)
+        stream_index = self._stream_message_indices.pop(session_id, None)
+        self._stream_buffers.pop(session_id, None)
+        if stream_index is None:
+            self.session_store.add_message("assistant", message, conversation_id=session_id)
+        else:
+            self.session_store.update_message_content(
+                session_id,
+                stream_index,
+                message,
+            )
         is_active = session_id == self.session_store.active_id
         stopped_by_user = "原因：user_stopped" in message
+        rejected_by_user = "原因：user_rejected_batch" in message
         self._awaiting_confirmation = False
         self._pending_write_path = ""
+        self._pending_write_paths.clear()
+        self.batch_diff_widget.clear_batch()
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
         self._disconnect_confirmation()
         self._running_session_id = None
         first_line = message.splitlines()[0] if message else "Agent 已结束"
-        if stopped_by_user:
-            first_line = "已停止"
+        if stopped_by_user or rejected_by_user:
+            first_line = "已停止" if stopped_by_user else "已拒绝全部修改"
         if is_active:
             self._render_active_session()
             self.task_input.setEnabled(True)
@@ -1695,7 +1781,9 @@ class MainWindow(QMainWindow):
             self._set_send_button_mode(False)
             self._stop_loading()
             self._stop_waiting_indicator()
-            final_state = "ready" if success or stopped_by_user else "error"
+            final_state = (
+                "ready" if success or stopped_by_user or rejected_by_user else "error"
+            )
             self.update_status(final_state, first_line)
         else:
             # The completed run belongs to a background session.  Its answer is
@@ -1703,6 +1791,13 @@ class MainWindow(QMainWindow):
             self._sync_active_run_controls()
         if self._close_pending:
             QTimer.singleShot(0, self.close)
+        elif self._queued_workspace_switch is not None:
+            queued_workspace = self._queued_workspace_switch
+            self._queued_workspace_switch = None
+            QTimer.singleShot(
+                0,
+                lambda workspace=queued_workspace: self._activate_workspace(workspace),
+            )
 
     def _disconnect_confirmation(self) -> None:
         """Disconnect the current worker decision slot if connected."""
@@ -1714,91 +1809,95 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    @Slot(str)
-    def _mark_confirmation_pending(self, path: str) -> None:
-        """Show a persistent conversation and input-adjacent waiting cue."""
+    @Slot(object)
+    def _mark_confirmation_pending(self, payload: object) -> None:
+        """Render one complete staged-write batch without adding chat bubbles."""
 
+        if not isinstance(payload, list):
+            return
+        pending = [dict(item) for item in payload if isinstance(item, dict)]
+        if not pending:
+            return
+        self._pending_write_paths = []
+        for item in pending:
+            path = item.get("path")
+            diff_text = item.get("diff")
+            if not isinstance(path, str) or not isinstance(diff_text, str):
+                continue
+            additions, deletions = AgentWorker._count_diff_changes(diff_text)
+            self._pending_write_paths.append(path)
+            self.update_diff(path, diff_text, additions, deletions)
+        if not self._pending_write_paths:
+            return
         self._awaiting_confirmation = True
-        self._pending_write_path = path
-        state = self._tab_previews.get(path)
-        if state is not None:
-            state["pending"] = True
-        session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.add_message(
-            "system",
-            "✋ 需要您确认才能继续",
-            conversation_id=session_id,
-            waiting=True,
+        self._pending_write_path = self._pending_write_paths[0]
+        self.batch_diff_widget.set_pending_writes(pending)
+        self._select_batch_diff(self._pending_write_path)
+        self.apply_button.setEnabled(True)
+        self.reject_button.setEnabled(True)
+        self.decision_widget.setVisible(True)
+        self.waiting_indicator.setVisible(True)
+        self.waiting_timer.start()
+        self.update_status(
+            "running",
+            f"等待批量审批：{len(self._pending_write_paths)} 个文件",
         )
-        if session_id == self.session_store.active_id:
-            self.apply_button.setEnabled(True)
-            self.reject_button.setEnabled(True)
-            self.decision_widget.setVisible(True)
-            self._render_active_session()
-            self.waiting_indicator.setVisible(True)
-            self.waiting_timer.start()
-            self.update_status("running", f"等待确认修改：{path}")
+
+    @Slot(str)
+    def _select_batch_diff(self, path: str) -> None:
+        """Activate the code tab that owns one batch-list row."""
+
+        editor = self._tab_editors.get(path)
+        if editor is not None:
+            self.code_tabs.setCurrentWidget(editor)
+            self.code_view = editor
+            self._render_code_tab(path)
 
     @Slot()
     def _apply_pending_change(self) -> None:
-        """Approve the visible Diff and release the blocked worker."""
+        """Approve every staged Diff and release the blocked worker once."""
 
         if not self._awaiting_confirmation:
             return
-        path = self._pending_write_path
-        state = self._tab_previews.get(path, {})
-        step = state.get("step", 0)
-        safe_step = step if isinstance(step, int) and not isinstance(step, bool) else 0
-        additions = state.get("additions", 0)
-        deletions = state.get("deletions", 0)
-        safe_additions = additions if isinstance(additions, int) else 0
-        safe_deletions = deletions if isinstance(deletions, int) else 0
+        paths = list(self._pending_write_paths)
         self._awaiting_confirmation = False
         self._pending_write_path = ""
+        self._pending_write_paths.clear()
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
-        self._clear_diff_decoration(path, clear_code=False)
-        session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.update_waiting_message(
-            f"✅ 已允许修改：{path}",
-            conversation_id=session_id,
-        )
-        if session_id == self.session_store.active_id:
-            self._render_active_session()
-        self.update_log(
-            safe_step,
-            "📝",
-            f"modified {Path(path).name} (+{safe_additions} -{safe_deletions})",
-            "success",
-            "",
-        )
+        self.batch_diff_widget.clear_batch()
+        for path in paths:
+            self._clear_diff_decoration(path, clear_code=False)
         self._stop_waiting_indicator()
-        self.update_status("running", "已确认，Agent 继续执行")
+        self.update_status("running", f"正在应用 {len(paths)} 个文件...")
         self.confirm_signal.emit(True)
 
     @Slot()
     def _reject_pending_change(self) -> None:
-        """Reject the visible Diff, clear its editor, and return user_aborted."""
+        """Reject every staged Diff and release the blocked worker once."""
 
         if not self._awaiting_confirmation:
             return
-        path = self._pending_write_path
+        paths = list(self._pending_write_paths)
         self._awaiting_confirmation = False
         self._pending_write_path = ""
+        self._pending_write_paths.clear()
         self.apply_button.setEnabled(False)
         self.reject_button.setEnabled(False)
         self.decision_widget.setVisible(False)
-        self._clear_diff_decoration(path, clear_code=False)
-        session_id = self._running_session_id or self.session_store.active_id
-        self.session_store.update_waiting_message(
-            f"⛔ 已拒绝修改：{path}",
-            conversation_id=session_id,
-        )
-        if session_id == self.session_store.active_id:
-            self._render_active_session()
+        self.batch_diff_widget.clear_batch()
+        for path in paths:
+            self._clear_diff_decoration(path, clear_code=False)
         self._stop_waiting_indicator()
-        self.update_status("running", "已拒绝，Agent 将重新思考")
+        self.update_log(
+            0,
+            "⛔",
+            "批量修改",
+            "warning",
+            f"已拒绝 {len(paths)} 个文件",
+        )
+        self.update_status("running", "已拒绝全部修改，正在结束任务")
         self.confirm_signal.emit(False)
 
     @Slot()
@@ -1833,6 +1932,22 @@ class MainWindow(QMainWindow):
     def _new_session(self) -> None:
         """Create and display a new session without touching old histories."""
 
+        worker_running = self.worker is not None and self.worker.isRunning()
+        if not worker_running and self._running_session_id is None:
+            # A new conversation must not inherit an old approval wait, batch
+            # preview, stream buffer, or stop-button state. Keep these globals
+            # only while a real background session is still running.
+            self._disconnect_confirmation()
+            self._awaiting_confirmation = False
+            self._pending_write_path = ""
+            self._pending_write_paths.clear()
+            self.batch_diff_widget.clear_batch()
+            self.apply_button.setEnabled(False)
+            self.reject_button.setEnabled(False)
+            self.decision_widget.setVisible(False)
+            self._stop_waiting_indicator()
+            self._stream_buffers.clear()
+            self._stream_message_indices.clear()
         self.session_store.create()
         self._refresh_session_combo()
         self._render_active_session()
@@ -1888,6 +2003,7 @@ class MainWindow(QMainWindow):
                 self.apply_button.setEnabled(True)
                 self.reject_button.setEnabled(True)
                 self.decision_widget.setVisible(True)
+                self.batch_diff_widget.setVisible(True)
                 self.waiting_indicator.setVisible(True)
                 self.waiting_timer.start()
         else:
@@ -1897,6 +2013,7 @@ class MainWindow(QMainWindow):
             self.apply_button.setEnabled(False)
             self.reject_button.setEnabled(False)
             self.decision_widget.setVisible(False)
+            self.batch_diff_widget.setVisible(False)
 
     def _render_active_session(self) -> None:
         """Render modern left/right message bubbles and session activity."""
@@ -2030,6 +2147,16 @@ class MainWindow(QMainWindow):
         """Switch every workspace-dependent component to one directory."""
 
         if self.worker is not None and self.worker.isRunning():
+            if self._awaiting_confirmation:
+                if not self._confirm_discard_pending("workspace"):
+                    return
+                self._queued_workspace_switch = workspace
+                self._reject_pending_change()
+                self.update_status(
+                    "running",
+                    "已丢弃待审批修改，Agent 结束后切换工作区",
+                )
+                return
             self.update_status("error", "Agent 运行时不能切换工作区")
             return
         if self._has_pending_diffs():
@@ -2512,6 +2639,7 @@ class MainWindow(QMainWindow):
         """Persist UI state and defer destruction until the worker exits."""
 
         self.file_mention_popup.hide()
+        self._queued_workspace_switch = None
         if self._has_pending_diffs():
             if not self._confirm_discard_pending("window"):
                 event.ignore()

@@ -200,6 +200,47 @@ def _new_file_write_provider(path: str, content: str) -> FakeProvider:
     )
 
 
+def _multi_write_provider(
+    changes: list[tuple[Path, str]],
+) -> FakeProvider:
+    """Build one assistant turn that stages several independent file writes."""
+
+    calls: list[ToolCall] = []
+    protocol_calls: list[dict[str, Any]] = []
+    for index, (target, content) in enumerate(changes, start=1):
+        arguments_json = json.dumps(
+            {
+                "path": target.name,
+                "content": content,
+                "expected_sha256": sha256_file_streaming(target),
+            }
+        )
+        call_id = f"write-{index}"
+        calls.append(ToolCall(call_id, "write_file", arguments_json))
+        protocol_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "write_file", "arguments": arguments_json},
+            }
+        )
+    return FakeProvider(
+        [
+            AssistantTurn(
+                content=None,
+                tool_calls=calls,
+                protocol_message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": protocol_calls,
+                },
+                finish_reason="tool_calls",
+            ),
+            _final_turn("批量修改规划完成。"),
+        ]
+    )
+
+
 def _wait_until(
     app: QApplication,
     predicate: Callable[[], bool],
@@ -490,6 +531,53 @@ def test_worker_emits_exactly_one_compact_log_per_tool(
     assert finished_spy.at(0)[0] is True
 
 
+def test_worker_streams_answer_with_session_and_reports_five_startup_stages(
+    qt_app: QApplication,
+    workspace: Path,
+) -> None:
+    """Expose immediate startup progress and route streamed text by session id."""
+
+    worker = AgentWorker(provider=FakeProvider([_final_turn("分段回答")]))
+    stream_spy = QSignalSpy(worker.stream_signal)
+    status_spy = QSignalSpy(worker.status_signal)
+
+    worker.start_agent(
+        "回答问题",
+        workspace,
+        max_steps=2,
+        interactive=False,
+        session_id="session-stream",
+    )
+    assert worker.wait(2_000) is True
+    qt_app.processEvents()
+
+    assert stream_spy.count() == 1
+    assert list(stream_spy.at(0)) == ["session-stream", "分段回答"]
+    statuses = [str(status_spy.at(index)[1]) for index in range(status_spy.count())]
+    for stage in range(1, 6):
+        assert any(f"阶段 {stage}/5" in message for message in statuses)
+
+
+def test_filesystem_event_rows_use_cerebro_create_delete_format(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Render verification-file lifecycle records in the ordinary log view."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.update_log(1, "📄", "filesystem_create", "success", "verify.py")
+        window.update_log(2, "🗑️", "filesystem_delete", "warning", "verify.py")
+        window._flush_log_buffer()
+        text = window.log_view.toPlainText()
+        assert "📄 [Cerebro::Filesystem] 创建验证文件: verify.py" in text
+        assert "🗑️ [Cerebro::Filesystem] 删除验证文件: verify.py" in text
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_two_tools_produce_exactly_two_log_rows(
     qt_app: QApplication,
     workspace: Path,
@@ -549,7 +637,7 @@ def test_deep_mode_emits_narrative_and_quick_mode_emits_short_status(
     assert all("reasoning_content" not in summary for summary in quick_summaries)
 
 
-def test_worker_emits_diff_counts_for_real_interactive_write(
+def test_worker_emits_one_batch_for_real_interactive_write(
     qt_app: QApplication,
     workspace: Path,
 ) -> None:
@@ -562,30 +650,31 @@ def test_worker_emits_diff_counts_for_real_interactive_write(
         "        raise ValueError('zero')\n"
         "    return a / b\n"
     )
-    requested_paths: list[str] = []
+    requested_batches: list[list[dict[str, Any]]] = []
 
-    def approve(path: str) -> bool:
-        """Approve the injected confirmation without opening a dialog."""
+    def approve(batch: list[dict[str, Any]]) -> bool:
+        """Approve the injected batch without opening a dialog."""
 
-        requested_paths.append(path)
+        requested_batches.append(batch)
         return True
 
     worker = AgentWorker(
         provider=_write_provider(target, new_content),
         confirmation_callback=approve,
     )
-    diff_spy = QSignalSpy(worker.diff_signal)
+    batch_spy = QSignalSpy(worker.batch_confirmation_signal)
 
     worker.start_agent("修复除零", workspace, max_steps=4, interactive=True)
     assert worker.wait(2_000) is True
     qt_app.processEvents()
 
-    assert requested_paths == ["calc.py"]
+    assert len(requested_batches) == 1
+    assert [item["path"] for item in requested_batches[0]] == ["calc.py"]
     assert target.read_text(encoding="utf-8") == new_content
-    assert diff_spy.count() == 1
-    assert diff_spy.at(0)[0] == "calc.py"
-    assert "+    if b == 0:" in diff_spy.at(0)[1]
-    assert diff_spy.at(0)[2:] == [2, 0]
+    assert batch_spy.count() == 1
+    payload = batch_spy.at(0)[0]
+    assert isinstance(payload, list)
+    assert "+    if b == 0:" in payload[0]["diff"]
 
 
 def test_send_clears_input_and_binds_real_agent(
@@ -755,10 +844,14 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
         window.task_input.setText("修改 calc.py")
         window.send_button.click()
         assert _wait_until(qt_app, lambda: window._awaiting_confirmation)
-        assert "需要您确认" in window.conversation_view.toPlainText()
+        assert "需要您确认" not in window.conversation_view.toPlainText()
         assert window.waiting_indicator.isVisible() is True
         assert "Unified Diff" in window.code_view.toPlainText()
         assert window.decision_widget.isVisible() is True
+        assert window.batch_diff_widget.isVisible() is True
+        assert window.batch_diff_widget.file_list.count() == 1
+        assert window.apply_button.text() == "全部应用"
+        assert window.reject_button.text() == "全部拒绝"
 
         if confirmed:
             window.apply_button.click()
@@ -784,8 +877,10 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
                 window.theme_colors["success"].lstrip("#").casefold()
                 not in window.code_view.toHtml().casefold()
             )
-        resolved_text = "已允许修改" if confirmed else "已拒绝修改"
-        assert resolved_text in window.conversation_view.toPlainText()
+        assert all(
+            message.get("role") != "system"
+            for message in window.session_store.active.messages
+        )
         assert window.waiting_indicator.isVisible() is False
         if confirmed:
             assert (
@@ -794,8 +889,8 @@ def test_window_interactive_buttons_release_write_and_clear_rejected_preview(
             )
         else:
             assert "modified calc.py" not in window.log_view.toPlainText()
-        expected_icon = "✅" if confirmed else "↩"
-        assert window.tool_status_button.text().startswith(expected_icon)
+        expected_text = "✅ 批量修改" if confirmed else "↩ 批量修改"
+        assert window.tool_status_button.text().startswith(expected_text)
         assert window.decision_widget.isVisible() is False
     finally:
         if window.worker is not None and window.worker.isRunning():
@@ -849,6 +944,72 @@ def test_new_agent_file_also_requires_diff_approval(
             assert window.code_view.isReadOnly() is False
         else:
             assert window.code_view.toPlainText() == ""
+    finally:
+        if window.worker is not None and window.worker.isRunning():
+            window.confirm_signal.emit(False)
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_three_file_batch_applies_or_rejects_with_one_decision(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    confirmed: bool,
+) -> None:
+    """Show three selectable Diffs and commit none or all with one click."""
+
+    originals: dict[Path, str] = {}
+    changes: list[tuple[Path, str]] = []
+    for index in range(1, 4):
+        target = workspace / f"module_{index}.py"
+        original = f"value = {index}\n"
+        updated = f"value = {index * 10}\n"
+        target.write_text(original, encoding="utf-8")
+        originals[target] = original
+        changes.append((target, updated))
+    provider = _multi_write_provider(changes)
+
+    class BatchWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = BatchWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.task_input.setText("批量修改三个文件")
+        window.send_button.click()
+        assert _wait_until(qt_app, lambda: window._awaiting_confirmation)
+        assert window.batch_diff_widget.file_list.count() == 3
+        assert window.code_tabs.count() == 3
+        assert all(target.read_text(encoding="utf-8") == original for target, original in originals.items())
+        assert all(
+            message.get("role") != "system"
+            for message in window.session_store.active.messages
+        )
+
+        if confirmed:
+            window.apply_button.click()
+        else:
+            window.reject_button.click()
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+
+        for target, updated in changes:
+            expected = updated if confirmed else originals[target]
+            assert target.read_text(encoding="utf-8") == expected
+        assert window.batch_diff_widget.isHidden() is True
+        assert window.decision_widget.isHidden() is True
+        assert all(
+            message.get("role") != "system"
+            for message in window.session_store.active.messages
+        )
+        if not confirmed:
+            assert "已拒绝 3 个文件" in window.log_view.toPlainText()
     finally:
         if window.worker is not None and window.worker.isRunning():
             window.confirm_signal.emit(False)
@@ -981,6 +1142,47 @@ def test_pending_diff_window_close_can_cancel_or_discard(
     assert window.worker.wait(2_000) is True
     assert _wait_until(qt_app, lambda: not window.isVisible())
     assert target.read_text(encoding="utf-8") == original
+
+
+def test_workspace_switch_discards_pending_batch_before_activation(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject staged writes once, then complete a queued workspace switch."""
+
+    target = workspace / "calc.py"
+    original = target.read_text(encoding="utf-8")
+    provider = _write_provider(target, original.replace("a / b", "a - b"))
+    next_workspace = tmp_path / "next-workspace"
+    next_workspace.mkdir()
+
+    class PendingWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = PendingWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        window.task_input.setText("切换前暂存")
+        window.send_button.click()
+        assert _wait_until(qt_app, lambda: window._awaiting_confirmation)
+        monkeypatch.setattr(window, "_confirm_discard_pending", lambda scope: True)
+
+        window._activate_workspace(next_workspace)
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        assert _wait_until(qt_app, lambda: window.workspace_root == next_workspace)
+
+        assert target.read_text(encoding="utf-8") == original
+        assert window._awaiting_confirmation is False
+        assert window._has_pending_diffs() is False
+    finally:
+        window.close()
+        qt_app.processEvents()
 
 
 def test_conversations_switch_in_memory_and_restart_starts_fresh(
@@ -1484,6 +1686,77 @@ def test_new_session_does_not_inherit_background_run_ui_or_answer(
         qt_app.processEvents()
 
 
+def test_idle_new_session_clears_stale_confirmation_state(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """A fresh conversation cannot inherit an old Event/UI approval wait."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window._awaiting_confirmation = True
+        window._pending_write_path = "old.py"
+        window._pending_write_paths = ["old.py"]
+        window._stream_buffers["old-session"] = "partial"
+        window._stream_message_indices["old-session"] = 0
+        old_id = window.session_store.active_id
+
+        window._new_session()
+
+        assert window.session_store.active_id != old_id
+        assert window._awaiting_confirmation is False
+        assert window._pending_write_path == ""
+        assert window._pending_write_paths == []
+        assert window._stream_buffers == {}
+        assert window._stream_message_indices == {}
+        assert window.apply_button.isEnabled() is False
+        assert window.reject_button.isEnabled() is False
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_new_session_can_immediately_run_simple_task(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Reproduce the reported new-chat path without API keys or network access."""
+
+    provider = FakeProvider([_final_turn("当前目录已列出。")])
+
+    class FreshSessionWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=provider, mode=self.mode)
+
+    window = FreshSessionWindow(workspace, settings=gui_settings)
+    try:
+        window._new_session()
+        new_id = window.session_store.active_id
+        window.task_input.setText("列出当前目录")
+        window.send_button.click()
+
+        assert window.worker is not None
+        assert window.worker.wait(2_000) is True
+        qt_app.processEvents()
+        conversation = window.session_store.get(new_id)
+        assert conversation is not None
+        assert any(
+            "当前目录已列出" in str(message.get("content", ""))
+            for message in conversation.messages
+        )
+        assert window._running_session_id is None
+        assert window.task_input.isEnabled() is True
+    finally:
+        if window.worker is not None and window.worker.isRunning():
+            window.worker.stop()
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
+
+
 def test_send_button_becomes_stop_and_preserves_partial_session(
     qt_app: QApplication,
     workspace: Path,
@@ -1876,14 +2149,21 @@ def test_cerebro_visual_components_follow_agent_and_theme_state(
         assert isinstance(window.centralWidget(), CerebroBackground)
         assert isinstance(window.pulse_indicator, PulseIndicator)
         assert isinstance(window.brain_wave_indicator, BrainWaveIndicator)
+        assert window.save_snapshot_button.text().startswith("📸")
         window.update_status("running", "思考中")
         assert window.centralWidget()._active is True
         assert window.brain_wave_indicator._active is True
         assert window.pulse_indicator._timer.isActive() is True
         initial_angle = window.centralWidget()._angle
         assert _wait_until(qt_app, lambda: window.centralWidget()._angle > initial_angle)
+        window.centralWidget()._scan_offset = 0.0
+        window.centralWidget()._advance_animation()
+        assert window.centralWidget()._scan_offset == pytest.approx(0.009)
         window.update_status("ready", "就绪")
         assert window.centralWidget()._active is False
+        idle_scan = window.centralWidget()._scan_offset
+        window.centralWidget()._advance_animation()
+        assert window.centralWidget()._scan_offset == idle_scan
         assert window.brain_wave_indicator._active is False
         window._toggle_theme()
         assert window.theme_name == "light"

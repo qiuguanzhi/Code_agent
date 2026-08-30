@@ -18,6 +18,8 @@ DEFAULT_ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
     {
         "git",
         "git.exe",
+        "dir",
+        "ls",
         "py",
         "py.exe",
         "pytest",
@@ -98,9 +100,11 @@ def _error(
 
 
 def build_sanitized_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Copy the environment while excluding likely credentials."""
+    """Copy the process environment while excluding likely credentials."""
 
-    original = os.environ if source is None else source
+    original = dict(os.environ)
+    if source is not None:
+        original.update(source)
     sanitized: dict[str, str] = {}
     for key, value in original.items():
         normalized_key = key.upper()
@@ -109,6 +113,89 @@ def build_sanitized_env(source: Mapping[str, str] | None = None) -> dict[str, st
         sanitized[key] = value
     sanitized.setdefault("PYTHONIOENCODING", "utf-8")
     return sanitized
+
+
+def _environment_diagnostic(environment: Mapping[str, str]) -> str:
+    """Describe PATH availability without printing its potentially sensitive value."""
+
+    path_value = environment.get("PATH") or environment.get("Path") or ""
+    entry_count = len([entry for entry in path_value.split(os.pathsep) if entry])
+    return f"path_present={bool(path_value)} path_entries={entry_count}"
+
+
+def _portable_directory_listing(
+    workspace: Path,
+    checked_cwd: Path,
+    argv: Sequence[str],
+    max_output_chars: int,
+) -> dict[str, Any]:
+    """Implement Windows ``ls``/``dir`` safely without invoking a command shell."""
+
+    started_at = time.monotonic()
+    supported_flags = {"-a", "-l", "-al", "-la", "--all", "/a", "/b"}
+    targets: list[str] = []
+    for argument in argv[1:]:
+        if argument.lower() in supported_flags:
+            continue
+        if argument.startswith("-") or argument.startswith("/"):
+            return _error(
+                "invalid_command",
+                f"unsupported directory-listing option: {argument}",
+                meta={"argv": list(argv)},
+            )
+        targets.append(argument)
+    if len(targets) > 1:
+        return _error(
+            "invalid_command",
+            "ls/dir accepts at most one directory path",
+            meta={"argv": list(argv)},
+        )
+
+    try:
+        root = workspace.resolve(strict=True)
+        target = (checked_cwd / (targets[0] if targets else ".")).resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return _error(
+            "path_violation",
+            "directory-listing target must stay inside the workspace",
+            meta={"argv": list(argv)},
+        )
+    if not target.is_dir():
+        return _error(
+            "invalid_cwd",
+            "directory-listing target is not a directory",
+            meta={"argv": list(argv)},
+        )
+
+    output = BoundedHeadTailBuffer(max_output_chars)
+    try:
+        for entry in sorted(target.iterdir(), key=lambda item: item.name.casefold()):
+            suffix = "/" if entry.is_dir() else ""
+            output.feed(f"{entry.name}{suffix}\n")
+    except OSError as exc:
+        return _error(
+            "command_execution_failed",
+            f"directory listing failed: {exc}",
+            meta={"argv": list(argv)},
+        )
+    duration_ms = round((time.monotonic() - started_at) * 1_000)
+    return {
+        "ok": True,
+        "data": output.render(),
+        "error": None,
+        "meta": {
+            "argv": list(argv),
+            "cwd": str(checked_cwd),
+            "exit_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "duration_ms": duration_ms,
+            "output_chars": output.total_chars,
+            "output_truncated": output.truncated,
+            "portable_alias": True,
+        },
+    }
 
 
 def _validate_argv(
@@ -222,10 +309,31 @@ def run_command(
     if not checked_cwd.is_dir():
         return _error("invalid_cwd", "cwd is not a directory", meta={"cwd": cwd})
 
+    sanitized_environment = build_sanitized_env(environment)
+    print(
+        "[Cerebro::Shell] "
+        f"cwd={checked_cwd} argv={checked_argv!r} "
+        f"{_environment_diagnostic(sanitized_environment)}"
+    )
+    executable_name = Path(checked_argv[0]).name.lower()
+    if os.name == "nt" and executable_name in {"ls", "dir"}:
+        result = _portable_directory_listing(
+            workspace,
+            checked_cwd,
+            checked_argv,
+            max_output_chars,
+        )
+        print(
+            "[Cerebro::Shell] "
+            f"returncode={result.get('meta', {}).get('exit_code')} "
+            f"ok={result.get('ok')} alias={executable_name}"
+        )
+        return result
+
     popen_kwargs: dict[str, Any] = {
         "args": checked_argv,
         "cwd": checked_cwd,
-        "env": build_sanitized_env(environment),
+        "env": sanitized_environment,
         "shell": False,
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
@@ -244,9 +352,25 @@ def run_command(
     try:
         process: subprocess.Popen[str] = subprocess.Popen(**popen_kwargs)
     except FileNotFoundError:
-        return _error("command_not_found", "executable was not found")
+        print(
+            "[Cerebro::Shell] "
+            f"returncode=not_started error=command_not_found cwd={checked_cwd}"
+        )
+        return _error(
+            "command_not_found",
+            "executable was not found",
+            meta={"argv": checked_argv, "cwd": str(checked_cwd)},
+        )
     except OSError as exc:
-        return _error("command_start_failed", str(exc))
+        print(
+            "[Cerebro::Shell] "
+            f"returncode=not_started error={type(exc).__name__} cwd={checked_cwd}"
+        )
+        return _error(
+            "command_start_failed",
+            str(exc),
+            meta={"argv": checked_argv, "cwd": str(checked_cwd)},
+        )
 
     output = BoundedHeadTailBuffer(max_output_chars)
     if process.stdout is None:
@@ -291,7 +415,7 @@ def run_command(
     else:
         error_code = None
 
-    return {
+    result = {
         "ok": error_code is None,
         "data": rendered_output,
         "error": (
@@ -319,3 +443,10 @@ def run_command(
             "output_truncated": output.truncated,
         },
     }
+    stderr_preview = rendered_output[-300:].replace("\n", "\\n") if error_code else ""
+    print(
+        "[Cerebro::Shell] "
+        f"returncode={exit_code} ok={error_code is None} "
+        f"duration_ms={duration_ms} stderr_tail={stderr_preview!r}"
+    )
+    return result

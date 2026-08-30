@@ -272,6 +272,29 @@ QListWidget#fileMentionList::item:selected {{
     background-color: {colors['hover']};
     color: {colors['text']};
 }}
+
+QFrame#batchDiffPanel {{
+    background-color: {colors['toolbar_card']};
+    border: 1px solid {colors['accent']};
+    border-radius: 8px;
+}}
+
+QLabel#batchDiffSummary {{
+    color: {colors['warning']};
+    font-weight: 700;
+}}
+
+QListWidget#batchDiffList {{
+    background-color: {colors['code_background']};
+    border: 1px solid {colors['border']};
+    border-radius: 6px;
+}}
+
+QListWidget#batchDiffList::item {{ padding: 6px 8px; }}
+QListWidget#batchDiffList::item:selected {{
+    color: {colors['text']};
+    background-color: {colors['hover']};
+}}
 QWidget#logPanel {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
