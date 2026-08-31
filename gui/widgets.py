@@ -283,6 +283,79 @@ class BrainWaveIndicator(QWidget):
         painter.drawPath(path)
 
 
+class ContextRing(QWidget):
+    """Compact circular context-budget indicator with semantic thresholds."""
+
+    def __init__(
+        self,
+        colors: dict[str, str],
+        parent: QWidget | None = None,
+    ) -> None:
+        """Create an empty 46-pixel ring using theme semantic colors."""
+
+        super().__init__(parent)
+        self.setObjectName("contextRing")
+        self.setFixedSize(46, 46)
+        self._used = 0
+        self._budget = 1
+        self._colors = dict(colors)
+        self._refresh_tooltip()
+
+    def set_usage(self, used_tokens: int, budget_tokens: int) -> None:
+        """Update token values and schedule one inexpensive repaint."""
+
+        self._used = max(0, used_tokens)
+        self._budget = max(1, budget_tokens)
+        self._refresh_tooltip()
+        self.update()
+
+    def set_colors(self, colors: dict[str, str]) -> None:
+        """Apply a new light/dark semantic palette."""
+
+        self._colors = dict(colors)
+        self.update()
+
+    @property
+    def percentage(self) -> int:
+        """Return the clamped integer percentage shown in the center."""
+
+        return min(100, round(self._used * 100 / self._budget))
+
+    def level_color(self) -> QColor:
+        """Choose green, yellow, or red from the current theme."""
+
+        ratio = self._used / self._budget
+        key = "success" if ratio < 0.60 else "warning" if ratio <= 0.85 else "error"
+        return QColor(self._colors[key])
+
+    def paintEvent(self, event: object) -> None:
+        """Draw a background track, progress arc, and centered percentage."""
+
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        bounds = QRectF(5, 5, 36, 36)
+        painter.setPen(QPen(QColor(self._colors["border"]), 4.0))
+        painter.drawArc(bounds, 0, 360 * 16)
+        progress_pen = QPen(self.level_color(), 4.0)
+        progress_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(progress_pen)
+        painter.drawArc(bounds, 90 * 16, -self.percentage * 360 * 16 // 100)
+        painter.setPen(QColor(self._colors["text"]))
+        font = painter.font()
+        font.setPixelSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.percentage}%")
+
+    def _refresh_tooltip(self) -> None:
+        """Expose exact usage for keyboard and mouse users."""
+
+        self.setToolTip(
+            f"已用上下文：{self._used} / {self._budget} Tokens（{self.percentage}%）"
+        )
+
+
 def basic_markdown_to_html(markdown_text: str) -> str:
     """Render a small, escaped Markdown subset suitable for Agent answers."""
 

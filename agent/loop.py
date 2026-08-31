@@ -10,9 +10,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.context import ContextBudgetError, fit_context
+from agent.context import (
+    MAX_INPUT_TOKENS,
+    ContextBudgetError,
+    ContextUsage,
+    compress_tool_history,
+    estimate_context_tokens,
+    fit_context,
+)
 from agent.state import AgentState, AssistantTurn
 from providers.base import ModelProvider
+from skills.registry import SkillRegistry
 from tools.registry import ToolRegistry, ToolStopRequested
 from utils.snapshot import save_workspace_snapshot
 
@@ -23,10 +31,23 @@ SleepCallback = Callable[[float], None]
 StopCallback = Callable[[], bool]
 TokenCallback = Callable[[str], None]
 ReasoningTokenCallback = Callable[[str], None]
+StepExtensionCallback = Callable[[int, int, int], bool]
+ClockCallback = Callable[[], float]
 
 
 class ModelRetryExhausted(RuntimeError):
     """Raised after all configured transient API retries fail."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "model_api_error",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
 
 
 class AgentStopRequested(RuntimeError):
@@ -39,11 +60,14 @@ class AgentConfig:
 
     workspace: Path
     provider: ModelProvider
-    max_steps: int = 20
-    max_wall_seconds: float = 600.0
-    input_token_budget: int = 48_000
+    max_steps: int = 200
+    max_duration_seconds: float = 1_200.0
+    max_wall_seconds: float | None = None
+    input_token_budget: int = MAX_INPUT_TOKENS
     max_api_attempts: int = 3
     retry_base_seconds: float = 0.5
+    max_empty_response_retries: int = 2
+    empty_response_retry_base_seconds: float = 1.0
     max_same_call: int = 3
     mode: str = "auto"
     interactive: bool = False
@@ -54,6 +78,12 @@ class AgentConfig:
     should_stop: StopCallback | None = field(default=None, repr=False)
     on_token: TokenCallback | None = field(default=None, repr=False)
     on_reasoning_token: ReasoningTokenCallback | None = field(default=None, repr=False)
+    confirm_step_extension: StepExtensionCallback | None = field(default=None, repr=False)
+    enabled_skills: frozenset[str] | None = None
+    skill_permissions: frozenset[str] = frozenset({"filesystem"})
+    confirm_high_risk_skill: Callable[[Any], bool] | None = field(default=None, repr=False)
+    skill_registry: SkillRegistry | None = field(default=None, repr=False)
+    time_fn: ClockCallback = field(default=time.time, repr=False)
     system_prompt_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -64,14 +94,20 @@ class AgentConfig:
             raise ValueError("workspace must be a directory")
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
-        if self.max_wall_seconds <= 0:
-            raise ValueError("max_wall_seconds must be positive")
+        if self.max_wall_seconds is not None:
+            self.max_duration_seconds = self.max_wall_seconds
+        if self.max_duration_seconds <= 0:
+            raise ValueError("max_duration_seconds must be positive")
         if self.input_token_budget <= 0:
             raise ValueError("input_token_budget must be positive")
         if self.max_api_attempts < 1:
             raise ValueError("max_api_attempts must be positive")
         if self.retry_base_seconds < 0:
             raise ValueError("retry_base_seconds cannot be negative")
+        if self.max_empty_response_retries < 0:
+            raise ValueError("max_empty_response_retries cannot be negative")
+        if self.empty_response_retry_base_seconds < 0:
+            raise ValueError("empty_response_retry_base_seconds cannot be negative")
         if self.interactive and not self.batch_writes and self.confirm_write is None:
             raise ValueError("interactive mode requires confirm_write")
 
@@ -120,6 +156,84 @@ def _is_retriable_exception(exc: Exception) -> bool:
     }
 
 
+def _exception_code(exc: Exception) -> str:
+    """Preserve provider protocol codes and classify transport timeouts."""
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    if isinstance(exc, TimeoutError) or type(exc).__name__ in {
+        "APITimeoutError",
+        "ReadTimeout",
+    }:
+        return "api_timeout"
+    return "model_api_error"
+
+
+def _message_diagnostics(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Return bounded last-message summaries and protocol-shape anomalies."""
+
+    summaries: list[str] = []
+    anomalies: list[str] = []
+    for index, message in enumerate(messages):
+        role = str(message.get("role", "<missing>"))
+        content = message.get("content")
+        if isinstance(content, str):
+            preview = content.replace("\n", " ")[:50]
+        elif content is None:
+            preview = "<null>"
+        else:
+            preview = f"<{type(content).__name__}>"
+            anomalies.append(f"message[{index}] content has unsupported type")
+        if role == "assistant" and (content is None or content == "") and not message.get(
+            "tool_calls"
+        ):
+            anomalies.append(f"message[{index}] empty assistant protocol message")
+        if role not in {"system", "user", "assistant", "tool"}:
+            anomalies.append(f"message[{index}] invalid role={role}")
+        summaries.append(f"{role}: {preview}")
+    return summaries[-3:], anomalies
+
+
+def _friendly_model_error(code: str, *, retry_count: int = 0) -> str:
+    """Map internal diagnostics to stable user-facing Chinese messages."""
+
+    if code == "api_empty_choices":
+        return "⚠️ 模型服务未返回有效响应，请检查网络连接或稍后重试。"
+    if code == "api_missing_message":
+        return "⚠️ 模型响应缺少消息主体，请检查兼容网关或模型配置。"
+    if code == "empty_content_and_tools":
+        return f"⚠️ 模型返回了空响应，可能因上下文过长或格式问题，已自动重试 {retry_count} 次。"
+    if code == "tool_calls_parse_error":
+        return "⚠️ 模型返回的工具调用格式异常，请检查模型配置。"
+    if code == "api_timeout":
+        return "⏱️ 模型响应超时，当前任务较复杂，请尝试简化问题或稍后重试。"
+    return "⚠️ 模型服务请求失败，请查看事件日志中的诊断信息。"
+
+
+def _record_model_error(
+    state: AgentState,
+    code: str,
+    message: str,
+    *,
+    step: int,
+    details: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist a bounded, structured model diagnostic on the run state."""
+
+    state.last_error_code = code
+    state.error_history.append(
+        {
+            "step": step,
+            "code": code,
+            "message": message,
+            "details": dict(details or {}),
+        }
+    )
+    if len(state.error_history) > 50:
+        del state.error_history[:-50]
+
+
 def call_model_with_retry(
     cfg: AgentConfig,
     messages: list[dict[str, Any]],
@@ -147,7 +261,12 @@ def call_model_with_retry(
             if cfg.should_stop is not None and cfg.should_stop():
                 raise AgentStopRequested("user requested stop") from exc
             if not _is_retriable_exception(exc) or attempt >= cfg.max_api_attempts:
-                raise ModelRetryExhausted(str(exc)) from exc
+                details = getattr(exc, "details", None)
+                raise ModelRetryExhausted(
+                    str(exc),
+                    code=_exception_code(exc),
+                    details=details if isinstance(details, Mapping) else None,
+                ) from exc
             delay = cfg.retry_base_seconds * (2 ** (attempt - 1))
             _emit(
                 on_update,
@@ -229,6 +348,21 @@ def _user_stopped(state: AgentState, on_update: UpdateCallback | None) -> AgentR
     return _stopped("stopped", "user_stopped", answer, state)
 
 
+def _duration_stopped(
+    state: AgentState,
+    cfg: AgentConfig,
+    on_update: UpdateCallback | None,
+) -> AgentRunResult:
+    """Build the stable hard-duration terminal result."""
+
+    if abs(cfg.max_duration_seconds - 1_200.0) < 0.001:
+        answer = "⏱️ 执行超时（超过 20 分钟）"
+    else:
+        answer = f"⏱️ 执行超时（超过 {cfg.max_duration_seconds:g} 秒）"
+    _emit(on_update, "run_stopped", state.step, answer, reason="max_duration")
+    return _stopped("stopped", "max_duration", answer, state)
+
+
 def run_agent(
     task: str,
     cfg: AgentConfig,
@@ -239,7 +373,11 @@ def run_agent(
     if not task.strip():
         raise ValueError("task must be a non-empty string")
 
-    state = AgentState(mode=cfg.mode)
+    state = AgentState(
+        mode=cfg.mode,
+        start_time=cfg.time_fn(),
+        max_duration_seconds=cfg.max_duration_seconds,
+    )
     _emit(on_update, "run_preparing", 0, "正在初始化 Agent 环境")
     _emit(on_update, "snapshot_started", 0, "正在保存工作区快照")
     snapshot_started = time.perf_counter()
@@ -289,6 +427,17 @@ def run_agent(
     ]
     prompt_duration_ms = (time.perf_counter() - prompt_started) * 1_000
     registry_started = time.perf_counter()
+    skill_registry = cfg.skill_registry or SkillRegistry.discover_builtin(
+        granted_permissions=cfg.skill_permissions,
+        enabled_names=cfg.enabled_skills,
+        confirm_high_risk=cfg.confirm_high_risk_skill,
+    )
+
+    def emit_skill_update(event: str, message: str, data: dict[str, Any]) -> None:
+        """Bridge framework-free Skill lifecycle events to the Agent callback."""
+
+        _emit(on_update, event, state.step, message, **data)
+
     registry = ToolRegistry(
         cfg.workspace,
         write_policy={
@@ -299,6 +448,8 @@ def run_agent(
         should_stop=cfg.should_stop,
         defer_writes=cfg.batch_writes,
         forbidden_tools=_forbidden_tools_from_task(task),
+        skill_registry=skill_registry,
+        on_skill_update=emit_skill_update,
     )
     registry_duration_ms = (time.perf_counter() - registry_started) * 1_000
     _emit(
@@ -308,6 +459,28 @@ def run_agent(
         "工具注册表已就绪",
         duration_ms=registry_duration_ms,
         tool_count=len(registry.schemas),
+        skill_count=len(skill_registry.enabled_names()),
+    )
+    provider_limit = getattr(cfg.provider, "max_input_tokens", cfg.input_token_budget)
+    effective_input_budget = min(
+        cfg.input_token_budget,
+        provider_limit if isinstance(provider_limit, int) and provider_limit > 0 else cfg.input_token_budget,
+    )
+    state.context_budget_tokens = effective_input_budget
+    budget_label = (
+        "320K"
+        if effective_input_budget == MAX_INPUT_TOKENS
+        else f"{effective_input_budget:,}"
+    )
+    _emit(
+        on_update,
+        "context_budget_configured",
+        0,
+        f"🧠 [Cerebro] 上下文预算已设置为 {budget_label} Tokens",
+        used_tokens=0,
+        budget_tokens=effective_input_budget,
+        configured_budget_tokens=cfg.input_token_budget,
+        provider_limit_tokens=provider_limit,
     )
     for stage_name, duration_ms in (
         ("system_prompt", prompt_duration_ms),
@@ -317,15 +490,47 @@ def run_agent(
             print(f"[perf] {stage_name} duration_ms={duration_ms:.1f}")
     _emit(on_update, "run_started", 0, "Agent 已启动", mode=cfg.mode)
 
-    for step in range(1, cfg.max_steps + 1):
+    current_step_limit = cfg.max_steps
+    step = 1
+    while step <= current_step_limit:
         state.step = step
         if cfg.should_stop is not None and cfg.should_stop():
             return _user_stopped(state, on_update)
-        elapsed = time.monotonic() - state.started_at
-        if elapsed > cfg.max_wall_seconds:
-            answer = f"Agent 已达到墙钟时间上限（{cfg.max_wall_seconds:.0f} 秒）。"
-            _emit(on_update, "run_stopped", step, answer, reason="wall_time_limit")
-            return _stopped("stopped", "wall_time_limit", answer, state)
+        if cfg.time_fn() - state.start_time > cfg.max_duration_seconds:
+            return _duration_stopped(state, cfg, on_update)
+        _emit(
+            on_update,
+            "step_started",
+            step,
+            f"步数：{step}/{current_step_limit}",
+            current_step=step,
+            max_steps=current_step_limit,
+        )
+        remaining_steps = current_step_limit - step
+        if remaining_steps <= 3:
+            _emit(
+                on_update,
+                "step_limit_warning",
+                step,
+                f"⚠️ 即将达到循环上限（剩余 {remaining_steps} 步）",
+                current_step=step,
+                max_steps=current_step_limit,
+                remaining_steps=remaining_steps,
+            )
+
+        state.messages, removed_tool_units, kept_tool_units = compress_tool_history(
+            state.messages
+        )
+        if removed_tool_units:
+            state.tool_history_compressions += 1
+            _emit(
+                on_update,
+                "tool_history_compressed",
+                step,
+                "🔧 工具历史已压缩，保留最近 20 条",
+                removed_tool_units=removed_tool_units,
+                kept_tool_units=kept_tool_units,
+            )
 
         _emit(
             on_update,
@@ -335,16 +540,53 @@ def run_agent(
             source_messages=len(state.messages),
         )
         context_started = time.perf_counter()
+        usage_holder: list[ContextUsage] = []
         try:
             request_messages = fit_context(
                 state.messages,
                 registry.schemas,
-                cfg.input_token_budget,
+                effective_input_budget,
+                usage_callback=usage_holder.append,
             )
         except ContextBudgetError as exc:
             answer = str(exc)
             _emit(on_update, "run_failed", step, answer, reason="context_budget_error")
             return _stopped("failed", "context_budget_error", answer, state)
+
+        if usage_holder:
+            usage = usage_holder[-1]
+            state.context_used_tokens = usage.used_tokens
+            state.context_budget_tokens = usage.budget_tokens
+            if usage.compressed:
+                state.context_compressions += 1
+            _emit(
+                on_update,
+                "context_usage",
+                step,
+                "上下文用量已更新",
+                used_tokens=usage.used_tokens,
+                budget_tokens=usage.budget_tokens,
+                source_tokens=usage.source_tokens,
+                compressed=usage.compressed,
+                released_tokens=usage.released_tokens,
+            )
+            if usage.compressed:
+                _emit(
+                    on_update,
+                    "context_compressed",
+                    step,
+                    f"📦 上下文已压缩，释放约 {usage.released_tokens} Tokens",
+                    released_tokens=usage.released_tokens,
+                )
+                _emit(
+                    on_update,
+                    "context_forced_compression",
+                    step,
+                    f"📦 上下文 Token 估算：{usage.source_tokens} / {usage.budget_tokens}，触发压缩",
+                    source_tokens=usage.source_tokens,
+                    budget_tokens=usage.budget_tokens,
+                    output_tokens=usage.used_tokens,
+                )
 
         context_duration_ms = (time.perf_counter() - context_started) * 1_000
         _emit(
@@ -361,22 +603,114 @@ def run_agent(
                 f"duration_ms={context_duration_ms:.1f}"
             )
 
+        request_token_estimate = estimate_context_tokens(
+            request_messages,
+            registry.schemas,
+        )
+        message_summaries, message_anomalies = _message_diagnostics(request_messages)
+        _emit(
+            on_update,
+            "model_request_diagnostics",
+            step,
+            "模型请求诊断已记录",
+            message_count=len(request_messages),
+            estimated_tokens=request_token_estimate,
+            budget_tokens=effective_input_budget,
+            last_messages=message_summaries,
+            anomalies=message_anomalies,
+        )
+        print(
+            "[Cerebro::ModelRequest] "
+            f"messages={len(request_messages)} tokens={request_token_estimate}/"
+            f"{effective_input_budget} last3={message_summaries!r} "
+            f"anomalies={message_anomalies!r}"
+        )
         _emit(on_update, "model_request", step, "正在请求模型", messages=len(request_messages))
         model_started = time.perf_counter()
-        try:
-            turn = call_model_with_retry(
-                cfg,
-                request_messages,
-                registry.schemas,
-                on_update,
+        empty_retry_count = 0
+        while True:
+            try:
+                turn = call_model_with_retry(
+                    cfg,
+                    request_messages,
+                    registry.schemas,
+                    on_update,
+                    step=step,
+                )
+            except AgentStopRequested:
+                return _user_stopped(state, on_update)
+            except ModelRetryExhausted as exc:
+                code = exc.code
+                answer = _friendly_model_error(code)
+                _record_model_error(
+                    state,
+                    code,
+                    str(exc),
+                    step=step,
+                    details=exc.details,
+                )
+                _emit(
+                    on_update,
+                    "run_failed",
+                    step,
+                    answer,
+                    reason=code,
+                    error_code=code,
+                    technical_message=str(exc),
+                    diagnostics=exc.details,
+                )
+                return _stopped("failed", code, answer, state)
+
+            has_content = isinstance(turn.content, str) and bool(turn.content.strip())
+            if has_content or turn.tool_calls:
+                break
+
+            code = "empty_content_and_tools"
+            details = {
+                "finish_reason": turn.finish_reason,
+                "retry_count": empty_retry_count,
+                "message_count": len(request_messages),
+                "estimated_tokens": request_token_estimate,
+            }
+            _record_model_error(
+                state,
+                code,
+                "provider returned neither text content nor tool calls",
                 step=step,
+                details=details,
             )
-        except AgentStopRequested:
-            return _user_stopped(state, on_update)
-        except ModelRetryExhausted as exc:
-            answer = f"模型 API 请求失败：{exc}"
-            _emit(on_update, "run_failed", step, answer, reason="model_api_error")
-            return _stopped("failed", "model_api_error", answer, state)
+            if empty_retry_count >= cfg.max_empty_response_retries:
+                answer = _friendly_model_error(code, retry_count=empty_retry_count)
+                _emit(
+                    on_update,
+                    "run_stopped",
+                    step,
+                    answer,
+                    reason="empty_response",
+                    error_code=code,
+                    retry_count=empty_retry_count,
+                    diagnostics=details,
+                )
+                return _stopped("stopped", "empty_response", answer, state)
+
+            empty_retry_count += 1
+            state.empty_response_retries += 1
+            delay = cfg.empty_response_retry_base_seconds * (
+                2 ** (empty_retry_count - 1)
+            )
+            _emit(
+                on_update,
+                "empty_response_retry",
+                step,
+                f"⚠️ 检测到空响应，正在重试（第 {empty_retry_count} 次）...",
+                attempt=empty_retry_count,
+                delay_seconds=delay,
+                finish_reason=turn.finish_reason,
+            )
+            # The empty assistant turn has deliberately not been appended to
+            # state.messages, so the retry uses the last clean protocol state.
+            if delay > 0:
+                cfg.sleep_fn(delay)
 
         if cfg.should_stop is not None and cfg.should_stop():
             return _user_stopped(state, on_update)
@@ -384,6 +718,24 @@ def run_agent(
         model_duration_ms = (time.perf_counter() - model_started) * 1_000
         if cfg.verbose or model_duration_ms > 500:
             print(f"[perf] model step={step} duration_ms={model_duration_ms:.1f}")
+
+        finish_reason = turn.finish_reason
+        if finish_reason == "length":
+            _emit(
+                on_update,
+                "response_truncated",
+                step,
+                "⚠️ 模型响应被截断（finish_reason=length），建议增加 max_tokens 或精简上下文",
+                finish_reason=finish_reason,
+            )
+        elif finish_reason == "content_filter":
+            _emit(
+                on_update,
+                "response_filtered",
+                step,
+                "⚠️ 模型响应受到内容过滤（finish_reason=content_filter）",
+                finish_reason=finish_reason,
+            )
 
         state.messages.append(turn.protocol_message)
         reasoning = turn.protocol_message.get("reasoning_content")
@@ -398,15 +750,12 @@ def run_agent(
             tool_call_count=len(turn.tool_calls),
             reasoning=reasoning if isinstance(reasoning, str) else None,
             duration_ms=model_duration_ms,
+            finish_reason=finish_reason,
         )
 
         if not turn.tool_calls:
-            if turn.content and turn.content.strip():
-                _emit(on_update, "run_completed", step, "Agent 已完成任务")
-                return _stopped("completed", "final_answer", turn.content, state)
-            answer = "模型未返回文本或工具调用，Agent 已停止。"
-            _emit(on_update, "run_stopped", step, answer, reason="empty_response")
-            return _stopped("stopped", "empty_response", answer, state)
+            _emit(on_update, "run_completed", step, "Agent 已完成任务")
+            return _stopped("completed", "final_answer", turn.content or "", state)
 
         for call in turn.tool_calls:
             if cfg.should_stop is not None and cfg.should_stop():
@@ -459,13 +808,65 @@ def run_agent(
                 _emit(on_update, "run_stopped", step, answer, reason=error_code)
                 return _stopped("stopped", error_code, answer, state)
 
-            if time.monotonic() - state.started_at > cfg.max_wall_seconds:
-                answer = f"Agent 已达到墙钟时间上限（{cfg.max_wall_seconds:.0f} 秒）。"
-                _emit(on_update, "run_stopped", step, answer, reason="wall_time_limit")
-                return _stopped("stopped", "wall_time_limit", answer, state)
+            if cfg.time_fn() - state.start_time > cfg.max_duration_seconds:
+                return _duration_stopped(state, cfg, on_update)
 
         _emit(on_update, "step_completed", step, f"步骤 {step} 已完成")
 
-    answer = f"Agent 已达到最大步骤数（{cfg.max_steps}），任务可能尚未完成。"
-    _emit(on_update, "run_stopped", cfg.max_steps, answer, reason="max_steps")
+        if step >= current_step_limit:
+            if cfg.confirm_step_extension is not None:
+                _emit(
+                    on_update,
+                    "step_extension_requested",
+                    step,
+                    "循环次数已达到上限，等待用户决定",
+                    current_step=step,
+                    max_steps=current_step_limit,
+                    extension_count=state.step_extensions,
+                )
+                approved = cfg.confirm_step_extension(
+                    step,
+                    current_step_limit,
+                    state.step_extensions,
+                )
+                if cfg.should_stop is not None and cfg.should_stop():
+                    return _user_stopped(state, on_update)
+                if cfg.time_fn() - state.start_time > cfg.max_duration_seconds:
+                    return _duration_stopped(state, cfg, on_update)
+                if approved:
+                    state.allow_continue = True
+                    state.override_max_steps = True
+                    state.step_extensions += 1
+                    current_step_limit += 50
+                    _emit(
+                        on_update,
+                        "step_extension_approved",
+                        step,
+                        "🧠 [Cerebro] 用户选择继续（步数上限 +50）",
+                        max_steps=current_step_limit,
+                        extension_size=50,
+                    )
+                else:
+                    answer = "用户在循环次数上限处停止执行。"
+                    _emit(
+                        on_update,
+                        "run_stopped",
+                        step,
+                        "🧠 [Cerebro] 用户停止执行",
+                        reason="user_declined_step_extension",
+                    )
+                    return _stopped(
+                        "stopped",
+                        "user_declined_step_extension",
+                        answer,
+                        state,
+                    )
+            else:
+                answer = f"Agent 已达到最大步骤数（{current_step_limit}），任务可能尚未完成。"
+                _emit(on_update, "run_stopped", step, answer, reason="max_steps")
+                return _stopped("stopped", "max_steps", answer, state)
+        step += 1
+
+    answer = f"Agent 已达到最大步骤数（{current_step_limit}），任务可能尚未完成。"
+    _emit(on_update, "run_stopped", state.step, answer, reason="max_steps")
     return _stopped("stopped", "max_steps", answer, state)

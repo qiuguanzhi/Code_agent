@@ -1,6 +1,6 @@
 # Development Progress
 
-Last updated: 2026-08-27
+Last updated: 2026-08-31
 
 ## Phase 1 — Tools Layer
 
@@ -392,3 +392,106 @@ Status: Implemented and verified
 ### Pending items
 
 - User visual acceptance of the corrected desktop interface
+
+## Round 11 — Skills, Context Capacity, and Runtime Limits
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `skills/`: framework-free Skill contract, discovery/enablement registry, permission gates, and three read-only built-in coding skills
+- `tools/registry.py`: Skill-first routing, nested native-tool validation, high-risk mutation policy, and native-name collision protection
+- `utils/token_counter.py` and `agent/context.py`: observable conservative Token estimates and protocol-safe automatic compression above 80%
+- `agent/state.py` and `agent/loop.py`: context metrics, 20-minute hard duration, three-step warnings, and at most three user-approved ten-step extensions
+- `gui/skill_dialog.py`, `gui/widgets.py`, `gui/worker.py`, and `gui/main_window.py`: persistent skill manager, high-risk confirmation, themed context ring, timeout reporting, and thread-safe loop-extension prompts
+- `tests/test_round11_features.py`: local Skill, permission, compression, timeout, extension, and offscreen context-ring coverage
+- `process.md`: per-task Round 11 implementation, evidence, and limitations
+
+### Test status
+
+- Status: Pass
+- Round 11 focused regression: `pytest tests/test_round11_features.py -q` → 9 passed
+- Full regression: `pytest tests/ -q` → 148 passed, 1 skipped
+- Network/API usage: none; all new Agent tests use deterministic providers and local temporary workspaces
+- Skip reason: the current Windows environment does not permit creation of the path-guard symlink
+
+### Pending items
+
+- User visual acceptance of the Skill dialog, context ring, and max-step prompt with a real provider session
+
+## Round 12 — 64K Context and Unlimited User Continuations
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `agent/context.py` and `agent/loop.py`: shared 64K input budget, observable startup configuration, cumulative step progress, and unbounded user-approved +20 extensions
+- `providers/openai_compatible.py`: validated 8192-token output limit on streaming and non-streaming requests
+- `gui/worker.py` and `gui/main_window.py`: 64K startup log, context-ring initialization, default 30-step limit, permanent `current/limit` status label, and repeatable continuation prompt
+- `main.py`: CLI defaults synchronized to 64K input and 30 steps
+- `coding_agent_technical_design.md`: runtime-limit guidance synchronized to the implemented 30-step and repeatable +20 policy
+- `tests/test_round12_features.py` and `tests/test_gui.py`: large-context, request-payload, multi-extension, rejection, startup-log, and status-label regression coverage
+- `process.md`: Round 12 implementation evidence and limitations
+
+### Test status
+
+- Status: Pass
+- Context/Provider focused regression: 26 passed
+- Full regression: `pytest tests/ -q` → 155 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the path-guard symlink
+
+### Pending items
+
+- Superseded by the larger Round 13 validation target below
+
+## Round 13 — 320K Context and 200-Step Default
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `agent/context.py` and `agent/loop.py`: 320K input budget, 200-step default, and repeatable +50 cumulative extensions
+- `providers/openai_compatible.py`: 16,384-token output request limit for streaming and non-streaming calls
+- `gui/worker.py` and `gui/main_window.py`: 320K startup event, dynamic context-ring denominator, 200-step status display, and +50 confirmation feedback
+- `main.py` and `coding_agent_technical_design.md`: CLI defaults and design guidance synchronized with runtime behavior
+- `tests/test_round12_features.py` and `tests/test_gui.py`: 150K-character input, 150-step no-prompt, 200/250-step extensions, Provider payload, startup log, and GUI state coverage
+- `process.md`: Round 13 evidence, regression results, and model-capability caveat
+
+### Test status
+
+- Status: Pass
+- Round 13 focused regression: 32 passed
+- Full regression: `pytest tests/ -q` → 157 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the path-guard symlink
+
+### Pending items
+
+- Verify that the selected real model and gateway support a 320K input window and 16,384 output tokens
+
+## Empty Model Response Recovery — 2026-08-31
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `providers/openai_compatible.py`: content-free raw response diagnostics, granular protocol error codes, 120-second per-request timeout, configurable model input limit, optional `max_completion_tokens=8192`, and explicit finish-reason handling
+- `agent/context.py` and `agent/loop.py`: request diagnostics, effective model-aware context budget, protocol-safe tool-history compression, two clean-context empty-response retries, partial length-truncated answer preservation, and structured failure history
+- `agent/state.py`: empty retry counters, last error code, and bounded structured error records
+- `gui/worker.py`: friendly classified model errors, diagnostic event logs, compression/truncation feedback, and model-error signal
+- `gui/main_window.py` and `gui/theme.py`: contextual “🔄 重试” action that creates a fresh run without duplicating the retained user conversation
+- `tests/test_agent_loop.py`, `tests/test_context.py`, `tests/test_providers.py`, and `tests/test_gui.py`: network-free regression coverage for all recovery paths
+- `process.md`: implementation evidence, compatibility decisions, tests, and remaining real-provider validation
+
+### Test status
+
+- Status: Pass
+- Full regression: `pytest tests/ -q` → 167 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the path-guard symlink
+
+### Pending items
+
+- Validate one deliberately large request against the selected real gateway and set `AGENT_MODEL_INPUT_TOKENS` to that model's documented input limit
+- Enable `AGENT_USE_MAX_COMPLETION_TOKENS=1` only for gateways that explicitly support that parameter

@@ -142,6 +142,78 @@ def test_provider_normalizes_final_text_response() -> None:
     assert turn.protocol_message == {"role": "assistant", "content": "Done"}
 
 
+def test_provider_classifies_empty_choices_and_logs_response_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider = OpenAICompatibleProvider(
+        FakeClient(SimpleNamespace(choices=[], usage=None)),
+        "fake-model",
+    )
+
+    with pytest.raises(ProviderResponseError) as raised:
+        provider.complete([], get_tool_schemas())
+
+    assert raised.value.code == "api_empty_choices"
+    output = capsys.readouterr().out
+    assert "response_shape" in output
+    assert "choices=0" in output
+
+
+def test_provider_classifies_missing_message() -> None:
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=None, finish_reason="stop")],
+        usage=None,
+    )
+    provider = OpenAICompatibleProvider(FakeClient(response), "fake-model")
+
+    with pytest.raises(ProviderResponseError) as raised:
+        provider.complete([], get_tool_schemas())
+
+    assert raised.value.code == "api_missing_message"
+
+
+def test_provider_classifies_malformed_tool_calls() -> None:
+    message = SimpleNamespace(
+        content=None,
+        tool_calls=[SimpleNamespace(id="call-1", type="function", function=None)],
+        reasoning_content=None,
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        usage=None,
+    )
+    provider = OpenAICompatibleProvider(FakeClient(response), "fake-model")
+
+    with pytest.raises(ProviderResponseError) as raised:
+        provider.complete([], get_tool_schemas())
+
+    assert raised.value.code == "tool_calls_parse_error"
+
+
+def test_provider_request_uses_timeout_and_optional_completion_limit() -> None:
+    message = SimpleNamespace(content="Done", tool_calls=None, reasoning_content=None)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        usage=None,
+    )
+    client = FakeClient(response)
+    provider = OpenAICompatibleProvider(
+        client,
+        "fake-model",
+        request_timeout_seconds=120,
+        max_completion_tokens=8_192,
+        supports_max_completion_tokens=True,
+    )
+
+    provider.complete([], get_tool_schemas())
+
+    request = client.chat.completions.last_request
+    assert request is not None
+    assert request["timeout"] == 120
+    assert request["max_completion_tokens"] == 8_192
+    assert "max_tokens" not in request
+
+
 def test_provider_streams_text_deltas_and_returns_complete_turn() -> None:
     """Forward native chunks while retaining a normalized final response."""
 

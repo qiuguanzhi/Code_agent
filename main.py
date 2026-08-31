@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from agent.context import MAX_INPUT_TOKENS
 from agent.loop import AgentConfig, AgentRunResult, UpdateCallback, run_agent
 from providers.openai_compatible import ProviderConfigurationError, create_provider_from_env
 
@@ -36,9 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Existing workspace directory accessible to local tools",
     )
-    parser.add_argument("--max-steps", type=int, default=20)
-    parser.add_argument("--max-wall-seconds", type=float, default=600.0)
-    parser.add_argument("--input-budget", type=int, default=48_000)
+    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument(
+        "--max-wall-seconds",
+        type=float,
+        default=1_200.0,
+        help="Maximum execution duration in seconds (default: 1200)",
+    )
+    parser.add_argument("--input-budget", type=int, default=MAX_INPUT_TOKENS)
     parser.add_argument("--interactive", action="store_true", help="Confirm every write_file call")
     parser.add_argument("--verbose", action="store_true", help="Show structured event details")
     parser.add_argument("--mode", choices=("auto", "goal"), default="auto")

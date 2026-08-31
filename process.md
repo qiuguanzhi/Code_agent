@@ -626,3 +626,133 @@ $env:QT_QPA_PLATFORM='offscreen'
 ```
 
 唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试全部使用 SDK 形状的流式假数据、FakeProvider、offscreen Qt 和临时工作区，不访问真实 API。`git diff --check` 未发现空白错误，仅有 Windows 的 LF→CRLF 常规提示。
+
+---
+
+## [2026-08-31 10:54] 第11轮 任务 #1 - Skill 运行时能力包
+
+- **修改内容**：新增零框架依赖的 `Skill`、`AgentContext`、`SkillResult` 与 `SkillRegistry`，启动时自动发现 `skills/builtin/` 下的能力类，并把启用技能转换为原生 Tool Schema。工具注册表按“Skill 优先、原生 Tool 回退”分发，嵌套工具调用仍走参数校验、工作区边界和取消检查。内置 `code_reviewer`、`explain_code`、`refactor_suggest` 三个只读技能。GUI 工具栏新增技能管理对话框，可刷新发现、查看描述/权限并持久化启用状态。技能必须声明 `filesystem`、`process` 或 `filesystem_write` 权限；写删能力还必须标记为高风险并逐次由用户确认；技能名禁止覆盖原生工具。
+- **涉及文件**：`skills/__init__.py`、`skills/base.py`、`skills/registry.py`、`skills/builtin/__init__.py`、`skills/builtin/code_review.py`、`tools/registry.py`、`agent/loop.py`、`gui/skill_dialog.py`、`gui/main_window.py`、`gui/worker.py`、`pyproject.toml`、`tests/test_round11_features.py`
+- **测试结果**：通过。自定义 `list_files` Skill 经 Agent 原生 tool call 调用安全的 `run_command(["ls"])` 并返回工作区文件；覆盖禁用后不暴露、权限检查、高风险显式确认、原生工具名防覆盖和 3 个内置技能自动发现。
+- **遗留问题**：Skill 自动发现范围有意限制在项目内的 `skills/builtin/`，不从任意外部目录动态导入代码；新增 Skill 后点击“刷新技能”即可重新扫描。当前三个内置技能均为本地只读能力，不需要网络权限。
+
+## [2026-08-31 10:54] 第11轮 任务 #2 - 上下文压缩与圆形可视化
+
+- **修改内容**：新增 `utils/token_counter.py`，沿用项目原有“序列化字符数 + 20% 余量”保守估算。`fit_context` 在历史占用超过预算 80% 时调用公开的 `compress_context()`，只压缩可丢弃的旧协议单元为 `WORK_MEMORY_JSON`，不损伤仅有的系统提示和当前用户消息；结果通过 `ContextUsage` 报告用量、源用量和释放量。AgentState 保存当前用量和压缩次数，Worker 发射 `context_signal` 并在压缩时写入 `📦` 日志。输入栏新增自绘 `ContextRing`：小于 60% 为绿、60%～85% 为黄、大于 85% 为红，Tooltip 显示精确 Tokens，并随亮暗主题更新。
+- **涉及文件**：`utils/token_counter.py`、`agent/context.py`、`agent/state.py`、`agent/loop.py`、`gui/worker.py`、`gui/widgets.py`、`gui/main_window.py`、`gui/theme.py`、`tests/test_round11_features.py`
+- **测试结果**：通过。覆盖超过 80% 后协议安全压缩、释放量统计、环形阈值颜色、Tooltip、亮暗主题切换和 offscreen 实际绘制。
+- **遗留问题**：Token 数量是无第三方依赖的保守估算，不等同于各厂商模型的精确 tokenizer；圆环用于容量预警，API 侧的最终计费 Token 仍以厂商响应为准。
+
+## [2026-08-31 10:54] 第11轮 任务 #3 - 20 分钟最大执行时长
+
+- **修改内容**：`AgentConfig.max_duration_seconds` 默认设为 1200 秒，`AgentState` 记录 `start_time` 与本轮上限。核心循环在每轮开始、每个工具结束及循环扩展决策后检查绝对时长，超时返回稳定原因 `max_duration` 与提示“⏱️ 执行超时（超过 20 分钟）”。Worker 的循环/高风险确认等待也检查同一上限并向 GUI 发送失败完成状态。原 `max_wall_seconds` 作为兼容别名保留，CLI 默认同步更新为 1200 秒。
+- **涉及文件**：`agent/state.py`、`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`main.py`、`tests/test_round11_features.py`
+- **测试结果**：通过。注入确定性时钟把上限缩短为 1 秒，验证模型调用前即安全停止、Provider 不被调用且终止文案正确。
+- **遗留问题**：协作式超时无法在 Python 正执行不可中断的第三方 C 扩展时强制杀线程；现有模型请求有网络超时，Shell 工具有进程组超时/取消，因此项目内主要阻塞点均已有边界。
+
+## [2026-08-31 10:54] 第11轮 任务 #4 - 循环上限提醒与续跑
+
+- **修改内容**：核心循环改为动态步数上限，剩余 3 步起发射结构化警告；完成当前上限仍未结束时，通过 Worker Event 请求 GUI 决策。主线程弹出“循环次数接近上限”对话框，选择继续会增加 10 步并记录 `override_max_steps`/`step_extensions`，选择停止则以 `user_declined_step_extension` 正常结束。最多允许连续扩展 3 次；用户停止和最大时长在等待期间仍可立即解除 Event。每次决定均在事件日志记录 Cerebro 继续/停止状态。
+- **涉及文件**：`agent/state.py`、`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`tests/test_round11_features.py`
+- **测试结果**：通过。以 `max_steps=1` 的 FakeProvider 流程验证首次到限触发回调、批准后上限增加 10 步并在第 2 步正常完成；原有无回调模式仍按既定 `max_steps` 硬停止。
+- **遗留问题**：CLI 模式未配置交互回调时保持非交互式硬停止，避免无人值守进程等待标准输入；GUI 模式提供本任务要求的询问与续跑体验。
+
+## [2026-08-31 10:54] 第11轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_round11_features.py -q
+# 9 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 148 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试使用 FakeProvider、offscreen Qt、临时工作区与便携 `ls` 实现，不访问真实 API。完整 GUI 测试实例化主窗口并验证环形控件绘制；高风险确认和循环续跑采用线程安全 Event/Signal 链路。`git diff --check` 未发现空白错误，仅有 Windows 的 LF→CRLF 常规提示。
+
+---
+
+## [2026-08-31 12:28] 第12轮 任务 #1 - 上下文容量扩展至 64K
+
+- **修改内容**：在 `agent/context.py` 新增统一的 `MAX_INPUT_TOKENS = 64_000`，AgentConfig 与 CLI 的默认输入预算均引用该常量；原有 Token 估算 20% 余量和 80% 历史压缩阈值保持不变。OpenAI 兼容 Provider 新增经校验的 `max_tokens` 配置，流式与非流式请求默认均发送 `8192`。Agent 启动时发射预算配置事件，Worker 将“🧠 [Cerebro] 上下文预算已扩容至 64K Tokens”写入事件记录并把 `0/64000` 发送给圆形进度环；后续实际用量继续按核心 `ContextUsage` 更新，因此 GUI 不存在独立硬编码上限。
+- **涉及文件**：`agent/context.py`、`agent/loop.py`、`providers/openai_compatible.py`、`main.py`、`gui/worker.py`、`tests/test_round12_features.py`、`tests/test_gui.py`
+- **测试结果**：通过。30,000 个中文字符连同真实 Tool Schema 的估算输入低于 64K 的 80% 阈值，消息原样保留且 `compressed=False`；Fake OpenAI 客户端验证完整请求包含 `max_tokens=8192`；上下文、Provider 相关 26 项测试全部通过。
+- **遗留问题**：64K 是应用侧保守输入预算，实际模型/兼容网关的上下文上限仍由用户配置的 `AGENT_MODEL` 决定；若选择上限更小的模型，需通过 CLI `--input-budget` 主动调低。输出上限 8192 也可能被特定网关按其服务策略进一步限制。
+
+## [2026-08-31 12:28] 第12轮 任务 #2 - 默认 30 步与无限续跑
+
+- **修改内容**：核心 Agent、CLI 和 GUI 的默认 `max_steps` 统一从 20 提高到 30。每轮开始发射 `step_started(current_step, max_steps)`；Worker 转换为 `step_progress_signal`，底部状态栏通过独立永久标签持续显示“步数：X/Y”，启动阶段同时显示当前步数上限。达到阈值后仍由 GUI 询问，批准时累计步数保持不变、动态上限增加 20，并记录“🧠 [Cerebro] 用户选择继续（步数上限 +20）”；移除了最多 3 次的条件，用户可重复批准直至任务完成、主动停止或达到 20 分钟硬时限。拒绝仍以 `user_declined_step_extension` 安全结束且不再弹窗。
+- **涉及文件**：`agent/loop.py`、`agent/state.py`、`gui/worker.py`、`gui/main_window.py`、`main.py`、`coding_agent_technical_design.md`、`tests/test_round12_features.py`
+- **测试结果**：通过。确定性 Agent 从初始上限 1 开始连续批准 4 次（超过旧限制），阈值依次更新为 21、41、61、81，并在第 62 步正常完成；另一路径验证首次拒绝后立即终止且只调用一次确认。GUI offscreen 测试验证默认 `0/30`、运行时 `12/30`、64K 预算信号及启动日志。
+- **遗留问题**：无限续跑指不限制用户主动批准次数，仍受用户停止、重复工具调用保护和 20 分钟最大时长约束，避免无人值守情况下无限消耗资源。CLI 未配置确认回调时仍按指定上限直接停止。
+
+## [2026-08-31 12:28] 第12轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_round12_features.py tests\test_context.py tests\test_providers.py -q
+# 26 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 155 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试使用 30K 字符内存消息、Fake OpenAI SDK、FakeProvider、offscreen Qt 与临时工作区，不访问真实 API。`git diff --check` 未发现空白错误，仅有 Windows 工作区 LF→CRLF 的常规提示。
+
+---
+
+## [2026-08-31 15:58] 第13轮 任务 #1 - 上下文容量扩展至 320K
+
+- **修改内容**：统一的 `MAX_INPUT_TOKENS` 从 64,000 提升至 320,000，AgentConfig 与 CLI 自动继承新默认值；20% 保守 Token 估算余量和 80% 历史压缩阈值继续保留，因此自动压缩线同步提升到约 256K。OpenAI 兼容 Provider 的流式/非流式 `max_tokens` 默认值由 8,192 提升至 16,384。Worker 启动日志更新为“🧠 [Cerebro] 上下文预算已扩容至 320K Tokens”，并向圆形进度环发送 `0/320000`；圆环继续使用核心传来的动态 budget 计算百分比，无 GUI 重复硬编码。
+- **涉及文件**：`agent/context.py`、`agent/loop.py`、`providers/openai_compatible.py`、`gui/worker.py`、`main.py`、`tests/test_round12_features.py`、`tests/test_gui.py`
+- **测试结果**：通过。以 150,001 个中文字符和真实 Tool Schema 构造输入，完整消息原样进入请求、未触发裁剪或 Work Memory 压缩；Fake SDK 验证请求参数为 `max_tokens=16384`；上下文/Provider 相关 32 项测试全部通过。
+- **遗留问题**：320K 是应用侧预算，不会改变模型服务本身的上下文窗口。若 `AGENT_MODEL` 或兼容网关不支持 320K 输入或 16,384 输出，服务端可能拒绝或自行截断；此时应使用 `--input-budget` 选择该模型的真实上限。
+
+## [2026-08-31 15:58] 第13轮 任务 #2 - 默认 200 步与每次增加 50 步
+
+- **修改内容**：核心 Agent、CLI、Worker 和 GUI 的默认步数上限统一从 30 提升至 200；状态栏从启动开始显示累计“步数：X/200”。用户达到阈值并批准继续时，累计步数不清零、当前上限增加 50，状态栏立即显示新上限，事件日志记录“🧠 [Cerebro] 用户选择继续（步数上限 +50）”。确认对话框同步说明每次增加 50 步；继续次数仍无上限，20 分钟硬超时、重复调用保护和主动停止保持有效。
+- **涉及文件**：`agent/loop.py`、`gui/worker.py`、`gui/main_window.py`、`main.py`、`coding_agent_technical_design.md`、`tests/test_round12_features.py`
+- **测试结果**：通过。150 步确定性任务在默认 200 步内完成且确认回调从未触发；另一任务在第 200 步和第 250 步分别获得批准，上限更新为 250、300，并在第 251 步正常完成。原有连续批准 4 次的测试同步为每次 `+50`，继续证明不存在三次限制。
+- **遗留问题**：默认 200 步会提高复杂任务的潜在模型调用量，但仍由 20 分钟硬时限、用户停止与重复调用检测控制。CLI 未提供交互回调时达到指定上限仍直接结束。
+
+## [2026-08-31 15:58] 第13轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_round12_features.py tests\test_context.py tests\test_providers.py -q
+# 32 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 157 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试完全使用内存消息、FakeProvider、Fake SDK、offscreen Qt 与临时工作区，不访问真实 API。
+
+---
+
+## [2026-08-31 17:35] 空响应错误修复 - 任务 #1 - 响应分类、诊断与自动重试
+
+- **修改内容**：Provider 在解析前输出不含正文的原始结构诊断（响应 keys、choices 数量、finish_reason），并将无 choices、缺少 message、工具调用格式异常分别分类为 `api_empty_choices`、`api_missing_message`、`tool_calls_parse_error`。Agent 请求前记录消息数、包含 Tool Schema 的 Token 估算、最近 3 条消息的角色与 50 字符摘要，同时检查空 assistant 等协议异常。`content` 与 `tool_calls` 同时为空时，不把空 assistant 写入历史，按 1 秒、2 秒指数退避自动重试两次；耗尽后才以 `empty_response` 停止，并在 `AgentState.error_history` 保存结构化诊断。
+- **涉及文件**：`providers/openai_compatible.py`、`agent/loop.py`、`agent/state.py`、`gui/worker.py`、`tests/test_agent_loop.py`、`tests/test_providers.py`
+- **测试结果**：通过。覆盖两次空响应后恢复、连续三次空响应后停止、重试上下文无空消息污染、无 choices、缺少 message、畸形 tool_calls，以及响应结构日志。
+- **遗留问题**：真实模型的服务端内部原因无法由 OpenAI 兼容协议完全观测；当前诊断仅记录结构和安全摘要，不打印 API Key、完整提示词或完整模型正文。
+
+## [2026-08-31 17:35] 空响应错误修复 - 任务 #2 - 长上下文与工具历史降载
+
+- **修改内容**：Provider 暴露可由 `AGENT_MODEL_INPUT_TOKENS` 配置的模型真实输入上限，核心实际预算取应用 320K 与模型上限的较小值，并在每次请求前通过现有 `fit_context` 强制执行协议单元安全压缩。工具调用协议单元超过 30 条时，旧记录压缩为 `WORK_MEMORY_JSON`，保留最近 20 条 Assistant+Tool 完整单元。请求级超时默认 120 秒；支持 `max_completion_tokens` 的网关可通过 `AGENT_USE_MAX_COMPLETION_TOKENS=1` 发送 8192，否则继续使用既有 `max_tokens=16384`，避免同时发送两个互斥参数。`finish_reason=length` 时保留部分正文并发出截断告警，`content_filter` 单独记录。
+- **涉及文件**：`agent/context.py`、`agent/loop.py`、`providers/openai_compatible.py`、`gui/worker.py`、`.env.example`、`tests/test_context.py`、`tests/test_agent_loop.py`、`tests/test_providers.py`
+- **测试结果**：通过。覆盖 31 个工具协议单元压缩后保留最近 20 个且不拆分、动态模型预算、120 秒请求超时、可选 8192 completion limit，以及 length 截断仍返回部分回答。
+- **遗留问题**：320K 是应用上限而非对所有模型的能力保证；使用输入窗口更小的模型时应设置 `AGENT_MODEL_INPUT_TOKENS` 为厂商公布的真实值。不同兼容网关对 `max_completion_tokens` 的支持不一致，因此默认保持关闭并提供显式能力开关。
+
+## [2026-08-31 17:35] 空响应错误修复 - 任务 #3 - 友好错误展示与重试入口
+
+- **修改内容**：Worker 将模型错误码映射为中文友好提示，把技术异常与有界结构化诊断写入事件日志，并通过新增 `error_signal` 通知主窗口。输入栏旁新增仅在模型/API 错误后显示的“🔄 重试”按钮；重试会创建新的 Worker 和 AgentState，沿用当前会话历史与上一条任务，但不会重复添加用户消息。正常完成后自动隐藏按钮，后台会话错误不会污染当前会话 UI。
+- **涉及文件**：`gui/worker.py`、`gui/main_window.py`、`gui/theme.py`、`README.txt`、`tests/test_gui.py`
+- **测试结果**：通过。覆盖空响应友好提示、诊断日志、重试按钮显示，以及重试后用户消息不重复且新回答正确落入原会话。
+- **遗留问题**：自动化测试使用 FakeProvider 与 offscreen Qt，不访问真实 DeepSeek/百炼服务；真实大上下文请求的网关错误文案与首 Token 延迟仍需在用户 API Key 和网络环境下手工验收。
+
+## [2026-08-31 17:35] 空响应错误修复 - 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 167 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。所有新增测试使用 FakeProvider、Fake OpenAI SDK、offscreen Qt 与临时工作区，不消耗真实 API。

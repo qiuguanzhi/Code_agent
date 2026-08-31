@@ -21,4 +21,4 @@ addopts = "-ra -p no:cacheprovider"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "gui*", "providers*", "tools*", "utils*"]
+include = ["agent*", "gui*", "providers*", "skills*", "tools*", "utils*"]

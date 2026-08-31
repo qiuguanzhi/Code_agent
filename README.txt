@@ -30,5 +30,7 @@ read_file、write_file、delete_file 和 run_command 全部在本地执行。文
 
 桌面版提供暗色/亮色主题、多会话、文件树、手动编辑、文件引用、实时日志、模型回答与深度推理流式显示。文件修改先暂存为多文件 Unified Diff，由用户统一应用或拒绝；任务前自动创建快照，可安全回退。
 
+模型空响应会进行两次自动重试，并在事件日志中给出无 choices、缺少 message、工具调用格式异常、响应超时或上下文问题等分类诊断。模型/API 错误后可点击输入栏旁的“重试”按钮，以新的 Agent 状态重新执行上一任务，同时保留当前会话记录。模型真实输入上限可通过 AGENT_MODEL_INPUT_TOKENS 配置；只有网关明确支持时才应启用 AGENT_USE_MAX_COMPLETION_TOKENS=1。
+
 三、其它说明
-支持 DeepSeek 与阿里云百炼 OpenAI 兼容接口。测试默认使用 FakeProvider 和临时工作区，不消耗真实 API。当前自动化回归结果为 139 passed、1 skipped；跳过项是测试环境无符号链接权限，不影响正常功能。
+支持 DeepSeek 与阿里云百炼 OpenAI 兼容接口。测试默认使用 FakeProvider 和临时工作区，不消耗真实 API。当前自动化回归结果为 167 passed、1 skipped；跳过项是测试环境无符号链接权限，不影响正常功能。

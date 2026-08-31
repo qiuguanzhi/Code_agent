@@ -37,6 +37,18 @@ class AgentState:
     messages: list[dict[str, Any]] = field(default_factory=list)
     step: int = 0
     started_at: float = field(default_factory=time.monotonic)
+    start_time: float = field(default_factory=time.time)
+    max_duration_seconds: float = 1_200.0
+    allow_continue: bool = False
+    override_max_steps: bool = False
+    step_extensions: int = 0
+    context_used_tokens: int = 0
+    context_budget_tokens: int = 0
+    context_compressions: int = 0
+    tool_history_compressions: int = 0
+    empty_response_retries: int = 0
+    last_error_code: str | None = None
+    error_history: list[dict[str, Any]] = field(default_factory=list)
     repeated_signatures: dict[str, int] = field(default_factory=dict)
     tool_result_cache: dict[str, str] = field(default_factory=dict)
     changed_files: dict[str, str] = field(default_factory=dict)

@@ -25,6 +25,8 @@ from tools.filesystem import (
 )
 from tools.schemas import get_tool_schemas
 from tools.shell import run_command
+from skills.base import AgentContext
+from skills.registry import SkillRegistry
 
 
 WRITE_POLICY: dict[str, bool] = {"require_confirmation": True}
@@ -47,6 +49,8 @@ class ToolRegistry:
         should_stop: Callable[[], bool] | None = None,
         defer_writes: bool = False,
         forbidden_tools: Collection[str] | None = None,
+        skill_registry: SkillRegistry | None = None,
+        on_skill_update: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.workspace = workspace.resolve(strict=True)
         self.write_policy = dict(WRITE_POLICY if write_policy is None else write_policy)
@@ -55,7 +59,26 @@ class ToolRegistry:
         self.should_stop = should_stop
         self.defer_writes = defer_writes
         self.forbidden_tools = frozenset(forbidden_tools or ())
-        self.schemas = get_tool_schemas()
+        self.skill_registry = skill_registry
+        self.on_skill_update = on_skill_update
+        self._native_schemas = get_tool_schemas()
+        self.schemas = list(self._native_schemas)
+        if self.skill_registry is not None:
+            skill_schemas = self.skill_registry.get_skills_as_tools()
+            native_names = {
+                str(schema.get("function", {}).get("name", ""))
+                for schema in self._native_schemas
+            }
+            collisions = sorted(
+                str(schema.get("function", {}).get("name", ""))
+                for schema in skill_schemas
+                if str(schema.get("function", {}).get("name", "")) in native_names
+            )
+            if collisions:
+                raise ValueError(
+                    "skill names cannot shadow native tools: " + ", ".join(collisions)
+                )
+            self.schemas.extend(skill_schemas)
 
     def _confirm_write(self, path: str) -> bool:
         """Placeholder confirmation hook for file modifications."""
@@ -112,7 +135,25 @@ class ToolRegistry:
                 return self._cache_result(call.id, result, state)
 
         try:
-            if call.name == "read_file":
+            skill = (
+                self.skill_registry.get_skill(call.name)
+                if self.skill_registry is not None
+                else None
+            )
+            if skill is not None:
+                context = AgentContext(
+                    workspace=self.workspace,
+                    execute_tool=lambda name, params: self._execute_native_for_skill(
+                        name,
+                        params,
+                        state,
+                        skill_permissions=skill.required_permissions,
+                        high_risk=skill.high_risk,
+                    ),
+                    emit_update=self.on_skill_update,
+                )
+                result = self.skill_registry.execute(call.name, arguments, context)
+            elif call.name == "read_file":
                 staged = self._pending_write_for_path(
                     state,
                     str(arguments["path"]),
@@ -186,6 +227,106 @@ class ToolRegistry:
 
         self._raise_if_stopped()
         return self._cache_result(call.id, result, state)
+
+    def _execute_native_for_skill(
+        self,
+        name: str,
+        params: dict[str, Any],
+        state: AgentState,
+        *,
+        skill_permissions: Collection[str],
+        high_risk: bool,
+    ) -> dict[str, Any]:
+        """Validate a nested native call and enforce capability boundaries."""
+
+        if name in self.forbidden_tools:
+            return tool_error(
+                "task_scope_violation",
+                f"tool {name} conflicts with an explicit user constraint",
+            )
+        required_permission = {
+            "read_file": "filesystem",
+            "write_file": "filesystem_write",
+            "delete_file": "filesystem_write",
+            "run_command": "process",
+        }.get(name)
+        if required_permission is None:
+            return tool_error("unknown_tool", f"unknown native tool: {name}")
+        if required_permission not in skill_permissions:
+            return tool_error(
+                "skill_capability_denied",
+                f"skill did not declare permission: {required_permission}",
+            )
+        if name in {"write_file", "delete_file"} and not high_risk:
+            return tool_error(
+                "skill_capability_denied",
+                "filesystem mutation requires a high-risk skill",
+            )
+        nested = ToolCall(
+            id=f"skill:{name}:{len(state.tool_result_cache)}",
+            name=name,
+            arguments_json=json.dumps(params, ensure_ascii=False),
+        )
+        try:
+            arguments = parse_tool_arguments(nested, self._native_schemas)
+        except ToolArgumentsError as exc:
+            return tool_error(exc.code, str(exc), details=exc.details)
+
+        if name == "read_file":
+            staged = self._pending_write_for_path(state, str(arguments["path"]))
+            if staged is not None:
+                return read_staged_file(
+                    path=str(arguments["path"]),
+                    content=str(staged["content"]),
+                    start_line=int(arguments["start_line"]),
+                    max_lines=int(arguments["max_lines"]),
+                    max_chars=int(arguments["max_chars"]),
+                )
+            return read_file(self.workspace, **arguments)
+        if name == "run_command":
+            if self.defer_writes and state.pending_writes:
+                return tool_error(
+                    "pending_writes_require_confirmation",
+                    "staged writes are not on disk yet",
+                )
+            return run_command(
+                self.workspace,
+                **arguments,
+                should_stop=self.should_stop,
+            )
+        if name == "write_file":
+            if self.defer_writes:
+                result = stage_write_file(
+                    self.workspace,
+                    pending_writes=state.pending_writes,
+                    **arguments,
+                )
+                if result.get("ok") is True:
+                    staged_path = str(result.get("meta", {}).get("path", ""))
+                    staged_entry = self._pending_write_for_path(state, staged_path)
+                    if staged_entry is not None:
+                        staged_entry["step"] = state.step
+                return result
+            if (
+                self.write_policy.get("require_confirmation", True)
+                and not self._confirm_write(str(arguments["path"]))
+            ):
+                return tool_error("user_aborted", "user rejected skill write")
+            result = write_file(self.workspace, **arguments)
+            if result.get("ok") is True:
+                meta = result.get("meta", {})
+                path = str(arguments["path"])
+                if isinstance(meta.get("sha256"), str):
+                    state.changed_file_hashes[path] = meta["sha256"]
+                if isinstance(meta.get("diff"), str):
+                    state.changed_files[path] = meta["diff"]
+            return result
+        if self.defer_writes and state.pending_writes:
+            return tool_error(
+                "pending_writes_require_confirmation",
+                "confirm or reject staged writes before deleting files",
+            )
+        return delete_file(self.workspace, **arguments)
 
     def _pending_write_for_path(
         self,

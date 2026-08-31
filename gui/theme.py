@@ -71,7 +71,7 @@ QWidget#cerebroBackground {{ background-color: {colors['background']}; }}
 QWidget#workspacePanel, QWidget#conversationPanel, QWidget#codePanel {{
     background: transparent;
 }}
-QWidget#pulseIndicator, QWidget#alphaWaveIndicator {{
+QWidget#pulseIndicator, QWidget#alphaWaveIndicator, QWidget#contextRing {{
     background: transparent;
     border: 0;
 }}
@@ -130,6 +130,20 @@ QPushButton#sendButton:pressed {{ background-color: #238e69; }}
 QPushButton#sendButton:disabled {{
     background-color: #888888;
     color: #eeeeee;
+}}
+QPushButton#retryButton {{
+    background-color: {colors['warning']};
+    color: {colors['background']};
+    border: 0;
+    font-weight: 600;
+    padding: 7px 12px;
+}}
+QPushButton#retryButton:hover {{
+    background-color: {colors['accent']};
+}}
+QPushButton#retryButton:disabled {{
+    background-color: {colors['border']};
+    color: {colors['muted']};
 }}
 QPushButton#sendButton[stopMode="true"] {{
     background-color: {colors['stop_background']};

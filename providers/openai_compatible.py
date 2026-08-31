@@ -14,12 +14,26 @@ from agent.state import AssistantTurn, ToolCall
 from providers.base import ModelProvider
 
 
+MAX_OUTPUT_TOKENS = 16_384
+
+
 class ProviderConfigurationError(ValueError):
     """Raised when required provider configuration is missing or invalid."""
 
 
 class ProviderResponseError(ValueError):
     """Raised when a provider response cannot be normalized safely."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
 
 
 class ProviderStopRequested(RuntimeError):
@@ -46,6 +60,35 @@ def _usage_dict(usage: Any) -> dict[str, int]:
     else:
         return {}
     return {str(key): value for key, value in raw.items() if isinstance(value, int)}
+
+
+def _response_keys(response: Any) -> list[str]:
+    """Return structural response keys without serializing user/model content."""
+
+    if isinstance(response, Mapping):
+        return sorted(str(key) for key in response)
+    model_fields = getattr(response, "model_fields", None)
+    if isinstance(model_fields, Mapping):
+        return sorted(str(key) for key in model_fields)
+    values = getattr(response, "__dict__", None)
+    if isinstance(values, Mapping):
+        return sorted(str(key) for key in values if not str(key).startswith("_"))
+    return []
+
+
+def _log_response_shape(response: Any) -> None:
+    """Print a content-free structural summary for empty-response diagnosis."""
+
+    choices = _field(response, "choices", [])
+    choice_count = len(choices) if isinstance(choices, Sequence) else -1
+    finish_reason: Any = None
+    if isinstance(choices, Sequence) and choices:
+        finish_reason = _field(choices[0], "finish_reason")
+    print(
+        "[Cerebro::Provider] response_shape "
+        f"keys={_response_keys(response)} choices={choice_count} "
+        f"finish_reason={finish_reason!r}"
+    )
 
 
 def _can_fallback_from_stream(exc: Exception) -> bool:
@@ -151,6 +194,11 @@ class OpenAICompatibleProvider(ModelProvider):
         reasoning_effort: str | None = None,
         should_stop: Callable[[], bool] | None = None,
         temperature: float = 0.0,
+        max_tokens: int = MAX_OUTPUT_TOKENS,
+        request_timeout_seconds: float = 120.0,
+        max_completion_tokens: int = 8_192,
+        supports_max_completion_tokens: bool = False,
+        max_input_tokens: int = 320_000,
     ) -> None:
         if not model.strip():
             raise ProviderConfigurationError("model must be a non-empty string")
@@ -160,6 +208,19 @@ class OpenAICompatibleProvider(ModelProvider):
         self.reasoning_effort = reasoning_effort
         self.should_stop = should_stop
         self.temperature = temperature
+        if max_tokens < 1:
+            raise ProviderConfigurationError("max_tokens must be positive")
+        if request_timeout_seconds <= 0:
+            raise ProviderConfigurationError("request_timeout_seconds must be positive")
+        if max_completion_tokens < 1:
+            raise ProviderConfigurationError("max_completion_tokens must be positive")
+        if max_input_tokens < 1:
+            raise ProviderConfigurationError("max_input_tokens must be positive")
+        self.max_tokens = max_tokens
+        self.request_timeout_seconds = request_timeout_seconds
+        self.max_completion_tokens = max_completion_tokens
+        self.supports_max_completion_tokens = supports_max_completion_tokens
+        self.max_input_tokens = max_input_tokens
 
     def complete(
         self,
@@ -174,6 +235,7 @@ class OpenAICompatibleProvider(ModelProvider):
         print(f"[Cerebro::Provider] request model={self.model} stream=false")
         request = self._request_payload(messages, tools, stream=False)
         response = self.client.chat.completions.create(**request)
+        _log_response_shape(response)
         turn = self._normalize_response(response)
         duration_ms = (time.perf_counter() - started_at) * 1_000
         print(
@@ -199,6 +261,8 @@ class OpenAICompatibleProvider(ModelProvider):
         tool_parts: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
         usage: dict[str, int] = {}
+        chunk_count = 0
+        choices_seen = 0
         tagged_reasoning = _TaggedReasoningDemultiplexer()
         started_at = time.perf_counter()
         print(f"[Cerebro::Provider] request model={self.model} stream=true")
@@ -207,10 +271,12 @@ class OpenAICompatibleProvider(ModelProvider):
                 **self._request_payload(messages, tools, stream=True)
             )
             for chunk in stream:
+                chunk_count += 1
                 if self.should_stop is not None and self.should_stop():
                     raise ProviderStopRequested("user requested stop during model request")
                 choices = _field(chunk, "choices", []) or []
                 if choices:
+                    choices_seen += len(choices)
                     choice = choices[0]
                     delta = _field(choice, "delta")
                     if delta is not None:
@@ -278,6 +344,22 @@ class OpenAICompatibleProvider(ModelProvider):
             if on_reasoning_chunk is not None:
                 on_reasoning_chunk(trailing_reasoning)
 
+        print(
+            "[Cerebro::Provider] stream_shape "
+            f"chunks={chunk_count} choices={choices_seen} "
+            f"finish_reason={finish_reason!r}"
+        )
+        if choices_seen == 0:
+            raise ProviderResponseError(
+                "api_empty_choices",
+                "streaming response contained no choices",
+                details={
+                    "chunks": chunk_count,
+                    "choices_seen": choices_seen,
+                    "finish_reason": finish_reason,
+                },
+            )
+
         normalized_calls: list[ToolCall] = []
         protocol_calls: list[dict[str, Any]] = []
         for index in sorted(tool_parts):
@@ -287,7 +369,9 @@ class OpenAICompatibleProvider(ModelProvider):
             arguments = item["arguments"]
             if not name or not arguments:
                 raise ProviderResponseError(
-                    "streamed tool call name and arguments must be non-empty"
+                    "tool_calls_parse_error",
+                    "streamed tool call name and arguments must be non-empty",
+                    details={"index": index, "finish_reason": finish_reason},
                 )
             normalized_calls.append(ToolCall(call_id, name, arguments))
             protocol_calls.append(
@@ -334,9 +418,14 @@ class OpenAICompatibleProvider(ModelProvider):
             "tools": list(tools),
             "tool_choice": "auto",
             "temperature": self.temperature,
+            "timeout": self.request_timeout_seconds,
             "stream": stream,
             "extra_body": self.extra_body,
         }
+        if self.supports_max_completion_tokens:
+            request["max_completion_tokens"] = self.max_completion_tokens
+        else:
+            request["max_tokens"] = self.max_tokens
         if self.reasoning_effort is not None:
             request["reasoning_effort"] = self.reasoning_effort
         return request
@@ -376,22 +465,40 @@ class OpenAICompatibleProvider(ModelProvider):
 
         choices = _field(response, "choices", [])
         if not isinstance(choices, Sequence) or not choices:
-            raise ProviderResponseError("provider response contains no choices")
+            raise ProviderResponseError(
+                "api_empty_choices",
+                "provider response contains no choices",
+                details={
+                    "response_keys": _response_keys(response),
+                    "choices_count": 0,
+                },
+            )
 
         choice = choices[0]
         message = _field(choice, "message")
         if message is None:
-            raise ProviderResponseError("provider choice contains no message")
+            raise ProviderResponseError(
+                "api_missing_message",
+                "provider choice contains no message",
+                details={"finish_reason": _field(choice, "finish_reason")},
+            )
 
         content = _field(message, "content")
         if content is not None and not isinstance(content, str):
-            raise ProviderResponseError("assistant content must be text or null")
+            raise ProviderResponseError(
+                "invalid_content_type",
+                "assistant content must be text or null",
+            )
 
         normalized_calls: list[ToolCall] = []
         protocol_calls: list[dict[str, Any]] = []
         raw_calls = _field(message, "tool_calls", []) or []
         if not isinstance(raw_calls, Sequence):
-            raise ProviderResponseError("assistant tool_calls must be a sequence")
+            raise ProviderResponseError(
+                "tool_calls_parse_error",
+                "assistant tool_calls must be a sequence",
+                details={"finish_reason": _field(choice, "finish_reason")},
+            )
         for raw_call in raw_calls:
             call_id = _field(raw_call, "id")
             call_type = _field(raw_call, "type", "function")
@@ -399,7 +506,11 @@ class OpenAICompatibleProvider(ModelProvider):
             name = _field(function, "name")
             arguments = _field(function, "arguments")
             if not all(isinstance(item, str) and item for item in (call_id, name, arguments)):
-                raise ProviderResponseError("tool call id, name, and arguments must be non-empty strings")
+                raise ProviderResponseError(
+                    "tool_calls_parse_error",
+                    "tool call id, name, and arguments must be non-empty strings",
+                    details={"finish_reason": _field(choice, "finish_reason")},
+                )
             normalized_calls.append(
                 ToolCall(id=call_id, name=name, arguments_json=arguments)
             )
@@ -423,7 +534,10 @@ class OpenAICompatibleProvider(ModelProvider):
             reasoning_content = _field(message, "reasoning")
         if reasoning_content is not None:
             if not isinstance(reasoning_content, str):
-                raise ProviderResponseError("reasoning_content must be text or null")
+                raise ProviderResponseError(
+                    "invalid_reasoning_type",
+                    "reasoning_content must be text or null",
+                )
             protocol_message["reasoning_content"] = reasoning_content
 
         finish_reason = _field(choice, "finish_reason")
@@ -475,6 +589,30 @@ def create_provider_from_env(
     if not 1.0 <= api_timeout <= 300.0:
         raise ProviderConfigurationError("AGENT_API_TIMEOUT must be between 1 and 300")
 
+    request_timeout_text = os.getenv("AGENT_REQUEST_TIMEOUT", "120")
+    try:
+        request_timeout = float(request_timeout_text)
+    except ValueError as exc:
+        raise ProviderConfigurationError("AGENT_REQUEST_TIMEOUT must be numeric") from exc
+    if not 1.0 <= request_timeout <= 600.0:
+        raise ProviderConfigurationError(
+            "AGENT_REQUEST_TIMEOUT must be between 1 and 600"
+        )
+
+    input_limit_text = os.getenv("AGENT_MODEL_INPUT_TOKENS", "320000")
+    try:
+        model_input_tokens = int(input_limit_text)
+    except ValueError as exc:
+        raise ProviderConfigurationError(
+            "AGENT_MODEL_INPUT_TOKENS must be an integer"
+        ) from exc
+    if model_input_tokens < 1:
+        raise ProviderConfigurationError("AGENT_MODEL_INPUT_TOKENS must be positive")
+    supports_completion_tokens = os.getenv(
+        "AGENT_USE_MAX_COMPLETION_TOKENS",
+        "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
     if normalized == "deepseek":
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
@@ -496,6 +634,9 @@ def create_provider_from_env(
             resolved_model,
             extra_body=thinking_body,
             reasoning_effort="high" if mode == "goal" else None,
+            request_timeout_seconds=request_timeout,
+            supports_max_completion_tokens=supports_completion_tokens,
+            max_input_tokens=model_input_tokens,
         )
 
     if normalized in {"bailian", "dashscope"}:
@@ -515,6 +656,9 @@ def create_provider_from_env(
             client,
             resolved_model,
             extra_body={"enable_thinking": mode == "goal"},
+            request_timeout_seconds=request_timeout,
+            supports_max_completion_tokens=supports_completion_tokens,
+            max_input_tokens=model_input_tokens,
         )
 
     raise ProviderConfigurationError(f"unsupported provider: {provider_name}")

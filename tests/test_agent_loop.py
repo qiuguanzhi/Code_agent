@@ -72,6 +72,17 @@ def _final_turn(content: str = "Task completed and tests pass.") -> AssistantTur
     )
 
 
+def _empty_turn(*, finish_reason: str | None = None) -> AssistantTurn:
+    """Build a structurally valid response with no actionable payload."""
+
+    return AssistantTurn(
+        content=None,
+        tool_calls=[],
+        protocol_message={"role": "assistant", "content": None},
+        finish_reason=finish_reason,
+    )
+
+
 def _create_buggy_workspace(tmp_path: Path) -> tuple[Path, Path]:
     """Create a tiny project whose zero-division behavior needs repair."""
 
@@ -224,6 +235,83 @@ def test_run_agent_retries_transient_model_errors(tmp_path: Path) -> None:
     assert result.status == "completed"
     assert provider.calls == 3
     assert delays == [0.1, 0.2]
+
+
+def test_run_agent_retries_empty_turn_without_polluting_context(tmp_path: Path) -> None:
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    provider = FakeProvider([_empty_turn(), _empty_turn(), _final_turn("已恢复")])
+    delays: list[float] = []
+    events: list[dict[str, Any]] = []
+
+    result = run_agent(
+        "continue after empty responses",
+        AgentConfig(
+            workspace=workspace,
+            provider=provider,
+            sleep_fn=delays.append,
+        ),
+        events.append,
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "已恢复"
+    assert provider.calls == 3
+    assert delays == [1.0, 2.0]
+    assert result.state.empty_response_retries == 2
+    assert [event["event"] for event in events].count("empty_response_retry") == 2
+    assert not any(
+        message.get("role") == "assistant"
+        and message.get("content") is None
+        and not message.get("tool_calls")
+        for message in provider.requests[1]
+    )
+
+
+def test_run_agent_stops_only_after_empty_response_retries_are_exhausted(
+    tmp_path: Path,
+) -> None:
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    provider = FakeProvider([_empty_turn(), _empty_turn(), _empty_turn()])
+    delays: list[float] = []
+    events: list[dict[str, Any]] = []
+
+    result = run_agent(
+        "diagnose empty response",
+        AgentConfig(
+            workspace=workspace,
+            provider=provider,
+            sleep_fn=delays.append,
+        ),
+        events.append,
+    )
+
+    assert result.status == "stopped"
+    assert result.reason == "empty_response"
+    assert result.state.last_error_code == "empty_content_and_tools"
+    assert result.state.empty_response_retries == 2
+    assert delays == [1.0, 2.0]
+    terminal = next(event for event in events if event["event"] == "run_stopped")
+    assert terminal["data"]["error_code"] == "empty_content_and_tools"
+    assert "已自动重试 2 次" in terminal["message"]
+
+
+def test_run_agent_keeps_partial_text_when_finish_reason_is_length(
+    tmp_path: Path,
+) -> None:
+    workspace, _ = _create_buggy_workspace(tmp_path)
+    partial = _final_turn("部分但可用的回答")
+    partial.finish_reason = "length"
+    events: list[dict[str, Any]] = []
+
+    result = run_agent(
+        "return partial response",
+        AgentConfig(workspace=workspace, provider=FakeProvider([partial])),
+        events.append,
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "部分但可用的回答"
+    assert any(event["event"] == "response_truncated" for event in events)
 
 
 def test_run_agent_stops_at_max_steps(tmp_path: Path) -> None:

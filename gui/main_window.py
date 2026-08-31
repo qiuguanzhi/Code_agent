@@ -69,16 +69,19 @@ from PySide6.QtWidgets import (
 )
 
 from gui.session import Conversation, ConversationStore
+from gui.skill_dialog import SkillManagerDialog
 from gui.theme import get_theme
 from gui.widgets import (
     BatchDiffWidget,
     BrainWaveIndicator,
     CerebroBackground,
     ConversationScrollArea,
+    ContextRing,
     FileMentionPopup,
     PulseIndicator,
 )
 from gui.worker import AgentWorker
+from skills.registry import SkillRegistry
 from tools.filesystem import (
     DEFAULT_MAX_WRITE_BYTES,
     resolve_in_workspace,
@@ -131,7 +134,19 @@ class MainWindow(QMainWindow):
         # editor saves use their own button and intentionally do not enter this
         # Agent confirmation path.
         self.interactive_confirmation = True
-        self.max_steps = 20
+        self.max_steps = 200
+        self.max_duration_seconds = 1_200.0
+        saved_skills = self.settings.value("skills/enabled", None)
+        enabled_names = (
+            frozenset(str(name) for name in saved_skills)
+            if isinstance(saved_skills, list)
+            else None
+        )
+        self.skill_registry = SkillRegistry.discover_builtin(
+            enabled_names=enabled_names,
+        )
+        self.enabled_skills = self.skill_registry.enabled_names()
+        self.skill_permissions = self._enabled_skill_permissions()
         self.worker: AgentWorker | None = None
         self._running_session_id: str | None = None
         self._close_pending = False
@@ -162,6 +177,9 @@ class MainWindow(QMainWindow):
         self._stream_message_indices: dict[str, int] = {}
         self._stream_buffers: dict[str, str] = {}
         self._loading_base_text = "初始化环境"
+        self._last_submitted_task = ""
+        self._retrying_last_task = False
+        self._last_retry_error_code = ""
 
         self.setWindowTitle("Cerebro Coding Agent")
         self.setAcceptDrops(True)
@@ -173,6 +191,9 @@ class MainWindow(QMainWindow):
         self._create_tool_bar()
         self._create_central_widget()
         self.statusBar().setObjectName("statusBar")
+        self.step_counter_label = QLabel(f"步数：0/{self.max_steps}", self)
+        self.step_counter_label.setObjectName("stepCounterLabel")
+        self.statusBar().addPermanentWidget(self.step_counter_label)
 
         self.waiting_timer = QTimer(self)
         self.waiting_timer.setInterval(500)
@@ -358,6 +379,10 @@ class MainWindow(QMainWindow):
         self.theme_button.setObjectName("themeButton")
         self.theme_button.clicked.connect(self._toggle_theme)
         toolbar.addWidget(self.theme_button)
+        self.skill_button = QPushButton("🧩 技能", self)
+        self.skill_button.setObjectName("skillButton")
+        self.skill_button.clicked.connect(self._show_skill_manager)
+        toolbar.addWidget(self.skill_button)
 
     def _create_central_widget(self) -> None:
         """Build the adjustable workspace, conversation, and code columns."""
@@ -549,6 +574,8 @@ class MainWindow(QMainWindow):
         self.waiting_indicator.setVisible(False)
         layout.addWidget(self.waiting_indicator)
         input_row = QHBoxLayout()
+        self.context_ring = ContextRing(self.theme_colors, panel)
+        input_row.addWidget(self.context_ring)
         self.task_input = QLineEdit(panel)
         self.task_input.setObjectName("taskInput")
         self.task_input.setPlaceholderText("")
@@ -565,6 +592,12 @@ class MainWindow(QMainWindow):
         self.send_button.setObjectName("sendButton")
         self.send_button.clicked.connect(self._submit_task)
         input_row.addWidget(self.send_button)
+        self.retry_button = QPushButton("🔄 重试", panel)
+        self.retry_button.setObjectName("retryButton")
+        self.retry_button.setToolTip("使用保留的对话历史重新执行上一条任务")
+        self.retry_button.setVisible(False)
+        self.retry_button.clicked.connect(self._retry_last_task)
+        input_row.addWidget(self.retry_button)
         self.thinking_mode_combo = QComboBox(panel)
         self.thinking_mode_combo.setObjectName("thinkingModeCombo")
         self.thinking_mode_combo.addItem("快速", "quick")
@@ -662,7 +695,11 @@ class MainWindow(QMainWindow):
         """Create the production worker at a test-injection boundary."""
 
         _ = task
-        return AgentWorker(mode=self.mode)
+        return AgentWorker(
+            mode=self.mode,
+            enabled_skills=self.enabled_skills,
+            skill_permissions=self.skill_permissions,
+        )
 
     @Slot()
     def _submit_task(self) -> None:
@@ -679,11 +716,18 @@ class MainWindow(QMainWindow):
         self.file_mention_popup.hide()
         task = self.task_input.text().strip()
         if not task:
+            self._retrying_last_task = False
             self._record_ui_timing("submit_task_ms", started)
             return
         self.task_input.clear()
         conversation = self.session_store.active
-        self.session_store.add_message("user", task, conversation_id=conversation.id)
+        retrying = self._retrying_last_task
+        self._retrying_last_task = False
+        self._last_submitted_task = task
+        self._last_retry_error_code = ""
+        self.retry_button.setVisible(False)
+        if not retrying:
+            self.session_store.add_message("user", task, conversation_id=conversation.id)
         self._refresh_session_combo()
         self._render_active_session()
 
@@ -721,7 +765,14 @@ class MainWindow(QMainWindow):
         self.worker.reasoning_signal.connect(self._append_reasoning)
         self.worker.tool_status_signal.connect(self.update_tool_status)
         self.worker.stream_signal.connect(self._append_stream_delta)
+        self.worker.context_signal.connect(self._update_context_usage)
+        self.worker.step_warning_signal.connect(self._show_step_warning)
+        self.worker.step_confirmation_signal.connect(self._ask_step_extension)
+        self.worker.step_progress_signal.connect(self._update_step_progress)
+        self.worker.skill_confirmation_signal.connect(self._ask_high_risk_skill)
+        self.worker.error_signal.connect(self._show_retryable_error)
         self.confirm_signal.connect(self.worker.resolve_write_confirmation)
+        self._update_step_progress(0, self.max_steps)
         try:
             self.worker.start_agent(
                 task,
@@ -729,6 +780,7 @@ class MainWindow(QMainWindow):
                 self.max_steps,
                 self.interactive_confirmation,
                 conversation.id,
+                self.max_duration_seconds,
             )
         except (RuntimeError, ValueError) as exc:
             self._disconnect_confirmation()
@@ -741,6 +793,40 @@ class MainWindow(QMainWindow):
         self._record_ui_timing("submit_task_ms", started)
 
     @Slot()
+    def _retry_last_task(self) -> None:
+        """Re-run the last task with a fresh worker while preserving history."""
+
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self._last_submitted_task or self.workspace_root is None:
+            self.update_status("error", "没有可重试的任务，或工作区尚未打开")
+            return
+        self.retry_button.setEnabled(False)
+        self._retrying_last_task = True
+        self.task_input.setText(self._last_submitted_task)
+        self._submit_task()
+
+    @Slot(str, str)
+    def _show_retryable_error(self, code: str, message: str) -> None:
+        """Show the retry affordance for model/API failures only."""
+
+        if self._running_session_id != self.session_store.active_id:
+            return
+        retryable_codes = {
+            "api_empty_choices",
+            "api_missing_message",
+            "empty_content_and_tools",
+            "tool_calls_parse_error",
+            "api_timeout",
+            "model_api_error",
+        }
+        self._last_retry_error_code = code
+        self.retry_button.setToolTip(message)
+        self.retry_button.setVisible(code in retryable_codes)
+        self.retry_button.setEnabled(False)
+        self.update_status("error", message)
+
+    @Slot()
     def _stop_agent(self) -> None:
         """Request cooperative cancellation without discarding partial state."""
 
@@ -748,6 +834,82 @@ class MainWindow(QMainWindow):
             return
         self.worker.stop()
         self.send_button.setEnabled(False)
+
+    @Slot()
+    def _show_skill_manager(self) -> None:
+        """Open the runtime-skill enablement dialog and persist acceptance."""
+
+        discovered = SkillRegistry.discover_builtin(enabled_names=self.enabled_skills)
+        dialog = SkillManagerDialog(discovered, self)
+        if dialog.exec() != SkillManagerDialog.DialogCode.Accepted:
+            return
+        self.skill_registry = dialog.registry
+        self.enabled_skills = dialog.enabled_names()
+        self.skill_permissions = self._enabled_skill_permissions()
+        self.settings.setValue("skills/enabled", sorted(self.enabled_skills))
+        self.settings.sync()
+        self.statusBar().showMessage(f"已启用 {len(self.enabled_skills)} 个技能", 3_000)
+
+    def _enabled_skill_permissions(self) -> frozenset[str]:
+        """Treat explicit GUI enablement as the permission grant for that Skill."""
+
+        permissions: set[str] = set()
+        for skill in self.skill_registry.list_skills():
+            if skill.name in self.enabled_skills:
+                permissions.update(skill.required_permissions)
+        return frozenset(permissions)
+
+    @Slot(int, int)
+    def _update_context_usage(self, used_tokens: int, budget_tokens: int) -> None:
+        """Refresh the circular context indicator from a worker signal."""
+
+        self.context_ring.set_usage(used_tokens, budget_tokens)
+
+    @Slot(int, int)
+    def _show_step_warning(self, remaining_steps: int, max_steps: int) -> None:
+        """Surface the non-blocking three-step warning in the status bar."""
+
+        self.statusBar().showMessage(
+            f"⚠️ 即将达到循环上限 {max_steps}（剩余 {remaining_steps} 步）"
+        )
+
+    @Slot(int, int)
+    def _ask_step_extension(self, current_step: int, max_steps: int) -> None:
+        """Ask on the GUI thread and return the decision to the waiting worker."""
+
+        worker = self.worker
+        if worker is None:
+            return
+        decision = QMessageBox.question(
+            self,
+            "循环次数接近上限",
+            f"已执行 {current_step} 步，达到步数上限（{max_steps} 步）。是否继续执行？\n\n每次继续将增加 50 步，可重复继续直到任务完成或主动停止。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        worker.resolve_step_extension(decision == QMessageBox.StandardButton.Yes)
+
+    @Slot(int, int)
+    def _update_step_progress(self, current_step: int, max_steps: int) -> None:
+        """Keep a persistent cumulative step counter in the status bar."""
+
+        self.step_counter_label.setText(f"步数：{current_step}/{max_steps}")
+
+    @Slot(str, str)
+    def _ask_high_risk_skill(self, name: str, description: str) -> None:
+        """Prompt for every high-risk Skill invocation on the GUI thread."""
+
+        worker = self.worker
+        if worker is None:
+            return
+        decision = QMessageBox.question(
+            self,
+            "高风险技能确认",
+            f"技能 {name} 请求执行高风险操作：\n\n{description}\n\n是否允许本次调用？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        worker.resolve_skill_confirmation(decision == QMessageBox.StandardButton.Yes)
         self.send_button.setToolTip("正在停止 Agent")
         self.update_status("running", "正在停止 Agent……")
 
@@ -1803,6 +1965,12 @@ class MainWindow(QMainWindow):
                 "ready" if success or stopped_by_user or rejected_by_user else "error"
             )
             self.update_status(final_state, first_line)
+            if success:
+                self.retry_button.setVisible(False)
+                self._last_retry_error_code = ""
+            elif self._last_retry_error_code:
+                self.retry_button.setVisible(True)
+                self.retry_button.setEnabled(True)
         else:
             # The completed run belongs to a background session.  Its answer is
             # persisted there, but the newly selected conversation stays intact.
@@ -2620,6 +2788,7 @@ class MainWindow(QMainWindow):
         central = self.centralWidget()
         if isinstance(central, CerebroBackground):
             central.set_theme(self.theme_name)
+        self.context_ring.set_colors(colors)
         self.theme_button.setText("☀ 亮色" if self.theme_name == "dark" else "🌙 暗色")
         self._render_active_session()
         for file_path in self._tab_editors:

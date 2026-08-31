@@ -12,6 +12,7 @@ import pytest
 from agent.context import (
     ContextBudgetError,
     build_work_memory,
+    compress_tool_history,
     estimate_tokens,
     fit_context,
     group_protocol_units,
@@ -164,3 +165,35 @@ def test_fit_context_reports_safe_size_diagnostics(
     assert "messages=1" in output
     assert "estimated_tokens=" in output
     assert "列出当前目录" not in output
+
+
+def test_compress_tool_history_retains_recent_protocol_units() -> None:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "rules"}]
+    for index in range(31):
+        call_id = f"call-{index}"
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call(call_id)],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps({"ok": True, "meta": {"path": f"f{index}.py"}}),
+                },
+            ]
+        )
+
+    compressed, removed, retained = compress_tool_history(messages)
+
+    assert removed == 11
+    assert retained == 20
+    assert sum(message.get("role") == "tool" for message in compressed) == 20
+    assert any(
+        isinstance(message.get("content"), str)
+        and message["content"].startswith("WORK_MEMORY_JSON")
+        for message in compressed
+    )
+    _assert_no_split_tool_units(compressed)

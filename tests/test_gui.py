@@ -524,8 +524,12 @@ def test_worker_emits_exactly_one_compact_log_per_tool(
     assert worker.wait(2_000) is True
     qt_app.processEvents()
 
-    assert log_spy.count() == 1
-    assert list(log_spy.at(0)) == [1, "🔧", "read_file", "tool_success", ""]
+    rows = [list(log_spy.at(index)) for index in range(log_spy.count())]
+    assert sum(row[2] == "read_file" for row in rows) == 1
+    assert [row for row in rows if row[2] == "read_file"] == [
+        [1, "🔧", "read_file", "tool_success", ""]
+    ]
+    assert any("上下文预算已扩容至 320K Tokens" in str(row[4]) for row in rows)
     assert code_spy.count() == 0
     assert finished_spy.count() == 1
     assert finished_spy.at(0)[0] is True
@@ -591,8 +595,12 @@ def test_two_tools_produce_exactly_two_log_rows(
     assert worker.wait(4_000) is True
     qt_app.processEvents()
 
-    assert log_spy.count() == 2
-    assert [log_spy.at(index)[2] for index in range(2)] == [
+    tool_labels = [
+        log_spy.at(index)[2]
+        for index in range(log_spy.count())
+        if log_spy.at(index)[2] in {"read_file", "run_command"}
+    ]
+    assert tool_labels == [
         "read_file",
         "run_command",
     ]
@@ -704,10 +712,13 @@ def test_send_clears_input_and_binds_real_agent(
         assert window.worker.wait(2_000) is True
         qt_app.processEvents()
 
-        assert window.log_view.toPlainText() == ""
+        assert "上下文预算已扩容至 320K Tokens" in window.log_view.toPlainText()
         assert window.tool_status_button.text() == "✅ read_file"
-        assert len(window.session_store.active.logs) == 1
-        assert window.session_store.active.logs[0]["label"] == "read_file"
+        assert len(window.session_store.active.logs) == 2
+        assert [entry["label"] for entry in window.session_store.active.logs] == [
+            "Cerebro",
+            "read_file",
+        ]
         assert "思考" not in window.log_view.toPlainText()
         assert "模型" not in window.log_view.toPlainText()
         assert window.code_tabs.count() == 0
@@ -1991,6 +2002,92 @@ def test_deep_mode_reports_when_gateway_has_no_reasoning_chunks(
             "data": {"reason": "model_api_error"},
         }
     )
+
+
+def test_worker_emits_friendly_model_error_and_diagnostic_log(
+    qt_app: QApplication,
+) -> None:
+    worker = AgentWorker(mode="auto")
+    error_spy = QSignalSpy(worker.error_signal)
+    log_spy = QSignalSpy(worker.log_signal)
+
+    worker._handle_update(
+        {
+            "event": "run_stopped",
+            "step": 1,
+            "message": "⚠️ 模型返回了空响应，可能因上下文过长或格式问题，已自动重试 2 次。",
+            "data": {
+                "reason": "empty_response",
+                "error_code": "empty_content_and_tools",
+                "retry_count": 2,
+                "diagnostics": {"finish_reason": None},
+            },
+        }
+    )
+    qt_app.processEvents()
+
+    assert error_spy.count() == 1
+    assert error_spy.at(0)[0] == "empty_content_and_tools"
+    assert "已自动重试 2 次" in str(error_spy.at(0)[1])
+    assert log_spy.count() == 1
+    assert "诊断" in str(log_spy.at(0)[4])
+
+
+def test_retry_button_reuses_last_task_without_duplicate_user_message(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    class RetryWindow(MainWindow):
+        def _create_worker(self, task: str) -> AgentWorker:
+            _ = task
+            return AgentWorker(provider=FakeProvider([_final_turn("重试成功")]))
+
+    window = RetryWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        conversation = window.session_store.active
+        window.session_store.add_message(
+            "user",
+            "再次执行上一任务",
+            conversation_id=conversation.id,
+        )
+        window._last_submitted_task = "再次执行上一任务"
+        window._running_session_id = conversation.id
+        window._show_retryable_error(
+            "empty_content_and_tools",
+            "模型返回空响应",
+        )
+        window._handle_worker_finished(False, "模型返回空响应")
+        qt_app.processEvents()
+        assert window.retry_button.isVisible() is True
+        assert window.retry_button.isEnabled() is True
+
+        window.retry_button.click()
+        assert _wait_until(
+            qt_app,
+            lambda: any(
+                message.get("role") == "assistant"
+                and "重试成功" in str(message.get("content", ""))
+                for message in window.session_store.active.messages
+            ),
+        )
+
+        roles_and_content = [
+            (message.get("role"), message.get("content"))
+            for message in window.session_store.active.messages
+        ]
+        assert roles_and_content.count(("user", "再次执行上一任务")) == 1
+        assert any(
+            role == "assistant" and "重试成功" in str(content)
+            for role, content in roles_and_content
+        )
+    finally:
+        if window.worker is not None and window.worker.isRunning():
+            window.worker.stop()
+            window.worker.wait(2_000)
+        window.close()
+        qt_app.processEvents()
 
 
 def test_file_mentions_filter_insert_and_expand_workplace(

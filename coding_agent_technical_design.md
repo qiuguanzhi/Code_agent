@@ -809,8 +809,8 @@ API 重试必须复用同一份请求状态。工具执行重试则要更谨慎�
 
 同时设置以下硬限制：
 
-- `max_steps`：建议演示时 12，默认 20。
-- `max_wall_seconds`：例如 10 分钟。
+- `max_steps`：默认 200；GUI 达到上限后可由用户反复批准，每次把累计上限增加 50。
+- `max_duration_seconds`：默认 20 分钟；即使用户继续增加步数，该硬时限仍然有效。
 - `max_same_call`：完全相同的工具名与参数最多 3 次。
 - `max_tool_calls_total`：例如 40 次。
 - `max_consecutive_errors`：例如连续 5 次工具错误。

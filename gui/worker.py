@@ -16,6 +16,7 @@ from PySide6.QtCore import QThread, Signal
 from agent.loop import AgentConfig, AgentRunResult, run_agent
 from providers.base import ModelProvider
 from providers.openai_compatible import create_provider_from_env
+from skills.base import Skill
 from tools.filesystem import apply_staged_writes
 
 
@@ -35,6 +36,12 @@ class AgentWorker(QThread):
     batch_confirmation_signal = Signal(object)
     snapshot_signal = Signal(object, str)
     stream_signal = Signal(str, str)
+    context_signal = Signal(int, int)
+    step_warning_signal = Signal(int, int)
+    step_confirmation_signal = Signal(int, int)
+    step_progress_signal = Signal(int, int)
+    skill_confirmation_signal = Signal(str, str)
+    error_signal = Signal(str, str)
     finished_signal = Signal(bool, str)
 
     def __init__(
@@ -44,6 +51,8 @@ class AgentWorker(QThread):
         provider_name: str | None = None,
         mode: str = "auto",
         confirmation_callback: ConfirmationCallback | None = None,
+        enabled_skills: frozenset[str] | None = None,
+        skill_permissions: frozenset[str] = frozenset({"filesystem"}),
     ) -> None:
         """Create a worker with optional network-free test dependencies."""
 
@@ -52,13 +61,21 @@ class AgentWorker(QThread):
         self.provider_name = provider_name or os.getenv("AGENT_PROVIDER", "deepseek")
         self.mode = mode
         self.confirmation_callback = confirmation_callback
+        self.enabled_skills = enabled_skills
+        self.skill_permissions = skill_permissions
         self._task = ""
         self._workspace: Path | None = None
-        self._max_steps = 20
+        self._max_steps = 200
+        self._max_duration_seconds = 1_200.0
+        self._run_started_time = 0.0
         self._interactive = False
         self._confirmation_event = threading.Event()
         self._confirmation_result = False
         self._stop_event = threading.Event()
+        self._step_extension_event = threading.Event()
+        self._step_extension_result = False
+        self._skill_confirmation_event = threading.Event()
+        self._skill_confirmation_result = False
         self.current_step = 0
         self._active_provider: ModelProvider | None = None
         self._reasoning_output_started = False
@@ -82,6 +99,7 @@ class AgentWorker(QThread):
         max_steps: int,
         interactive: bool,
         session_id: str = "",
+        max_duration_seconds: float = 1_200.0,
     ) -> None:
         """Validate and start one configured Agent run in this QThread."""
 
@@ -91,6 +109,8 @@ class AgentWorker(QThread):
             raise ValueError("task must be a non-empty string")
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
+        if max_duration_seconds <= 0:
+            raise ValueError("max_duration_seconds must be positive")
         try:
             resolved_workspace = Path(workspace).resolve(strict=True)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -101,12 +121,18 @@ class AgentWorker(QThread):
         self._task = task
         self._workspace = resolved_workspace
         self._max_steps = max_steps
+        self._max_duration_seconds = max_duration_seconds
+        self._run_started_time = time.time()
         self._interactive = interactive
         # Events are deliberately replaced, not merely cleared. A previous run
         # may still own a waiter reference while its queued Qt signals drain.
         self._confirmation_event = threading.Event()
         self._confirmation_result = False
         self._stop_event = threading.Event()
+        self._step_extension_event = threading.Event()
+        self._step_extension_result = False
+        self._skill_confirmation_event = threading.Event()
+        self._skill_confirmation_result = False
         self.current_step = 0
         self._reasoning_output_started = False
         self._reasoning_interruption_marked = False
@@ -132,6 +158,10 @@ class AgentWorker(QThread):
         self.requestInterruption()
         self._confirmation_result = False
         self._confirmation_event.set()
+        self._step_extension_result = False
+        self._step_extension_event.set()
+        self._skill_confirmation_result = False
+        self._skill_confirmation_event.set()
         cancel = getattr(self._active_provider, "cancel", None)
         if callable(cancel):
             try:
@@ -150,6 +180,18 @@ class AgentWorker(QThread):
         self._confirmation_result = confirmed
         self._confirmation_event.set()
 
+    def resolve_step_extension(self, confirmed: bool) -> None:
+        """Release the worker waiting at a configurable loop boundary."""
+
+        self._step_extension_result = confirmed
+        self._step_extension_event.set()
+
+    def resolve_skill_confirmation(self, confirmed: bool) -> None:
+        """Release a high-risk Skill permission prompt."""
+
+        self._skill_confirmation_result = confirmed
+        self._skill_confirmation_event.set()
+
     def run(self) -> None:
         """Build the Provider/configuration and execute the Agent loop."""
 
@@ -157,7 +199,11 @@ class AgentWorker(QThread):
             self._finish_with_error("Agent Worker 尚未配置工作区。")
             return
 
-        self.status_signal.emit("running", "阶段 1/5：⏳ 初始化模型连接...")
+        self.step_progress_signal.emit(0, self._max_steps)
+        self.status_signal.emit(
+            "running",
+            f"阶段 1/5：⏳ 初始化模型连接...（步数上限 {self._max_steps}）",
+        )
         try:
             self._begin_diagnostic_stage("阶段1: 创建 Provider")
             provider_started = time.perf_counter()
@@ -177,6 +223,7 @@ class AgentWorker(QThread):
                 workspace=self._workspace,
                 provider=provider,
                 max_steps=self._max_steps,
+                max_duration_seconds=self._max_duration_seconds,
                 mode=self.mode,
                 interactive=self._interactive,
                 batch_writes=self._interactive,
@@ -186,6 +233,10 @@ class AgentWorker(QThread):
                 on_reasoning_token=(
                     self._handle_reasoning_token if self.mode == "goal" else None
                 ),
+                confirm_step_extension=self._confirm_step_extension,
+                enabled_skills=self.enabled_skills,
+                skill_permissions=self.skill_permissions,
+                confirm_high_risk_skill=self._confirm_high_risk_skill,
             )
             self._end_diagnostic_stage("阶段2: 构建配置")
             snapshot_timestamp = datetime.now().astimezone().strftime(
@@ -250,10 +301,13 @@ class AgentWorker(QThread):
         self._flush_reasoning_tokens()
         self.snapshot_signal.emit(result.state.initial_snapshot, snapshot_timestamp)
         rejected_by_user = result.reason == "user_rejected_batch"
+        stopped_at_step_limit = result.reason == "user_declined_step_extension"
         self.status_signal.emit(
-            "ready" if success or stopped_by_user or rejected_by_user else "error",
+            "ready"
+            if success or stopped_by_user or rejected_by_user or stopped_at_step_limit
+            else "error",
             "已停止"
-            if stopped_by_user
+            if stopped_by_user or stopped_at_step_limit
             else "已拒绝全部修改"
             if rejected_by_user
             else result.answer,
@@ -283,6 +337,54 @@ class AgentWorker(QThread):
             if self.is_stop_requested():
                 return False
         return self._confirmation_result
+
+    def _confirm_step_extension(
+        self,
+        current_step: int,
+        max_steps: int,
+        extension_count: int,
+    ) -> bool:
+        """Ask the GUI whether another ten-step buffer should be granted."""
+
+        _ = extension_count
+        self._step_extension_result = False
+        self._step_extension_event.clear()
+        self.step_confirmation_signal.emit(current_step, max_steps)
+        while not self._step_extension_event.wait(timeout=0.1):
+            if self.is_stop_requested():
+                return False
+            if time.time() - self._run_started_time > self._max_duration_seconds:
+                return False
+        if self._step_extension_result:
+            self.log_signal.emit(
+                current_step,
+                "🧠",
+                "Cerebro",
+                "success",
+                "用户选择继续（步数上限 +50）",
+            )
+        else:
+            self.log_signal.emit(
+                current_step,
+                "🧠",
+                "Cerebro",
+                "warning",
+                "用户停止执行",
+            )
+        return self._step_extension_result
+
+    def _confirm_high_risk_skill(self, skill: Skill) -> bool:
+        """Require an explicit GUI decision before one high-risk Skill call."""
+
+        self._skill_confirmation_result = False
+        self._skill_confirmation_event.clear()
+        self.skill_confirmation_signal.emit(skill.name, skill.description)
+        while not self._skill_confirmation_event.wait(timeout=0.1):
+            if self.is_stop_requested():
+                return False
+            if time.time() - self._run_started_time > self._max_duration_seconds:
+                return False
+        return self._skill_confirmation_result
 
     def _emit_applied_batch(
         self,
@@ -548,6 +650,97 @@ class AgentWorker(QThread):
             duration = event_data.get("duration_ms")
             if isinstance(duration, (int, float)):
                 self._report_slow_stage("上下文构建", float(duration))
+        elif event == "context_usage":
+            used = event_data.get("used_tokens")
+            budget = event_data.get("budget_tokens")
+            if isinstance(used, int) and isinstance(budget, int):
+                self.context_signal.emit(used, budget)
+        elif event == "context_budget_configured":
+            budget = event_data.get("budget_tokens")
+            if isinstance(budget, int):
+                self.context_signal.emit(0, budget)
+            detail = (
+                "上下文预算已扩容至 320K Tokens"
+                if budget == 320_000
+                else f"上下文预算已设置为 {budget} Tokens"
+            )
+            self.log_signal.emit(
+                0,
+                "🧠",
+                "Cerebro",
+                "success",
+                detail,
+            )
+        elif event == "model_request_diagnostics":
+            message_count = event_data.get("message_count", 0)
+            estimated = event_data.get("estimated_tokens", 0)
+            budget = event_data.get("budget_tokens", 0)
+            last_messages = event_data.get("last_messages", [])
+            anomalies = event_data.get("anomalies", [])
+            if isinstance(anomalies, list) and anomalies:
+                detail = (
+                    f"消息 {message_count} 条，Token 估算 {estimated}/{budget}；"
+                    f"最近消息：{last_messages}；格式异常：{anomalies}"
+                )
+                self.log_signal.emit(
+                    step,
+                    "🔎",
+                    "模型请求诊断",
+                    "warning",
+                    detail,
+                )
+        elif event == "context_compressed":
+            released = event_data.get("released_tokens", 0)
+            self.log_signal.emit(
+                step,
+                "📦",
+                "上下文压缩",
+                "success",
+                f"释放约 {released} Tokens",
+            )
+        elif event == "context_forced_compression":
+            source = event_data.get("source_tokens", 0)
+            budget = event_data.get("budget_tokens", 0)
+            output = event_data.get("output_tokens", 0)
+            self.log_signal.emit(
+                step,
+                "📦",
+                "上下文强制压缩",
+                "warning",
+                f"Token 估算：{source}/{budget}，压缩后约 {output}",
+            )
+        elif event == "tool_history_compressed":
+            removed = event_data.get("removed_tool_units", 0)
+            retained = event_data.get("kept_tool_units", 20)
+            self.log_signal.emit(
+                step,
+                "🔧",
+                "工具历史压缩",
+                "success",
+                f"工具历史已压缩，移除 {removed} 条，保留最近 {retained} 条",
+            )
+        elif event == "step_limit_warning":
+            remaining = event_data.get("remaining_steps", 0)
+            maximum = event_data.get("max_steps", self._max_steps)
+            if isinstance(remaining, int) and isinstance(maximum, int):
+                self.step_warning_signal.emit(remaining, maximum)
+                self.status_signal.emit(
+                    "running",
+                    f"⚠️ 即将达到循环上限（剩余 {remaining} 步）",
+                )
+        elif event == "step_started":
+            current = event_data.get("current_step")
+            maximum = event_data.get("max_steps")
+            if isinstance(current, int) and isinstance(maximum, int):
+                self.step_progress_signal.emit(current, maximum)
+        elif event == "step_extension_approved":
+            maximum = event_data.get("max_steps")
+            if isinstance(maximum, int):
+                self.step_progress_signal.emit(step, maximum)
+                self.status_signal.emit(
+                    "running",
+                    f"步数：{step}/{maximum}（已增加 50 步）",
+                )
         elif event == "model_request":
             self._flush_reasoning_tokens()
             self._current_reasoning_text = ""
@@ -567,10 +760,29 @@ class AgentWorker(QThread):
                 self._flush_reasoning_tokens()
         elif event == "api_retry":
             self._mark_reasoning_interrupted(retrying=True)
+        elif event == "empty_response_retry":
+            self._cancel_reasoning_wait_hint()
+            self.log_signal.emit(
+                step,
+                "⚠️",
+                "模型空响应",
+                "warning",
+                message,
+            )
+            self.status_signal.emit("running", message)
+        elif event in {"response_truncated", "response_filtered"}:
+            level = "warning" if event == "response_truncated" else "error"
+            self.log_signal.emit(step, "⚠️", "模型响应", level, message)
         elif event == "run_failed":
             self._cancel_reasoning_wait_hint()
             self._end_diagnostic_stage("阶段5: 调用模型")
             self._mark_reasoning_interrupted()
+            self._emit_model_error(step, message, event_data)
+        elif event == "run_stopped" and event_data.get("error_code"):
+            self._cancel_reasoning_wait_hint()
+            self._end_diagnostic_stage("阶段5: 调用模型")
+            self._mark_reasoning_interrupted()
+            self._emit_model_error(step, message, event_data)
         elif event == "tool_call":
             self._end_diagnostic_stage("阶段5: 调用模型")
             tool_name = str(event_data.get("tool", "工具"))
@@ -598,6 +810,38 @@ class AgentWorker(QThread):
                     default=str,
                 )
                 self.tool_status_signal.emit("error", tool_name, detail)
+
+    def _emit_model_error(
+        self,
+        step: int,
+        message: str,
+        event_data: Mapping[str, Any],
+    ) -> None:
+        """Expose a friendly model error and its bounded diagnostics."""
+
+        code = str(
+            event_data.get("error_code")
+            or event_data.get("reason")
+            or "model_api_error"
+        )
+        technical = event_data.get("technical_message")
+        diagnostics = event_data.get("diagnostics")
+        parts = [message]
+        if isinstance(technical, str) and technical:
+            parts.append(f"技术详情：{technical}")
+        if isinstance(diagnostics, Mapping) and diagnostics:
+            parts.append(
+                "诊断："
+                + json.dumps(
+                    dict(diagnostics),
+                    ensure_ascii=False,
+                    default=str,
+                )[:2_000]
+            )
+        detail = "\n".join(parts)
+        self.log_signal.emit(step, "❌", code, "error", detail)
+        self.status_signal.emit("error", message)
+        self.error_signal.emit(code, message)
 
     def _emit_safe_progress(
         self,
