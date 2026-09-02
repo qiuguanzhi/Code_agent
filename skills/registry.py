@@ -2,18 +2,86 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
+import json
+import os
 import pkgutil
 import re
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
-from skills.base import AgentContext, Skill, SkillResult
+from skills.base import (
+    SKILL_METADATA_PREFIX,
+    AgentContext,
+    Skill,
+    SkillResult,
+)
 
 
 SkillConfirmation = Callable[[Skill], bool]
-_VALID_NAME = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_VALID_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_NATIVE_TOOL_NAMES = frozenset(
+    {"read_file", "write_file", "delete_file", "run_command"}
+)
+_KNOWN_PERMISSIONS = frozenset(
+    {"filesystem", "filesystem_write", "network", "process"}
+)
+DEFAULT_USER_SKILL_DIR = Path(__file__).resolve().parent / "user"
+_DANGEROUS_CALLS = frozenset(
+    {
+        "__import__",
+        "breakpoint",
+        "compile",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
+)
+
+
+class SkillCodeSafetyError(ValueError):
+    """Signal that manually entered code needs explicit user acknowledgement."""
+
+    def __init__(self, warnings: list[str]) -> None:
+        """Retain structured warnings for the GUI confirmation dialog."""
+
+        self.warnings = tuple(warnings)
+        super().__init__("；".join(warnings))
+
+
+def inspect_skill_code(source_code: str) -> list[str]:
+    """Return auditable warnings without executing user-entered Python."""
+
+    try:
+        tree = ast.parse(source_code, filename="<user-skill>", mode="exec")
+    except SyntaxError as exc:
+        line = exc.lineno or 0
+        raise ValueError(f"Skill 代码语法错误（第 {line} 行）：{exc.msg}") from exc
+    warnings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError(
+                "动态 Skill 禁止 import；请通过 context.call_tool() 使用已授权能力"
+            )
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            raise ValueError("动态 Skill 禁止访问双下划线内部属性")
+        if isinstance(node, ast.Name) and node.id == "__builtins__":
+            raise ValueError("动态 Skill 禁止访问 __builtins__")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in _DANGEROUS_CALLS:
+                warning = f"检测到危险函数 {node.func.id}()（第 {node.lineno} 行）"
+                if warning not in warnings:
+                    warnings.append(warning)
+    return warnings
 
 
 class SkillRegistry:
@@ -25,11 +93,15 @@ class SkillRegistry:
         granted_permissions: Iterable[str] = ("filesystem",),
         enabled_names: Iterable[str] | None = None,
         confirm_high_risk: SkillConfirmation | None = None,
+        user_skill_dir: Path | str | None = None,
     ) -> None:
         self._skills: dict[str, Skill] = {}
         self._granted_permissions = frozenset(granted_permissions)
         self._enabled_names = None if enabled_names is None else set(enabled_names)
         self._confirm_high_risk = confirm_high_risk
+        self.user_skill_dir = Path(
+            user_skill_dir if user_skill_dir is not None else DEFAULT_USER_SKILL_DIR
+        ).resolve()
 
     @classmethod
     def discover_builtin(
@@ -61,20 +133,186 @@ class SkillRegistry:
                 registry.register(candidate)
         return registry
 
+    @classmethod
+    def discover_all(
+        cls,
+        *,
+        granted_permissions: Iterable[str] = ("filesystem",),
+        enabled_names: Iterable[str] | None = None,
+        confirm_high_risk: SkillConfirmation | None = None,
+        user_skill_dir: Path | str | None = None,
+    ) -> "SkillRegistry":
+        """Discover built-in Skills plus valid files in the controlled user directory."""
+
+        registry = cls(
+            granted_permissions=granted_permissions,
+            enabled_names=enabled_names,
+            confirm_high_risk=confirm_high_risk,
+            user_skill_dir=user_skill_dir,
+        )
+        builtin = cls.discover_builtin(
+            granted_permissions=granted_permissions,
+            enabled_names=enabled_names,
+            confirm_high_risk=confirm_high_risk,
+        )
+        for skill in builtin.list_skills():
+            registry._register_instance(skill)
+        if registry.user_skill_dir.exists():
+            for source in sorted(registry.user_skill_dir.glob("*.py")):
+                if source.name == "__init__.py":
+                    continue
+                try:
+                    skill = Skill.from_file(source)
+                    if skill.name in _NATIVE_TOOL_NAMES:
+                        raise ValueError(
+                            f"用户 Skill 不可覆盖原生工具: {skill.name}"
+                        )
+                    skill.source_path = source.resolve()
+                    registry._register_instance(skill)
+                except (OSError, TypeError, ValueError) as exc:
+                    print(
+                        "[Cerebro::Skill] "
+                        f"跳过无效用户 Skill {source.name}: {exc}"
+                    )
+        return registry
+
     def register(self, skill_class: type[Skill]) -> Skill:
         """Instantiate and register one validated Skill class."""
 
         if not inspect.isclass(skill_class) or not issubclass(skill_class, Skill):
             raise TypeError("skill_class must inherit Skill")
         skill = skill_class()
-        if not _VALID_NAME.fullmatch(skill.name):
-            raise ValueError(f"invalid skill name: {skill.name!r}")
-        if not skill.description.strip():
-            raise ValueError(f"skill {skill.name!r} requires a description")
-        if skill.name in self._skills:
-            raise ValueError(f"duplicate skill: {skill.name}")
+        return self._register_instance(skill)
+
+    def _register_instance(self, skill: Skill) -> Skill:
+        """Validate and store one already-instantiated Skill."""
+
+        if not isinstance(skill, Skill):
+            raise TypeError("skill must inherit Skill")
+        self._validate_new_skill(skill)
         self._skills[skill.name] = skill
         return skill
+
+    def register_from_code(
+        self,
+        *,
+        name: str,
+        description: str,
+        source_code: str,
+        required_permissions: Iterable[str] = (),
+        allow_dangerous: bool = False,
+    ) -> Skill:
+        """Validate, restrict, register, and atomically persist a form-defined Skill."""
+
+        normalized_name = name.strip()
+        normalized_description = description.strip()
+        permissions = frozenset(required_permissions)
+        if not _VALID_NAME.fullmatch(normalized_name):
+            raise ValueError("Skill 名称须以小写字母开头，仅含小写字母、数字和下划线")
+        if not normalized_description:
+            raise ValueError("Skill 描述不能为空")
+        if normalized_name in _NATIVE_TOOL_NAMES:
+            raise ValueError(f"用户 Skill 不可覆盖原生工具: {normalized_name}")
+        if normalized_name in self._skills:
+            raise ValueError(f"duplicate skill: {normalized_name}")
+        unknown_permissions = sorted(permissions - _KNOWN_PERMISSIONS)
+        if unknown_permissions:
+            raise ValueError(
+                "未知 Skill 权限：" + ", ".join(unknown_permissions)
+            )
+        warnings = inspect_skill_code(source_code)
+        if warnings and not allow_dangerous:
+            raise SkillCodeSafetyError(warnings)
+
+        skill = Skill.from_code(
+            source_code,
+            name=normalized_name,
+            description=normalized_description,
+            required_permissions=permissions,
+        )
+        self._validate_new_skill(skill)
+        self.user_skill_dir.mkdir(parents=True, exist_ok=True)
+        target = (self.user_skill_dir / f"skill_{normalized_name}.py").resolve()
+        try:
+            target.relative_to(self.user_skill_dir)
+        except ValueError as exc:
+            raise ValueError("用户 Skill 目标路径逃逸") from exc
+        if target.exists():
+            raise ValueError(f"用户 Skill 文件已存在: {target.name}")
+        metadata = json.dumps(
+            {
+                "name": normalized_name,
+                "description": normalized_description,
+                "permissions": sorted(permissions),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        persisted_source = f"{SKILL_METADATA_PREFIX}{metadata}\n{source_code.rstrip()}\n"
+        temporary = target.with_name(f".{target.name}.tmp")
+        try:
+            temporary.write_text(persisted_source, encoding="utf-8")
+            os.replace(temporary, target)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        skill.source_path = target
+        self._skills[skill.name] = skill
+        if self._enabled_names is not None:
+            self._enabled_names.add(skill.name)
+        return skill
+
+    def unregister(self, name: str) -> Skill:
+        """Remove one user Skill and its controlled source file."""
+
+        skill = self._skills.get(name)
+        if skill is None:
+            raise KeyError(name)
+        if skill.built_in:
+            raise ValueError("内置 Skill 不可删除")
+        source = skill.source_path or self.user_skill_dir / f"skill_{skill.name}.py"
+        resolved_source = source.resolve()
+        try:
+            resolved_source.relative_to(self.user_skill_dir)
+        except ValueError as exc:
+            raise ValueError("拒绝删除用户 Skill 目录之外的文件") from exc
+        if resolved_source.exists():
+            if not resolved_source.is_file():
+                raise ValueError("用户 Skill 源路径不是普通文件")
+            resolved_source.unlink()
+        removed = self._skills.pop(name)
+        if self._enabled_names is not None:
+            self._enabled_names.discard(name)
+        return removed
+
+    def _validate_new_skill(self, skill: Skill) -> None:
+        """Validate a candidate without mutating registry state."""
+
+        if not isinstance(skill.name, str) or not _VALID_NAME.fullmatch(skill.name):
+            raise ValueError(f"invalid skill name: {skill.name!r}")
+        if not isinstance(skill.description, str) or not skill.description.strip():
+            raise ValueError(f"skill {skill.name!r} requires a description")
+        if not isinstance(skill.parameters_schema, dict):
+            raise ValueError(f"skill {skill.name!r} requires a JSON object schema")
+        if skill.parameters_schema.get("type") != "object":
+            raise ValueError(f"skill {skill.name!r} parameters schema must be an object")
+        if not isinstance(skill.required_permissions, frozenset) or not all(
+            isinstance(permission, str) and permission
+            for permission in skill.required_permissions
+        ):
+            raise ValueError(
+                f"skill {skill.name!r} required_permissions must be frozenset[str]"
+            )
+        unknown_permissions = sorted(skill.required_permissions - _KNOWN_PERMISSIONS)
+        if unknown_permissions:
+            raise ValueError(
+                f"skill {skill.name!r} declares unknown permissions: "
+                + ", ".join(unknown_permissions)
+            )
+        if not isinstance(skill.high_risk, bool):
+            raise ValueError(f"skill {skill.name!r} high_risk must be boolean")
+        if skill.name in self._skills:
+            raise ValueError(f"duplicate skill: {skill.name}")
 
     def get_skill(self, name: str) -> Skill | None:
         """Return a registered skill, including a disabled one."""

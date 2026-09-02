@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 
 from PySide6.QtCore import (
@@ -27,11 +28,12 @@ class SplashScreen(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         """Prepare all animation state while keeping construction side-effect free."""
 
-        super().__init__(parent, Qt.WindowType.FramelessWindowHint | Qt.WindowType.SplashScreen)
+        super().__init__(parent)
         self.setObjectName("cerebroSplash")
+        self._topmost_enabled = self._configure_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setFixedSize(620, 420)
+        self.setFixedSize(800, 500)
         self._elapsed_ms = 0
         self._started_at = 0.0
         self._completed = False
@@ -41,6 +43,28 @@ class SplashScreen(QWidget):
         self._timer.timeout.connect(self._tick)
         self._fade_animation: QPropertyAnimation | None = None
 
+    def _configure_window_flags(self) -> bool:
+        """Prefer a frameless global-top Tool window, with a safe fallback."""
+
+        preferred = (
+            Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+        )
+        try:
+            self.setWindowFlags(preferred)
+            return True
+        except (RuntimeError, TypeError) as exc:
+            print(
+                "[Cerebro::Splash] 无法启用全局置顶，已降级为普通无边框窗口："
+                f"{exc}",
+                file=sys.stderr,
+            )
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+            )
+            return False
+
     def start(self) -> None:
         """Center, show, and start the three-stage non-blocking animation."""
 
@@ -49,13 +73,34 @@ class SplashScreen(QWidget):
             if screen is not None:
                 geometry = screen.availableGeometry()
                 self.move(geometry.center() - self.rect().center())
+            else:
+                print(
+                    "[Cerebro::Splash] 未检测到主显示器，使用默认窗口位置。",
+                    file=sys.stderr,
+                )
             self.setWindowOpacity(1.0)
             self._started_at = time.perf_counter()
             self.show()
             self.raise_()
+            self.activateWindow()
             self._timer.start()
-        except Exception:
-            self._complete()
+        except Exception as exc:
+            print(
+                f"[Cerebro::Splash] 置顶显示失败，尝试普通窗口降级：{exc}",
+                file=sys.stderr,
+            )
+            try:
+                self.setWindowFlags(
+                    Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                )
+                self.show()
+                self._timer.start()
+            except Exception as fallback_exc:
+                print(
+                    f"[Cerebro::Splash] 普通窗口降级失败：{fallback_exc}",
+                    file=sys.stderr,
+                )
+                self._complete()
 
     def skip(self) -> None:
         """Skip immediately, as used by mouse input and automated smoke tests."""
@@ -95,8 +140,9 @@ class SplashScreen(QWidget):
             return
         self._completed = True
         self._timer.stop()
-        self.finished.emit()
+        self.hide()
         self.close()
+        self.finished.emit()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Allow any pointer click to bypass the startup sequence."""
@@ -118,6 +164,8 @@ class SplashScreen(QWidget):
         painter.setPen(QPen(QColor("#233554"), 1.5))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 24, 24)
+
+        painter.translate((self.width() - 620) / 2, (self.height() - 420) / 2)
 
         elapsed = self._elapsed_ms
         brain_opacity = 1.0 if elapsed < 1_600 else max(0.0, 1.0 - (elapsed - 1_600) / 650)

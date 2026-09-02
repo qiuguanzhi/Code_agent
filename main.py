@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_gui(workspace_root: Path | None = None) -> int:
     """Launch the desktop application through lazy GUI imports."""
 
-    from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+    from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt
     from PySide6.QtWidgets import QApplication
 
     from gui.main_window import MainWindow
@@ -89,6 +89,7 @@ def run_gui(workspace_root: Path | None = None) -> int:
 
         try:
             app._cerebro_splash = None
+            window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
             window.setWindowOpacity(0.0)
             window.show()
             fade = QPropertyAnimation(window, b"windowOpacity", window)
@@ -98,9 +99,12 @@ def run_gui(workspace_root: Path | None = None) -> int:
             fade.setEasingCurve(QEasingCurve.Type.OutCubic)
             window._cerebro_fade_animation = fade
             fade.start()
+            QTimer.singleShot(100, window.raise_)
+            QTimer.singleShot(100, window.activateWindow)
         except Exception:
             window.setWindowOpacity(1.0)
             window.show()
+            QTimer.singleShot(100, window.raise_)
 
     app._cerebro_window = window
     app._cerebro_splash = splash

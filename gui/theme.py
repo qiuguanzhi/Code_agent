@@ -83,6 +83,19 @@ QMenuBar, QToolBar, QStatusBar {{
 QMenuBar {{ border-bottom: 1px solid {colors['border']}; padding: 4px 8px; }}
 QMenuBar::item {{ padding: 6px 11px; border-radius: 6px; }}
 QMenuBar::item:selected, QMenuBar::item:pressed {{ background-color: {colors['hover']}; }}
+QWidget#customTitleBar {{
+    background-color: {colors['panel']};
+    border-bottom: 1px solid {colors['border']};
+}}
+QMenuBar#mainMenuBar {{
+    background: transparent;
+    border: 0;
+    padding: 0 6px;
+}}
+QMenuBar#mainMenuBar::item {{
+    margin: 0;
+    padding: 7px 11px;
+}}
 QMenu {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
@@ -94,6 +107,30 @@ QMenu::item:selected {{ background-color: {colors['hover']}; }}
 QMenu::separator {{ height: 1px; background: {colors['border']}; margin: 6px 8px; }}
 QToolBar {{ border-bottom: 1px solid {colors['border']}; spacing: 9px; padding: 7px 10px; }}
 QToolBar::separator {{ background: {colors['border']}; width: 1px; margin: 4px 7px; }}
+QWidget#windowDragHandle {{
+    background: transparent;
+    border: 0;
+}}
+QToolButton#windowMinimizeButton,
+QToolButton#windowMaximizeButton,
+QToolButton#windowCloseButton {{
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+}}
+QToolButton#windowMinimizeButton:hover,
+QToolButton#windowMaximizeButton:hover {{
+    background-color: {colors['hover']};
+}}
+QToolButton#windowCloseButton:hover {{
+    background-color: {colors['error']};
+}}
+QToolButton#windowMinimizeButton:pressed,
+QToolButton#windowMaximizeButton:pressed,
+QToolButton#windowCloseButton:pressed {{
+    background-color: {colors['pressed']};
+}}
 QLabel#snapshotLabel, QLabel#waitingIndicator {{ color: {colors['warning']}; }}
 QLabel#statusIndicator, QLabel#workspaceLabel, QLabel#snapshotLabel {{
     background-color: {colors['toolbar_card']};
@@ -274,6 +311,88 @@ QMenu#fileMentionPopup {{
     background-color: {colors['panel']};
     border: 1px solid {colors['border']};
     border-radius: 8px;
+}}
+QDialog#skillManagerDialog, QDialog#addSkillDialog {{
+    background-color: {colors['panel']};
+    border: 1px solid {colors['accent']};
+    border-radius: 14px;
+}}
+QLabel#skillManagerTitle {{
+    color: {colors['accent']};
+    font-size: 18px;
+    font-weight: 700;
+}}
+QLabel#skillSecurityHint {{
+    color: {colors['warning']};
+    background-color: {colors['thinking_background']};
+    border: 1px solid {colors['border']};
+    border-radius: 7px;
+    padding: 7px;
+}}
+QListWidget#skillList {{
+    background-color: {colors['code_background']};
+    border: 1px solid {colors['border']};
+    border-radius: 9px;
+    padding: 5px;
+}}
+QListWidget#skillList::item {{
+    padding: 9px;
+    border-radius: 6px;
+}}
+QListWidget#skillList::item:selected {{
+    background-color: {colors['hover']};
+    color: {colors['text']};
+}}
+QWidget#skillDetailPanel {{
+    background-color: {colors['toolbar_card']};
+    border: 1px solid {colors['border']};
+    border-radius: 9px;
+}}
+QLabel#skillDetailTitle, QLabel#skillNameValue {{
+    color: {colors['accent']};
+    font-weight: 700;
+}}
+QLabel#skillDescriptionValue, QLabel#skillPermissionsValue,
+QLabel#skillOriginValue {{
+    color: {colors['text']};
+    background: transparent;
+}}
+QPushButton#skillManagerCloseButton {{
+    background: transparent;
+    color: {colors['muted']};
+    border: 0;
+    border-radius: 15px;
+    font-size: 20px;
+    padding: 0;
+}}
+QPushButton#skillManagerCloseButton:hover {{
+    background-color: {colors['error']};
+    color: #ffffff;
+}}
+QPushButton#deleteSkillButton:enabled {{
+    background-color: {colors['error']};
+    color: #ffffff;
+}}
+QLabel#skillPermissionTitle, QLabel#skillCodeTitle {{
+    color: {colors['accent']};
+    font-weight: 700;
+}}
+QLineEdit#skillNameInput, QPlainTextEdit#skillDescriptionInput,
+QPlainTextEdit#skillCodeEditor {{
+    background-color: {colors['code_background']};
+    color: {colors['text']};
+    border: 1px solid {colors['border']};
+    border-radius: 7px;
+    padding: 7px;
+    selection-background-color: {colors['accent']};
+}}
+QPlainTextEdit#skillCodeEditor {{
+    font-family: "Cascadia Code", "Consolas", monospace;
+    font-size: 13px;
+}}
+QPushButton#addSkillButton {{
+    background-color: {colors['accent']};
+    color: {colors['background']};
 }}
 QListWidget#fileMentionList {{
     background-color: {colors['panel']};

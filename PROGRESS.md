@@ -1,6 +1,6 @@
 # Development Progress
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 ## Phase 1 — Tools Layer
 
@@ -495,3 +495,32 @@ Status: Implemented and verified
 
 - Validate one deliberately large request against the selected real gateway and set `AGENT_MODEL_INPUT_TOKENS` to that model's documented input limit
 - Enable `AGENT_USE_MAX_COMPLETION_TOKENS=1` only for gateways that explicitly support that parameter
+
+## Round 14 — Manual Skill Management and Topmost Splash
+
+Status: Implemented and verified
+
+### Completed modules
+
+- `skills/base.py` and `skills/registry.py`: restricted-namespace code factory, syntax/AST checks, form metadata, controlled atomic persistence, built-in protection, restart discovery, and path-checked user Skill deletion
+- `skills/builtin/code_review.py` and `skills/user/`: explicit system markers and the controlled runtime-created package
+- `agent/loop.py`: default Skill discovery now includes enabled persisted user Skills
+- `gui/widgets.py` and `gui/skill_dialog.py`: manual name/description/code/permission form plus frameless draggable manager with enablement, metadata, refresh, and delete confirmation
+- `gui/main_window.py` and `gui/theme.py`: “🧩 Skill 管理” entry, add/delete audit logs, persistence, and light/dark form/manager styling
+- `gui/splash_screen.py` and `main.py`: 800×500 primary-screen-centered topmost Tool splash, click skip, ordinary-window fallback, and non-topmost main-window reveal
+- `tests/test_round14_features.py`: manual creation/reload/execution/deletion, restricted-code checks, built-in lock, GUI form/signals, and splash-window coverage
+- `README.txt` and `process.md`: user-facing safety guidance, implementation evidence, and platform limitations
+
+### Test status
+
+- Status: Pass
+- Round 14 focused regression: `pytest tests/test_round14_features.py -q` → 6 passed
+- Skill/GUI focused regression: `pytest tests/test_round11_features.py tests/test_round14_features.py tests/test_gui.py -q` → 76 passed
+- Full regression: `pytest tests/ -q` → 173 passed, 1 skipped
+- Network/API usage: none
+- Skip reason: the current Windows environment does not permit creation of the path-guard symlink
+
+### Pending items
+
+- Visually confirm global topmost behavior over other applications on the target Windows desktop
+- Repeat the visual check on macOS/X11/Wayland where available; Wayland compositors may ignore global topmost hints

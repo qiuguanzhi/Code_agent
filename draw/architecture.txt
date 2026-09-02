@@ -1,0 +1,17 @@
+标题：Cerebro 系统架构
+
+模块（共 7 个）：
+- GUI 层：用户交互、信号槽通信（gui/main_window.py, gui/worker.py）
+- Agent 引擎：主循环、状态管理（agent/loop.py, agent/state.py）
+- 上下文管理：上下文压缩、Token 预算（agent/context.py）
+- Provider 层：模型 API 适配（providers/openai_compatible.py）
+- 工具层：文件、Shell、注册表（tools/registry.py, tools/filesystem.py, tools/shell.py）
+- Skill 系统：技能注册与执行（skills/registry.py）
+- 工具函数：Diff、快照（utils/diff.py, utils/snapshot.py）
+
+数据流向（用箭头描述）：
+用户 → GUI → Agent引擎 → Provider → Agent引擎 → 工具层 → Agent引擎 → GUI
+                ↓                       ↓
+            上下文管理               Skill系统
+                ↓                       ↓
+            工具函数                 工具函数

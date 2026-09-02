@@ -26,6 +26,10 @@ traces/
 *.tmp
 .agent-*
 
+# Runtime-created user Skills (keep only the package marker)
+skills/user/*.py
+!skills/user/__init__.py
+
 # Build artifacts
 build/
 dist/

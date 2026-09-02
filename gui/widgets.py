@@ -21,6 +21,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -29,6 +33,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
+    QPlainTextEdit,
     QScrollArea,
     QTextBrowser,
     QToolButton,
@@ -36,6 +42,135 @@ from PySide6.QtWidgets import (
     QWidget,
     QWidgetAction,
 )
+
+
+_SKILL_TEMPLATE = '''class CustomSkill(Skill):
+    parameters_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    def execute(self, params: dict[str, Any], context: AgentContext) -> SkillResult:
+        # 通过 context.call_tool("read_file", {...}) 使用声明过的能力。
+        return SkillResult(True, {"message": "Hello from custom Skill"})
+'''
+
+
+class AddSkillDialog(QDialog):
+    """Collect one manually authored Skill and its explicit capabilities."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Build the form and seed a minimal, import-free Skill template."""
+
+        super().__init__(parent)
+        self.setObjectName("addSkillDialog")
+        self.setWindowTitle("添加 Skill")
+        self.resize(700, 600)
+        root = QVBoxLayout(self)
+        explanation = QLabel(
+            "执行逻辑必须定义且只定义一个 Skill 子类。权限能力只能通过 "
+            "context.call_tool() 使用；动态代码不能直接 import 系统模块。",
+            self,
+        )
+        explanation.setObjectName("skillSecurityHint")
+        explanation.setWordWrap(True)
+        root.addWidget(explanation)
+
+        form = QFormLayout()
+        self.name_input = QLineEdit(self)
+        self.name_input.setObjectName("skillNameInput")
+        self.name_input.setPlaceholderText("例如 weather_query（小写字母、数字、下划线）")
+        form.addRow("Skill 名称 *", self.name_input)
+        self.description_input = QPlainTextEdit(self)
+        self.description_input.setObjectName("skillDescriptionInput")
+        self.description_input.setPlaceholderText("用自然语言说明该 Skill 何时使用、返回什么。")
+        self.description_input.setMaximumHeight(90)
+        form.addRow("描述 *", self.description_input)
+        root.addLayout(form)
+
+        permissions_label = QLabel("权限声明（按最小权限勾选）", self)
+        permissions_label.setObjectName("skillPermissionTitle")
+        root.addWidget(permissions_label)
+        permission_row = QHBoxLayout()
+        self.permission_checks: dict[str, QCheckBox] = {}
+        for permission, label in (
+            ("filesystem", "读取文件"),
+            ("filesystem_write", "修改文件"),
+            ("process", "运行命令"),
+            ("network", "访问网络"),
+        ):
+            checkbox = QCheckBox(label, self)
+            checkbox.setProperty("permission", permission)
+            self.permission_checks[permission] = checkbox
+            permission_row.addWidget(checkbox)
+        permission_row.addStretch(1)
+        root.addLayout(permission_row)
+
+        code_label = QLabel("执行逻辑 *", self)
+        code_label.setObjectName("skillCodeTitle")
+        root.addWidget(code_label)
+        self.code_editor = QPlainTextEdit(self)
+        self.code_editor.setObjectName("skillCodeEditor")
+        self.code_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.code_editor.setPlainText(_SKILL_TEMPLATE)
+        root.addWidget(self.code_editor, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def selected_permissions(self) -> frozenset[str]:
+        """Return only explicitly checked capability names."""
+
+        return frozenset(
+            permission
+            for permission, checkbox in self.permission_checks.items()
+            if checkbox.isChecked()
+        )
+
+    def definition(self) -> dict[str, object]:
+        """Return the current form values without executing the source."""
+
+        return {
+            "name": self.name_input.text().strip(),
+            "description": self.description_input.toPlainText().strip(),
+            "source_code": self.code_editor.toPlainText(),
+            "required_permissions": self.selected_permissions(),
+        }
+
+    def accept(self) -> None:
+        """Reject missing fields and syntax errors before closing the editor."""
+
+        definition = self.definition()
+        name = definition["name"]
+        description = definition["description"]
+        source_code = definition["source_code"]
+        if not isinstance(name, str) or not name:
+            QMessageBox.warning(self, "无法保存", "Skill 名称不能为空。")
+            self.name_input.setFocus()
+            return
+        if not isinstance(description, str) or not description:
+            QMessageBox.warning(self, "无法保存", "Skill 描述不能为空。")
+            self.description_input.setFocus()
+            return
+        try:
+            compile(str(source_code), "<user-skill>", "exec")
+        except SyntaxError as exc:
+            line = exc.lineno or 0
+            QMessageBox.critical(
+                self,
+                "Skill 代码语法错误",
+                f"第 {line} 行：{exc.msg}",
+            )
+            self.code_editor.setFocus()
+            return
+        super().accept()
 
 
 class _CerebroOverlay(QWidget):

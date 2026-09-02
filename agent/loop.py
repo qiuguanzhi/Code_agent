@@ -427,7 +427,7 @@ def run_agent(
     ]
     prompt_duration_ms = (time.perf_counter() - prompt_started) * 1_000
     registry_started = time.perf_counter()
-    skill_registry = cfg.skill_registry or SkillRegistry.discover_builtin(
+    skill_registry = cfg.skill_registry or SkillRegistry.discover_all(
         granted_permissions=cfg.skill_permissions,
         enabled_names=cfg.enabled_skills,
         confirm_high_risk=cfg.confirm_high_risk_skill,

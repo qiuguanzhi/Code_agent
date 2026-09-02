@@ -37,7 +37,9 @@ from PySide6.QtGui import (
     QIcon,
     QKeyEvent,
     QKeySequence,
+    QMouseEvent,
     QPainter,
+    QPen,
     QPixmap,
     QTextCharFormat,
     QTextCursor,
@@ -53,9 +55,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMenuBar,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTabWidget,
@@ -110,6 +114,18 @@ class MainWindow(QMainWindow):
         """Create the three-column desktop interface and restore UI state."""
 
         super().__init__()
+        initial_margins = self.contentsMargins()
+        self._normal_window_margins = (
+            initial_margins.left(),
+            initial_margins.top(),
+            initial_margins.right(),
+            initial_margins.bottom(),
+        )
+        self._normal_central_margins = (10, 10, 10, 10)
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        )
+        self._window_drag_offset: QPoint | None = None
         self._launch_cwd = Path.cwd().resolve()
         self.workspace_root = self._normalize_workspace(workspace_root)
         self.settings = settings or QSettings("MiniCodingAgent", "Desktop")
@@ -142,7 +158,7 @@ class MainWindow(QMainWindow):
             if isinstance(saved_skills, list)
             else None
         )
-        self.skill_registry = SkillRegistry.discover_builtin(
+        self.skill_registry = SkillRegistry.discover_all(
             enabled_names=enabled_names,
         )
         self.enabled_skills = self.skill_registry.enabled_names()
@@ -318,18 +334,36 @@ class MainWindow(QMainWindow):
         self.rollback_toolbar_action.triggered.connect(self._rollback_snapshot)
 
     def _create_menu_bar(self) -> None:
-        """Populate File, Settings, and View menus."""
+        """Build one aligned custom title row containing menus and controls."""
 
-        file_menu = self.menuBar().addMenu("文件")
+        self.title_bar = QWidget(self)
+        self.title_bar.setObjectName("customTitleBar")
+        self.title_bar.setFixedHeight(32)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(0)
+        title_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.main_menu_bar = QMenuBar(self.title_bar)
+        self.main_menu_bar.setObjectName("mainMenuBar")
+        self.main_menu_bar.setNativeMenuBar(False)
+        self.main_menu_bar.setFixedHeight(32)
+        self.main_menu_bar.setSizePolicy(
+            QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Fixed,
+        )
+        title_layout.addWidget(self.main_menu_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        file_menu = self.main_menu_bar.addMenu("文件")
         file_menu.addAction(self.open_workspace_action)
         file_menu.addAction(self.save_file_action)
         file_menu.addAction(self.save_snapshot_action)
         file_menu.addAction(self.rollback_action)
 
-        settings_menu = self.menuBar().addMenu("设置")
+        settings_menu = self.main_menu_bar.addMenu("设置")
         settings_menu.addAction(self.interactive_action)
 
-        view_menu = self.menuBar().addMenu("视图")
+        view_menu = self.main_menu_bar.addMenu("视图")
         workspace_action = QAction("折叠/展开工作区", self)
         workspace_action.triggered.connect(self._toggle_workspace_panel)
         view_menu.addAction(workspace_action)
@@ -337,12 +371,62 @@ class MainWindow(QMainWindow):
         theme_action.triggered.connect(self._toggle_theme)
         view_menu.addAction(theme_action)
 
+        self.window_drag_handle = QWidget(self.title_bar)
+        self.window_drag_handle.setObjectName("windowDragHandle")
+        self.window_drag_handle.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.window_drag_handle.setFixedHeight(32)
+        self.window_drag_handle.setToolTip("拖动窗口；双击最大化或还原")
+        self.window_drag_handle.installEventFilter(self)
+        title_layout.addWidget(self.window_drag_handle, 1)
+
+        self.window_minimize_button = QToolButton(self.title_bar)
+        self.window_minimize_button.setObjectName("windowMinimizeButton")
+        self.window_minimize_button.setToolTip("最小化")
+        self.window_minimize_button.setFixedSize(30, 30)
+        self.window_minimize_button.setIconSize(QSize(16, 16))
+        self.window_minimize_button.clicked.connect(self.showMinimized)
+        title_layout.addWidget(
+            self.window_minimize_button,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        self.window_maximize_button = QToolButton(self.title_bar)
+        self.window_maximize_button.setObjectName("windowMaximizeButton")
+        self.window_maximize_button.setToolTip("最大化")
+        self.window_maximize_button.setFixedSize(30, 30)
+        self.window_maximize_button.setIconSize(QSize(16, 16))
+        self.window_maximize_button.clicked.connect(self._toggle_window_maximized)
+        title_layout.addWidget(
+            self.window_maximize_button,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        self.window_close_button = QToolButton(self.title_bar)
+        self.window_close_button.setObjectName("windowCloseButton")
+        self.window_close_button.setToolTip("关闭（Alt+F4）")
+        self.window_close_button.setFixedSize(30, 30)
+        self.window_close_button.setIconSize(QSize(16, 16))
+        self.window_close_button.clicked.connect(self.close)
+        title_layout.addWidget(
+            self.window_close_button,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        self.setMenuWidget(self.title_bar)
+        self._update_theme_icons()
+
     def _create_tool_bar(self) -> None:
         """Create workspace, snapshot, status, and theme controls."""
 
         toolbar = QToolBar("主工具栏", self)
         toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
+        self.main_toolbar = toolbar
         self.addToolBar(toolbar)
 
         self.pulse_indicator = PulseIndicator(toolbar)
@@ -379,10 +463,82 @@ class MainWindow(QMainWindow):
         self.theme_button.setObjectName("themeButton")
         self.theme_button.clicked.connect(self._toggle_theme)
         toolbar.addWidget(self.theme_button)
-        self.skill_button = QPushButton("🧩 技能", self)
+        self.skill_button = QPushButton("🧩 Skill 管理", self)
         self.skill_button.setObjectName("skillButton")
         self.skill_button.clicked.connect(self._show_skill_manager)
         toolbar.addWidget(self.skill_button)
+
+    def _build_window_control_icon(self, kind: str) -> QIcon:
+        """Draw one crisp title-control glyph using the active theme color."""
+
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        icon_color = QColor("#E6E6E6" if self.theme_name == "dark" else "#333333")
+        pen = QPen(icon_color, 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if kind == "minimize":
+            painter.drawLine(3, 11, 13, 11)
+        elif kind == "maximize":
+            painter.drawRect(3, 3, 10, 10)
+        elif kind == "restore":
+            painter.drawRect(5, 3, 8, 8)
+            painter.drawRect(3, 5, 8, 8)
+        elif kind == "close":
+            painter.drawLine(4, 4, 12, 12)
+            painter.drawLine(12, 4, 4, 12)
+        else:
+            painter.end()
+            raise ValueError(f"unknown window-control icon: {kind}")
+        painter.end()
+        return QIcon(pixmap)
+
+    def _update_theme_icons(self) -> None:
+        """Regenerate title-control icons for the active light/dark theme."""
+
+        self.window_minimize_button.setIcon(
+            self._build_window_control_icon("minimize")
+        )
+        self.window_maximize_button.setIcon(
+            self._build_window_control_icon(
+                "restore" if self.isMaximized() else "maximize"
+            )
+        )
+        self.window_close_button.setIcon(self._build_window_control_icon("close"))
+
+    @Slot()
+    def _toggle_window_maximized(self) -> None:
+        """Toggle maximized state without relying on a native title bar."""
+
+        if self.isMaximized():
+            self.showNormal()
+            self.window_maximize_button.setToolTip("最大化")
+        else:
+            self.showMaximized()
+            self.window_maximize_button.setToolTip("还原")
+        self._sync_window_state_layout()
+
+    def _sync_window_state_layout(self) -> None:
+        """Remove stale frame spacing when maximized and restore it normally."""
+
+        maximized = self.isMaximized()
+        window_margins = (0, 0, 0, 0) if maximized else self._normal_window_margins
+        self.setContentsMargins(*window_margins)
+        window_layout = self.layout()
+        if window_layout is not None:
+            window_layout.setContentsMargins(*window_margins)
+        root = self.centralWidget()
+        root_layout = root.layout() if root is not None else None
+        if root_layout is not None:
+            root_layout.setContentsMargins(
+                *((0, 0, 0, 0) if maximized else self._normal_central_margins)
+            )
+        self.window_maximize_button.setToolTip("还原" if maximized else "最大化")
+        self._update_theme_icons()
 
     def _create_central_widget(self) -> None:
         """Build the adjustable workspace, conversation, and code columns."""
@@ -839,12 +995,31 @@ class MainWindow(QMainWindow):
     def _show_skill_manager(self) -> None:
         """Open the runtime-skill enablement dialog and persist acceptance."""
 
-        discovered = SkillRegistry.discover_builtin(enabled_names=self.enabled_skills)
+        discovered = SkillRegistry.discover_all(enabled_names=self.enabled_skills)
         dialog = SkillManagerDialog(discovered, self)
-        if dialog.exec() != SkillManagerDialog.DialogCode.Accepted:
-            return
+        dialog.skill_added.connect(
+            lambda name: self.update_log(
+                0,
+                "📦",
+                "Cerebro",
+                "success",
+                f"已手动添加 Skill: {name}",
+            )
+        )
+        dialog.skill_deleted.connect(
+            lambda name: self.update_log(
+                0,
+                "🗑️",
+                "Cerebro",
+                "success",
+                f"已删除用户 Skill: {name}",
+            )
+        )
+        accepted = dialog.exec() == SkillManagerDialog.DialogCode.Accepted
         self.skill_registry = dialog.registry
-        self.enabled_skills = dialog.enabled_names()
+        if accepted:
+            dialog.apply_enabled_state()
+        self.enabled_skills = self.skill_registry.enabled_names()
         self.skill_permissions = self._enabled_skill_permissions()
         self.settings.setValue("skills/enabled", sorted(self.enabled_skills))
         self.settings.sync()
@@ -1017,11 +1192,48 @@ class MainWindow(QMainWindow):
         return f"[工作区文件: {joined}]"
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
-        """Route mention-popup navigation keys while preserving normal input."""
+        """Route frameless dragging and mention-popup navigation."""
 
+        if watched is getattr(self, "window_drag_handle", None) and isinstance(
+            event, QMouseEvent
+        ):
+            if (
+                event.type() == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._window_drag_offset = None
+                self._toggle_window_maximized()
+                return True
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+                and not self.isMaximized()
+            ):
+                self._window_drag_offset = (
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
+                )
+                return True
+            if (
+                event.type() == QEvent.Type.MouseMove
+                and self._window_drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self.move(
+                    event.globalPosition().toPoint() - self._window_drag_offset
+                )
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                self._window_drag_offset = None
+                return True
+
+        task_input = getattr(self, "task_input", None)
+        file_mention_popup = getattr(self, "file_mention_popup", None)
         if (
-            watched is self.task_input
-            and self.file_mention_popup.isVisible()
+            task_input is not None
+            and watched is task_input
+            and file_mention_popup is not None
+            and file_mention_popup.isVisible()
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
         ):
@@ -1038,6 +1250,38 @@ class MainWindow(QMainWindow):
                 self.file_mention_popup.hide()
                 return True
         return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Begin moving the frameless window from uncovered blank regions."""
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self.isMaximized()
+        ):
+            self._window_drag_offset = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Move the frameless window while a blank-region drag is active."""
+
+        if (
+            self._window_drag_offset is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self.move(event.globalPosition().toPoint() - self._window_drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """End an active frameless-window drag."""
+
+        self._window_drag_offset = None
+        super().mouseReleaseEvent(event)
 
     @Slot(int, str, str, str, str)
     def update_log(self, step: int, icon: str, label: str, color: str, message: str) -> None:
@@ -2799,6 +3043,8 @@ class MainWindow(QMainWindow):
         self.update_status(state, current_status)
         if self.send_button.property("stopMode") is True:
             self.send_button.setIcon(self._build_stop_icon())
+        if hasattr(self, "window_minimize_button"):
+            self._update_theme_icons()
 
     @Slot(int)
     def _set_thinking_mode(self, index: int) -> None:
@@ -2878,3 +3124,13 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
         super().closeEvent(event)
+
+    def changeEvent(self, event: QEvent) -> None:
+        """Synchronize frame margins and native icons on window-state changes."""
+
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and hasattr(self, "window_maximize_button")
+        ):
+            self._sync_window_state_layout()

@@ -38,6 +38,7 @@ class CodeReviewerSkill(Skill):
     description = "读取指定代码文件并进行安全性、可维护性和明显缺陷的快速审查。"
     parameters_schema = _PATH_SCHEMA
     required_permissions = frozenset({"filesystem"})
+    built_in = True
 
     def execute(self, params: dict[str, Any], context: AgentContext) -> SkillResult:
         """Return source-aware findings for the model to assess further."""
@@ -75,6 +76,7 @@ class ExplainCodeSkill(Skill):
     description = "读取指定代码并返回结构化源码上下文，帮助模型准确解释职责和执行流程。"
     parameters_schema = _PATH_SCHEMA
     required_permissions = frozenset({"filesystem"})
+    built_in = True
 
     def execute(self, params: dict[str, Any], context: AgentContext) -> SkillResult:
         """Return source text and basic metrics without modifying the file."""
@@ -102,6 +104,7 @@ class RefactorSuggestSkill(Skill):
     description = "读取指定代码，定位长行、深缩进和重复风险，给出不直接写盘的重构候选。"
     parameters_schema = _PATH_SCHEMA
     required_permissions = frozenset({"filesystem"})
+    built_in = True
 
     def execute(self, params: dict[str, Any], context: AgentContext) -> SkillResult:
         """Return deterministic refactoring candidates for model judgement."""

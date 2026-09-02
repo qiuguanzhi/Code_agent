@@ -756,3 +756,79 @@ $env:QT_QPA_PLATFORM='offscreen'
 ```
 
 唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。所有新增测试使用 FakeProvider、Fake OpenAI SDK、offscreen Qt 与临时工作区，不消耗真实 API。
+
+---
+
+## [2026-09-01 16:03] 第14轮 任务 #1 - Skill 手动添加与删除管理
+
+- **修改内容**：移除外部 `.py` 文件选择与导入入口，新增 `AddSkillDialog` 表单，包含名称、描述、完整 Skill 类代码编辑器，以及读取文件、修改文件、运行命令、访问网络四项权限声明。`Skill.from_code()` 使用 `compile()` 和 AST 做语法/结构检查，在只注入 `Skill`、`SkillResult`、`AgentContext`、`Any` 与少量安全内建函数的命名空间中加载唯一具体 Skill 类；禁止 import、`__builtins__` 和双下划线内部属性访问。`SkillRegistry.register_from_code()` 校验名称、描述、Schema、权限和原生工具名冲突，检测 `eval`/`exec`/`open`/`__import__` 等危险调用并要求 GUI 二次确认；声明权限不会向动态代码直接开放 `os` 或 `subprocess`，执行能力仍须经 `context.call_tool()` 和 ToolRegistry 权限门。表单元数据与源码以 `skill_<name>.py` 原子持久化到 `skills/user/`，重启可发现；非内置 Skill 可确认删除，内置 Skill 在 UI 与注册表两层锁定。添加/删除分别记录“已手动添加 Skill”和“已删除用户 Skill”审计日志。
+- **涉及文件**：`skills/base.py`、`skills/registry.py`、`skills/builtin/code_review.py`、`skills/user/__init__.py`、`agent/loop.py`、`gui/widgets.py`、`gui/skill_dialog.py`、`gui/main_window.py`、`gui/theme.py`、`.gitignore`、`README.txt`、`tests/test_round14_features.py`
+- **测试结果**：通过。覆盖表单字段与权限采集、Hello Skill 手动注册、元数据持久化、重启发现、Agent ToolRegistry 调用并返回 `Hello`、删除后不可调用、语法错误、import、危险函数提醒、原生工具名冲突、内置 Skill 删除保护，以及 GUI 添加/删除信号和按钮状态。
+- **遗留问题**：CPython 进程内的受限命名空间不是操作系统级安全沙箱；本实现采用最小内建集合、AST 禁止项、能力对象和既有权限门进行纵深防御。若未来需要运行不可信第三方代码，应改用低权限独立进程或容器，而不是扩大当前 `exec()` 命名空间。
+
+## [2026-09-01 15:14] 第14轮 任务 #2 - 启动动画全局置顶
+
+- **修改内容**：Splash 改为 `WindowStaysOnTopHint | FramelessWindowHint | Tool`，固定 `800×500`，通过 `QApplication.primaryScreen().availableGeometry()` 在主显示器居中；显示后立即执行 `raise_()` 和 `activateWindow()`。原有点击任意位置跳过保持不变，完成路径先隐藏并关闭 Splash，再发射 `finished` 显示主窗口。主窗口显式移除置顶标志，并在 100ms 后 `raise_()`/`activateWindow()` 获取焦点。若平台或窗口管理器拒绝置顶，控制台输出警告并降级到普通无边框 Tool 窗口；无主屏幕及无头 Qt 环境不会崩溃。
+- **涉及文件**：`gui/splash_screen.py`、`main.py`、`README.txt`、`tests/test_round14_features.py`、`tests/test_gui.py`
+- **测试结果**：通过。offscreen Qt 验证三项窗口标志、800×500 尺寸、主屏中心位置、真实鼠标点击只发射一次完成信号、动画矢量阶段继续可渲染，以及主窗口不继承置顶标志。
+- **遗留问题**：全局置顶最终受 Windows/macOS/Linux 窗口管理器策略控制，尤其 Wayland 可能忽略该提示；代码已提供降级路径，但“覆盖浏览器/IDE”的真实桌面视觉效果需在目标操作系统上人工验收。
+
+## [2026-09-01 16:03] 第14轮 全局回归
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_round14_features.py -q
+# 6 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\test_round11_features.py tests\test_round14_features.py tests\test_gui.py -q
+# 76 passed, exit code 0
+
+.\.venv\Scripts\python.exe -m pytest tests\ -q
+# 173 passed, 1 skipped, exit code 0
+```
+
+唯一跳过项仍为当前 Windows 账户不允许创建测试符号链接。新增测试全部使用临时用户 Skill 目录、受限代码命名空间、offscreen Qt 和本地确定性执行，不访问真实 API，也不会把测试 Skill 写入项目的 `skills/user/`。
+
+---
+
+## [2026-09-02 10:00] 生成 README.md
+
+- **修改内容**：根据已实现功能生成完整中文 `README.md`，涵盖项目简介、12 项核心特色、Windows/macOS/Linux 快速开始、GUI/CLI 使用、快捷键、目录架构、技术栈、许可证状态及维护反馈；正文共 653 个中文字符，未超过 1000 字。
+- **涉及文件**：`README.md`
+- **测试结果**：通过。逐项检索确认 12 项特色均已覆盖；核对 `pyproject.toml`、`main.py`、`.env.example` 与 GUI 快捷键实现，安装、环境变量及启动命令与源码一致；`git diff --check` 通过。
+- **遗留问题**：当前任务输入控件为单行 `QLineEdit`，因此 `Shift+Enter` 换行尚未实现，README 已明确标注；仓库暂未包含 `LICENSE`，公开发布前需由维护者选择许可证。另需在提交前清理任何本地脚本中的明文凭据并轮换已暴露的密钥。
+
+---
+
+## [2026-09-02 10:17] 生成架构与循环逻辑描述（精简版）
+
+- **修改内容**：在 `draw/` 目录下生成 Cerebro 系统架构与 Agent 主循环两份精简结构化描述，供后续可视化制图使用。
+- **涉及文件**：`draw/architecture.txt`、`draw/loop.txt`
+- **测试结果**：通过。架构描述包含 7 个模块和完整箭头数据流；循环描述包含 8 个编号节点、步数继续分支与工具调用回环。
+- **遗留问题**：无。
+
+---
+
+## [2026-09-02 14:50] 隐藏主窗口边框
+
+- **修改内容**：主窗口设置 `Qt.Window | Qt.FramelessWindowHint`，移除系统标题栏；工具栏右侧新增可拖拽空白区，以及最小化、最大化/还原、关闭按钮。拖拽区支持双击最大化/还原，未覆盖区域也可触发窗口移动；`Alt+F4` 和原有关闭清理流程保持有效。
+- **涉及文件**：`gui/main_window.py`、`tests/test_gui.py`
+- **测试结果**：通过。聚焦验证无边框/顶级窗口标志、拖拽状态、自定义窗口按钮和非置顶主窗口；GUI 与启动动画回归共 `68 passed`，`git diff --check` 通过。
+- **遗留问题**：未实现无边框窗口边缘拖拽缩放；当前可通过最大化/还原按钮调整显示范围，后续如需自由缩放可增加边缘命中区域。
+
+---
+
+## [2026-09-02 15:03] 修复自定义标题栏按钮样式与最大化空白区域
+
+- **修改内容**：最小化、最大化/还原、关闭按钮改用 `QStyle.StandardPixmap` 原生标题栏图标，并在窗口状态及主题变化时自动刷新；拖拽占位控件改为透明背景。新增 `changeEvent()` 状态同步，最大化时将主窗口、内部布局和中央内容布局边距归零，还原时恢复中央区域原有 `10px` 边距。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。像素级比对确认三个按钮采用相应标准图标，最大化后切换为 `SP_TitleBarNormalButton`；验证中央边距 `10 → 0 → 10`、无边框和非置顶标志、拖拽及关闭行为。GUI 与启动动画回归共 `68 passed`，编译与 `git diff --check` 通过。
+- **遗留问题**：Qt 标准图标最终外观由当前操作系统和 Qt Style 决定；真实 Windows 桌面上的视觉一致性仍建议人工确认。
+
+---
+
+## [2026-09-02 15:17] 自定义标题栏主题适配与布局对齐
+
+- **修改内容**：窗口控制图标改为 `QPainter` 绘制的 16px 矢量线条，暗色主题使用 `#E6E6E6`、亮色主题使用 `#333333`，主题及最大化状态变化时自动重绘；最大化按钮按状态切换最大化/还原图形。新增 32px 自定义标题栏，通过同一个 `QHBoxLayout` 排列 `QMenuBar`、透明拖拽区和三个 30×30 控制按钮，全部垂直居中；业务工具栏不再承载窗口按钮。
+- **涉及文件**：`gui/main_window.py`、`gui/theme.py`、`tests/test_gui.py`
+- **测试结果**：通过。自动验证菜单“文件/设置/视图”和控制按钮同属标题栏、中心线误差不超过 1px；逐像素验证暗色/亮色图标颜色、最大化/还原图形变化、悬停样式、拖拽及边距恢复。GUI 与启动动画回归共 `68 passed`，编译与 `git diff --check` 通过。
+- **遗留问题**：不同系统的字体度量可能让菜单文字产生极小的视觉差异；标题栏控件高度和中心线已固定，仍建议在目标 Windows 缩放比例下人工确认一次。

@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QMimeData, QSettings, Qt, QUrl, qInstallMessageHandler
 from PySide6.QtGui import QKeySequence
-from PySide6.QtTest import QSignalSpy
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -376,6 +376,120 @@ def test_main_window_has_three_resizable_columns_and_empty_input(
         assert window._fixed_width_font().pointSizeF() > 0
         assert str(workspace) in window.workspace_label.text()
         assert "就绪" in window.status_indicator.text()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_main_window_is_frameless_draggable_and_has_window_controls(
+    qt_app: QApplication,
+    workspace: Path,
+    gui_settings: QSettings,
+) -> None:
+    """Keep essential desktop controls after removing the native title bar."""
+
+    window = MainWindow(workspace, settings=gui_settings)
+    try:
+        window.show()
+        qt_app.processEvents()
+        flags = window.windowFlags()
+        assert flags & Qt.WindowType.Window
+        assert flags & Qt.WindowType.FramelessWindowHint
+        assert window.window_minimize_button.toolTip() == "最小化"
+        assert window.window_maximize_button.toolTip() == "最大化"
+        assert "Alt+F4" in window.window_close_button.toolTip()
+        assert window.title_bar.height() == 32
+        assert window.main_menu_bar.height() == 32
+        assert window.main_menu_bar.parent() is window.title_bar
+        assert window.window_drag_handle.parent() is window.title_bar
+        assert window.window_close_button.parent() is window.title_bar
+        assert window.main_toolbar.isAncestorOf(window.window_close_button) is False
+        assert [action.text() for action in window.main_menu_bar.actions()] == [
+            "文件",
+            "设置",
+            "视图",
+        ]
+        title_center_y = window.title_bar.rect().center().y()
+        assert abs(window.main_menu_bar.geometry().center().y() - title_center_y) <= 1
+        for button in (
+            window.window_minimize_button,
+            window.window_maximize_button,
+            window.window_close_button,
+        ):
+            assert abs(button.geometry().center().y() - title_center_y) <= 1
+        assert "QWidget#windowDragHandle" in DARK_THEME
+        for button in (
+            window.window_minimize_button,
+            window.window_maximize_button,
+            window.window_close_button,
+        ):
+            assert button.icon().isNull() is False
+            image = button.icon().pixmap(16, 16).toImage()
+            assert any(
+                image.pixelColor(x, y).alpha() > 0
+                and image.pixelColor(x, y).name().casefold() == "#e6e6e6"
+                for x in range(image.width())
+                for y in range(image.height())
+            )
+
+        window._toggle_theme()
+        qt_app.processEvents()
+        assert window.theme_name == "light"
+        for button in (
+            window.window_minimize_button,
+            window.window_maximize_button,
+            window.window_close_button,
+        ):
+            image = button.icon().pixmap(16, 16).toImage()
+            assert any(
+                image.pixelColor(x, y).alpha() > 0
+                and image.pixelColor(x, y).name().casefold() == "#333333"
+                for x in range(image.width())
+                for y in range(image.height())
+            )
+        window._toggle_theme()
+        qt_app.processEvents()
+
+        QTest.mousePress(
+            window.window_drag_handle,
+            Qt.MouseButton.LeftButton,
+            pos=window.window_drag_handle.rect().center(),
+        )
+        assert window._window_drag_offset is not None
+        QTest.mouseRelease(
+            window.window_drag_handle,
+            Qt.MouseButton.LeftButton,
+            pos=window.window_drag_handle.rect().center(),
+        )
+        assert window._window_drag_offset is None
+
+        maximize_image = window.window_maximize_button.icon().pixmap(16, 16).toImage()
+        window.window_maximize_button.click()
+        qt_app.processEvents()
+        assert window.window_maximize_button.toolTip() == "还原"
+        restore_image = window.window_maximize_button.icon().pixmap(16, 16).toImage()
+        assert restore_image != maximize_image
+        maximized_margins = window.centralWidget().layout().contentsMargins()
+        assert (
+            maximized_margins.left(),
+            maximized_margins.top(),
+            maximized_margins.right(),
+            maximized_margins.bottom(),
+        ) == (0, 0, 0, 0)
+        window.window_maximize_button.click()
+        qt_app.processEvents()
+        assert window.window_maximize_button.toolTip() == "最大化"
+        normal_margins = window.centralWidget().layout().contentsMargins()
+        assert (
+            normal_margins.left(),
+            normal_margins.top(),
+            normal_margins.right(),
+            normal_margins.bottom(),
+        ) == (10, 10, 10, 10)
+
+        window.window_close_button.click()
+        qt_app.processEvents()
+        assert window.isVisible() is False
     finally:
         window.close()
         qt_app.processEvents()
